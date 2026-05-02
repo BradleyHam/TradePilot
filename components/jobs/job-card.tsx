@@ -1,8 +1,8 @@
 'use client';
 
-import { Job } from '@/lib/types';
+import { Job, LeadSource } from '@/lib/types';
 import { StatusBadge } from './status-badge';
-import { MapPin, User, TrendingUp } from 'lucide-react';
+import { MapPin, User, Globe, Mail, Phone, UserPlus } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface JobCardProps {
@@ -50,7 +50,10 @@ export function JobCard({
             </div>
           )}
         </div>
-        <StatusBadge status={job.status} />
+        <div className="flex flex-col items-end gap-1.5 shrink-0">
+          <StatusBadge status={job.status} />
+          {job.source && <SourcePill source={job.source} />}
+        </div>
       </div>
 
       {/* Stats row */}
@@ -79,5 +82,30 @@ function Stat({ label, value, valueClass }: { label: string; value: string; valu
       <span className="text-[10px] text-muted-foreground font-medium">{label}</span>
       <span className={cn('text-sm font-semibold', valueClass ?? 'text-foreground')}>{value}</span>
     </div>
+  );
+}
+
+// Tiny channel pill below the status badge. Hidden for legacy/manual-entry
+// jobs (source === undefined) so existing data doesn't suddenly sprout tags.
+function SourcePill({ source }: { source: LeadSource }) {
+  // Manual is the boring default — no pill needed.
+  if (source === 'manual') return null;
+
+  const config: Record<LeadSource, { label: string; Icon: typeof Globe } | null> = {
+    website:  { label: 'Website',  Icon: Globe    },
+    email:    { label: 'Email',    Icon: Mail     },
+    phone:    { label: 'Phone',    Icon: Phone    },
+    referral: { label: 'Referral', Icon: UserPlus },
+    manual:   null,
+  };
+  const cfg = config[source];
+  if (!cfg) return null;
+  const { label, Icon } = cfg;
+
+  return (
+    <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-muted/60 text-[10px] text-muted-foreground font-medium">
+      <Icon size={10} strokeWidth={2} />
+      {label}
+    </span>
   );
 }

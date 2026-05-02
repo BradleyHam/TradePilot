@@ -91,6 +91,12 @@ export type ScheduleItemType =
   | 'invoice_due'
   | 'reminder';
 
+/**
+ * Where a lead/job originally came from. Free-form (not a check constraint
+ * in the DB) so we can add new channels without a migration.
+ */
+export type LeadSource = 'website' | 'email' | 'phone' | 'referral' | 'manual';
+
 export interface Job {
   id: string;
   businessId: string;
@@ -108,6 +114,8 @@ export interface Job {
   endDate?: string;
   followUpDate?: string;
   notes?: string;
+  /** How the lead came in. Null for legacy/imported rows. */
+  source?: LeadSource;
   createdAt: string;
   updatedAt: string;
 }

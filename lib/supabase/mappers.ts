@@ -5,7 +5,7 @@ import type {
   Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
   ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
-  BankTransactionStatus,
+  BankTransactionStatus, LeadSource,
 } from '../types';
 
 type Row = Record<string, unknown>;
@@ -44,6 +44,7 @@ export function rowToJob(r: Row): Job {
     endDate: asString(r.end_date),
     followUpDate: asString(r.follow_up_date),
     notes: asString(r.notes),
+    source: (asString(r.source) as LeadSource | undefined),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };
@@ -67,6 +68,7 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.endDate !== undefined) out.end_date = j.endDate;
   if (j.followUpDate !== undefined) out.follow_up_date = j.followUpDate;
   if (j.notes !== undefined) out.notes = j.notes;
+  if (j.source !== undefined) out.source = j.source || null;
   return out;
 }
 

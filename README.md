@@ -121,6 +121,34 @@ data/
   import/                 JSON dumps from the exporter (gitignored).
 ```
 
+## Website enquiry webhook
+
+`POST /api/webhooks/website-enquiry` accepts inbound contact-form submissions from painterswanaka.co.nz and creates a `lead`-status job.
+
+Requires two extra env vars:
+
+```
+WEBSITE_WEBHOOK_SECRET=<openssl rand -hex 32>
+TRADEPILOT_BUSINESS_ID=<uuid of the business in Supabase>
+```
+
+Body:
+
+```json
+{
+  "name": "Jane Smith",
+  "email": "jane@example.com",
+  "phone": "021 555 1234",
+  "message": "Looking for a quote on exterior repaint",
+  "pageUrl": "/contact",
+  "source": "website"
+}
+```
+
+Headers: `x-webhook-secret: <WEBSITE_WEBHOOK_SECRET>`, `Content-Type: application/json`.
+
+Either `email` or `phone` is required (not both). Same email + same message within 5 minutes is deduped to defend against double-submits.
+
 ## Available scripts
 
 ```bash
