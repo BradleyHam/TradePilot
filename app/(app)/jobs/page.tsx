@@ -15,25 +15,20 @@ import { JOB_STATUSES } from '@/lib/mock-data';
 import { jobStats } from '@/lib/job-stats';
 import { cn } from '@/lib/utils';
 
-const STATUS_GROUPS: { label: string; statuses: JobStatus[] }[] = [
-  { label: 'Active', statuses: ['lead', 'quoted', 'accepted', 'booked', 'in-progress'] },
-  { label: 'Done', statuses: ['completed', 'invoiced', 'paid'] },
-  { label: 'Lost', statuses: ['lost'] },
-];
+// Filter values: 'all', a synthetic 'coming-up' group, or a literal JobStatus.
+// 'coming-up' is everything you've got in the pipeline that isn't yet on the
+// brush — i.e. NOT in-progress, NOT done. Splits cleanly with In progress.
+type FilterValue = 'all' | 'coming-up' | JobStatus;
 
-// Filter values: 'all', a synthetic 'active' group, or a literal JobStatus.
-type FilterValue = 'all' | 'active' | JobStatus;
-
-// Statuses that count as "active" — anything not done, paid, or lost.
-const ACTIVE_STATUSES: JobStatus[] = [
-  'lead', 'quoted', 'accepted', 'booked', 'in-progress',
+const COMING_UP_STATUSES: JobStatus[] = [
+  'lead', 'quoted', 'accepted', 'booked',
 ];
 
 const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
   { label: 'All',         value: 'all' },
-  { label: 'Completed',   value: 'completed' },
-  { label: 'Active',      value: 'active' },
   { label: 'In progress', value: 'in-progress' },
+  { label: 'Coming up',   value: 'coming-up' },
+  { label: 'Completed',   value: 'completed' },
   { label: 'Leads',       value: 'lead' },
   { label: 'Quoted',      value: 'quoted' },
   { label: 'Booked',      value: 'booked' },
@@ -51,7 +46,7 @@ export default function JobsPage() {
   const filteredJobs = jobs.filter((j) => {
     const matchesFilter =
       filter === 'all' ? true
-      : filter === 'active' ? ACTIVE_STATUSES.includes(j.status)
+      : filter === 'coming-up' ? COMING_UP_STATUSES.includes(j.status)
       : j.status === filter;
     const matchesSearch =
       !search ||

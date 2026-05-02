@@ -79,7 +79,14 @@ export function ParsedPreview({ parsed, onConfirm, onEdit }: ParsedPreviewProps)
           {parsed.supplier && (
             <DetailRow label="Supplier" value={parsed.supplier} />
           )}
-          <DetailRow label="Date" value={new Date().toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' })} />
+          <DetailRow
+            label={parsed.entryDate ? 'Date · from text' : 'Date'}
+            value={
+              parsed.entryDate
+                ? new Date(parsed.entryDate + 'T00:00:00').toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' })
+                : new Date().toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' })
+            }
+          />
         </div>
 
         {/* Actions */}

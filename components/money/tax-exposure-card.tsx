@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useStore } from '@/lib/store';
-import { estimateTax } from '@/lib/tax-estimator';
+import { estimateTax, taxYearOf, previousTaxYearOf } from '@/lib/tax-estimator';
 import { ChevronDown, Receipt, TrendingDown, Info } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -11,32 +11,62 @@ const fmt = (n: number) => `$${Math.round(n).toLocaleString('en-NZ')}`;
 export function TaxExposureCard() {
   const { entries } = useStore();
   const [open, setOpen] = useState(false);
+  // Default to current year. 'prev' shows the year that just finished —
+  // useful at filing time (June/July) when you want last year's number.
+  const [yearKind, setYearKind] = useState<'current' | 'prev'>('current');
 
-  const est = estimateTax(entries);
-  const ty = est.taxYear;
+  const ty = yearKind === 'current' ? taxYearOf() : previousTaxYearOf();
+  const est = estimateTax(entries, new Date(), ty);
   const pct = est.totalDays > 0 ? Math.round((est.elapsedDays / est.totalDays) * 100) : 0;
+  const yearComplete = yearKind === 'prev' || pct >= 100;
 
   return (
     <div className="bg-card border border-border rounded-2xl overflow-hidden">
+      {/* Header — title + year toggle */}
+      <div className="flex items-center justify-between gap-2 px-4 pt-3.5 pb-2">
+        <p className="text-sm font-semibold text-foreground">Tax exposure</p>
+        <div className="inline-flex bg-muted rounded-lg p-0.5">
+          <button
+            onClick={(e) => { e.stopPropagation(); setYearKind('current'); }}
+            className={cn(
+              'px-2.5 h-7 rounded-md text-[11px] font-medium tabular-nums transition-colors',
+              yearKind === 'current'
+                ? 'bg-card shadow-sm text-foreground'
+                : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {taxYearOf().label}
+          </button>
+          <button
+            onClick={(e) => { e.stopPropagation(); setYearKind('prev'); }}
+            className={cn(
+              'px-2.5 h-7 rounded-md text-[11px] font-medium tabular-nums transition-colors',
+              yearKind === 'prev'
+                ? 'bg-card shadow-sm text-foreground'
+                : 'text-muted-foreground hover:text-foreground',
+            )}
+          >
+            {previousTaxYearOf().label}
+          </button>
+        </div>
+      </div>
+
       {/* Headline */}
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full text-left px-4 py-3.5 hover:bg-muted/30 active:bg-muted/50 transition-colors"
+        className="w-full text-left px-4 pb-3.5 pt-1 hover:bg-muted/30 active:bg-muted/50 transition-colors"
       >
-        <div className="flex items-baseline justify-between mb-3">
-          <p className="text-sm font-semibold text-foreground">
-            Tax exposure · {ty.label}
+        <div className="flex items-baseline justify-end mb-3 gap-2">
+          <p className="text-[11px] text-muted-foreground">
+            {yearComplete ? 'year complete' : `${pct}% through year`}
           </p>
-          <div className="flex items-center gap-2">
-            <p className="text-[11px] text-muted-foreground">{pct}% through year</p>
-            <ChevronDown
-              size={14}
-              className={cn(
-                'text-muted-foreground transition-transform',
-                open && 'rotate-180',
-              )}
-            />
-          </div>
+          <ChevronDown
+            size={14}
+            className={cn(
+              'text-muted-foreground transition-transform',
+              open && 'rotate-180',
+            )}
+          />
         </div>
 
         {/* Two lines */}
@@ -97,7 +127,7 @@ export function TaxExposureCard() {
           {/* Deduction breakdown */}
           <div>
             <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide mb-2">
-              Auto-deductions, pro-rated to today
+              {yearComplete ? 'Auto-deductions (full year)' : 'Auto-deductions, pro-rated to today'}
             </p>
             <Row label="Vehicle (km claim)" value={fmt(est.deductionBreakdown.vehicle)} />
             <Row label="Home office + shed" value={fmt(est.deductionBreakdown.homeAndShed)} />

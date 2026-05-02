@@ -160,6 +160,90 @@ function detectType(text: string): EntryType {
   return 'note';
 }
 
+// Best-effort date extractor. Recognises:
+//   - "yesterday", "today"
+//   - "monday" / "tuesday" / ... (most recent past or current weekday)
+//   - "on the 8th of April", "April 8", "8 April"
+//   - "30/04/2026", "30/04", "30/4"
+//   - ISO "2026-04-30"
+// Returns YYYY-MM-DD or undefined. Year defaults to current.
+function extractDate(text: string, now: Date = new Date()): string | undefined {
+  const lower = text.toLowerCase();
+  const iso = (d: Date) => {
+    const y = d.getFullYear();
+    const m = String(d.getMonth() + 1).padStart(2, '0');
+    const day = String(d.getDate()).padStart(2, '0');
+    return `${y}-${m}-${day}`;
+  };
+
+  if (/\byesterday\b/.test(lower)) {
+    const d = new Date(now); d.setDate(d.getDate() - 1);
+    return iso(d);
+  }
+  if (/\btoday\b/.test(lower)) return iso(now);
+
+  // ISO match — exact YYYY-MM-DD anywhere in the string
+  const isoMatch = text.match(/\b(\d{4})-(\d{2})-(\d{2})\b/);
+  if (isoMatch) return `${isoMatch[1]}-${isoMatch[2]}-${isoMatch[3]}`;
+
+  // Weekday name → most recent past instance (or today if it matches)
+  const weekdays = ['sunday','monday','tuesday','wednesday','thursday','friday','saturday'];
+  for (let i = 0; i < weekdays.length; i++) {
+    if (new RegExp(`\\b${weekdays[i]}\\b`).test(lower)) {
+      const d = new Date(now);
+      const today = d.getDay();
+      let diff = today - i;
+      if (diff < 0) diff += 7;
+      d.setDate(d.getDate() - diff);
+      return iso(d);
+    }
+  }
+
+  // Month-name patterns: "8th of april", "april 8", "8 april"
+  const months = ['january','february','march','april','may','june','july','august','september','october','november','december'];
+  for (let i = 0; i < months.length; i++) {
+    const m = months[i];
+    // Day-then-month: "8 april", "8th of april", "8th april"
+    const dm = lower.match(new RegExp(`\\b(\\d{1,2})(?:st|nd|rd|th)?(?:\\s+of)?\\s+${m}\\b`));
+    if (dm) {
+      const day = Number(dm[1]);
+      // Year: assume current year, but if that date is in the future by
+      // more than ~7 days, roll back to last year.
+      let year = now.getFullYear();
+      const candidate = new Date(year, i, day);
+      if (candidate.getTime() - now.getTime() > 7 * 86_400_000) year--;
+      const dd = new Date(year, i, day);
+      return iso(dd);
+    }
+    // Month-then-day: "april 8", "april 8th"
+    const md = lower.match(new RegExp(`\\b${m}\\s+(\\d{1,2})(?:st|nd|rd|th)?\\b`));
+    if (md) {
+      const day = Number(md[1]);
+      let year = now.getFullYear();
+      const candidate = new Date(year, i, day);
+      if (candidate.getTime() - now.getTime() > 7 * 86_400_000) year--;
+      const dd = new Date(year, i, day);
+      return iso(dd);
+    }
+  }
+
+  // Numeric D/M/YYYY or D/M (NZ-style — day first)
+  const dm = text.match(/\b(\d{1,2})\/(\d{1,2})(?:\/(\d{2,4}))?\b/);
+  if (dm) {
+    const day = Number(dm[1]);
+    const month = Number(dm[2]);
+    let yearStr = dm[3];
+    let year = yearStr ? Number(yearStr) : now.getFullYear();
+    if (yearStr && yearStr.length === 2) year = year < 70 ? 2000 + year : 1900 + year;
+    if (month >= 1 && month <= 12 && day >= 1 && day <= 31) {
+      const dd = new Date(year, month - 1, day);
+      return iso(dd);
+    }
+  }
+
+  return undefined;
+}
+
 export function parseNaturalLanguage(text: string): ParsedEntry {
   const trimmed = text.trim();
   const type = detectType(trimmed);
@@ -170,6 +254,7 @@ export function parseNaturalLanguage(text: string): ParsedEntry {
   const clientName = extractClientName(trimmed);
   const supplier = type === 'expense' ? extractSupplier(trimmed) : undefined;
   const category = type === 'expense' ? guessCategory(trimmed) : undefined;
+  const entryDate = extractDate(trimmed);
 
   const confidence =
     type !== 'note' && (amount !== undefined || hours !== undefined)
@@ -186,6 +271,7 @@ export function parseNaturalLanguage(text: string): ParsedEntry {
     hours,
     category,
     supplier,
+    entryDate,
     description: trimmed,
     confidence,
   };

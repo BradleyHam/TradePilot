@@ -72,10 +72,27 @@ export function jobStats(job: Job, entries: Entry[]): JobStats {
     .filter((e) => e.type === 'income')
     .reduce((s, e) => s + entryExGst(e), 0);
 
-  // Expected income: prefer hard data over guesses.
+  // Expected income: prefer the most authoritative number for the job's
+  // current stage. The fallback ladder differs between "still in progress"
+  // and "invoiced/done":
+  //
+  //   in-progress and friends: actual income > quote > estimate
+  //     → on a live job, only what's been received is real; the quote is
+  //       a forecast.
+  //   invoiced / completed / paid: invoice > actual income > quote
+  //     → once you've sent the final invoice, THAT is what you've earned.
+  //       Partial received income (e.g. deposit only) under-counts because
+  //       the rest is just sitting in your customer's bank, not yours, but
+  //       you've still earned it for hourly-rate / profitability purposes.
+  const isFinalised = job.status === 'invoiced'
+    || job.status === 'completed'
+    || job.status === 'paid';
+
   let expectedIncome = 0;
   let expectedIsConfident = true;
-  if (totalIncome > 0) {
+  if (isFinalised && job.invoiceAmount && job.invoiceAmount > 0) {
+    expectedIncome = job.invoiceAmount;
+  } else if (totalIncome > 0) {
     expectedIncome = totalIncome;
   } else if (job.invoiceAmount && job.invoiceAmount > 0) {
     expectedIncome = job.invoiceAmount;

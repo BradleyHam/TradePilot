@@ -258,6 +258,61 @@ create trigger settings_updated_at
   for each row execute function update_updated_at();
 
 -- ============================================================
+-- INVOICES
+-- ============================================================
+-- A job can have many invoices: deposit, optional progress, final.
+-- jobs.invoice_amount remains the agreed total work value (quote +
+-- variations); invoices document what's been billed against it.
+-- Marking an invoice paid auto-creates an income entry and links back
+-- via income_entry_id so the cash-basis side stays in sync.
+create table if not exists invoices (
+  id              uuid primary key default gen_random_uuid(),
+  business_id     uuid references businesses(id) on delete cascade not null,
+  job_id          uuid references jobs(id) on delete cascade not null,
+
+  invoice_number  text not null,
+  invoice_date    date not null default current_date,
+
+  kind            text not null default 'final'
+                    check (kind in ('deposit','progress','final')),
+
+  amount_ex_gst   numeric(10,2) not null,
+  gst_applies     boolean default true not null,
+  gst_component   numeric(10,2),
+  amount_incl_gst numeric(10,2),
+
+  paid            boolean default false not null,
+  paid_date       date,
+  paid_via        text,
+  -- Link to the auto-created income entry (or any existing entry the
+  -- migration matched up). Nulled if the entry is later deleted; the
+  -- invoice survives.
+  income_entry_id uuid references entries(id) on delete set null,
+
+  notes           text,
+  created_at      timestamptz default now() not null,
+  updated_at      timestamptz default now() not null,
+
+  -- Per-business unique invoice numbers
+  unique (business_id, invoice_number)
+);
+
+alter table invoices enable row level security;
+
+create policy "Users can manage own invoices"
+  on invoices for all using (
+    business_id in (select id from businesses where owner_id = auth.uid())
+  );
+
+create index invoices_job_id_idx on invoices(job_id);
+create index invoices_business_id_idx on invoices(business_id);
+create index invoices_paid_idx on invoices(paid);
+
+create trigger invoices_updated_at
+  before update on invoices
+  for each row execute function update_updated_at();
+
+-- ============================================================
 -- INDEXES on entries.legacy/GST for import + dashboard queries
 -- ============================================================
 create index if not exists jobs_legacy_id_idx on jobs(legacy_id);

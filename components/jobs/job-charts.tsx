@@ -89,7 +89,14 @@ export function HourlyRateGauge({ hourlyRate, isExpected = false }: HourlyRateGa
         <p className={cn('text-xs font-medium', statusColor)}>{status}</p>
       </div>
 
-      <div className="relative">
+      {/*
+        Cap the gauge width on desktop. Without this, the SVG's `w-full h-auto`
+        + 200×110 aspect ratio means a 1400px container yields a 770px-tall
+        gauge — it ate the entire viewport on desktop. 360px fits a phone
+        screen edge-to-edge while keeping the gauge a sensible size on a
+        laptop or external display.
+      */}
+      <div className="relative mx-auto w-full max-w-[360px]">
         <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" aria-hidden>
           {/* Zones */}
           <path d={arcPath(GAUGE_MIN, ZONE_RED)} stroke="#ef4444" strokeWidth="14" fill="none" strokeLinecap="butt" />

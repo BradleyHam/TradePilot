@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import { PageHeader } from '@/components/shared/page-header';
 import { StatCard } from '@/components/money/stat-card';
@@ -8,73 +8,122 @@ import { RevenueChart } from '@/components/money/revenue-chart';
 import { ExpenseChart } from '@/components/money/expense-chart';
 import { TransactionList } from '@/components/money/transaction-list';
 import { TaxExposureCard } from '@/components/money/tax-exposure-card';
+import {
+  TimeframeSelector,
+  type Timeframe, type TimeframeKind,
+  smartDefault, frameFor,
+} from '@/components/money/timeframe-selector';
+import {
+  earnedIncomeInWindow, cashIncomeInWindow, earnedIncomeByMonth,
+} from '@/lib/income-allocator';
 import { MonthlyData, CategoryData } from '@/lib/types';
+import { cn } from '@/lib/utils';
 import {
   TrendingUp, TrendingDown, Receipt, Clock, AlertCircle, FileText,
   Briefcase, DollarSign,
 } from 'lucide-react';
-import { format, parseISO, startOfMonth, isSameMonth } from 'date-fns';
+import { format, parseISO, isSameMonth, addMonths, startOfMonth, differenceInCalendarMonths } from 'date-fns';
 
 export default function MoneyPage() {
   const { entries, jobs } = useStore();
   const now = new Date();
 
-  const thisMonthEntries = useMemo(
-    () => entries.filter((e) => isSameMonth(parseISO(e.entryDate), now)),
-    [entries]
+  // Default selection: this month if data exists, else last month.
+  const [kind, setKind] = useState<TimeframeKind>(() =>
+    smartDefault(entries.map((e) => e.entryDate), now),
+  );
+  const [customFrame, setCustomFrame] = useState<Timeframe | null>(null);
+  const frame = frameFor(kind, customFrame, now);
+
+  // Cash vs Earned basis — defaults to Earned because that answers "did I
+  // actually have a good month" rather than "what hit the bank account".
+  const [basis, setBasis] = useState<'cash' | 'earned'>('earned');
+
+  // Entries that fall inside the selected window.
+  const windowEntries = useMemo(
+    () => entries.filter((e) => e.entryDate >= frame.start && e.entryDate <= frame.end),
+    [entries, frame.start, frame.end],
   );
 
-  const revenue = useMemo(
-    () => thisMonthEntries.filter((e) => e.type === 'income').reduce((s, e) => s + (e.amount ?? 0), 0),
-    [thisMonthEntries]
+  // ── KPIs (timeframe-bound) ─────────────────────────────────────────────────
+  // Cash income — money that actually landed in the window.
+  const cashRevenue = useMemo(
+    () => cashIncomeInWindow(entries, frame.start, frame.end),
+    [entries, frame.start, frame.end],
   );
+  // Earned income — for each completed/invoiced/paid job, allocate its quote
+  // amount across months by hours-share, then sum the months in the window.
+  const earnedRevenue = useMemo(
+    () => earnedIncomeInWindow(jobs, entries, frame.start, frame.end),
+    [jobs, entries, frame.start, frame.end],
+  );
+  const revenue = basis === 'earned' ? earnedRevenue : cashRevenue;
+
   const expenses = useMemo(
-    () => thisMonthEntries.filter((e) => e.type === 'expense').reduce((s, e) => s + (e.amount ?? 0), 0),
-    [thisMonthEntries]
+    () => windowEntries.filter((e) => e.type === 'expense').reduce((s, e) => s + (e.amount ?? 0), 0),
+    [windowEntries],
   );
   const profit = revenue - expenses;
+  const totalHoursInWindow = useMemo(
+    () => windowEntries.filter((e) => e.type === 'hours').reduce((s, e) => s + (e.hours ?? 0), 0),
+    [windowEntries],
+  );
+  const avgHourlyReturn = totalHoursInWindow > 0 ? revenue / totalHoursInWindow : 0;
 
+  // ── State-of-business stats (NOT timeframe-bound) ─────────────────────────
   const unpaidInvoices = jobs
     .filter((j) => j.status === 'invoiced')
     .reduce((s, j) => s + (j.invoiceAmount ?? j.quoteAmount ?? 0), 0);
-
   const awaitingQuotes = jobs.filter((j) => j.status === 'quoted').length;
-
   const upcomingBills = entries
     .filter((e) => e.type === 'bill' && e.dueDate && new Date(e.dueDate) >= now)
     .reduce((s, e) => s + (e.amount ?? 0), 0);
-
   const pipelineValue = jobs
     .filter((j) => !['paid', 'lost'].includes(j.status))
     .reduce((s, j) => s + (j.quoteAmount ?? j.estimatedValue ?? 0), 0);
 
-  const totalHoursThisMonth = useMemo(
-    () => thisMonthEntries.filter((e) => e.type === 'hours').reduce((s, e) => s + (e.hours ?? 0), 0),
-    [thisMonthEntries]
-  );
-  const avgHourlyReturn = totalHoursThisMonth > 0 ? revenue / totalHoursThisMonth : 0;
-
-  // Monthly chart data (last 3 months)
+  // ── Charts ─────────────────────────────────────────────────────────────────
+  // Revenue vs Expenses chart: one bar per month in the selected window
+  // (capped at 12 to keep it readable).
   const monthlyData: MonthlyData[] = useMemo(() => {
-    const months = [
-      new Date(now.getFullYear(), now.getMonth() - 2, 1),
-      new Date(now.getFullYear(), now.getMonth() - 1, 1),
-      new Date(now.getFullYear(), now.getMonth(), 1),
-    ];
-    return months.map((month) => {
-      const monthEntries = entries.filter((e) => isSameMonth(parseISO(e.entryDate), month));
+    const startMonth = startOfMonth(parseISO(frame.start));
+    const endMonth = startOfMonth(parseISO(frame.end));
+    const months: Date[] = [];
+    let cursor = startMonth;
+    while (cursor <= endMonth && months.length < 12) {
+      months.push(cursor);
+      cursor = addMonths(cursor, 1);
+    }
+    // If the window only spans one month, also pull in the previous two so
+    // the chart isn't a lonely bar on its own.
+    if (months.length === 1) {
+      months.unshift(addMonths(months[0], -1));
+      months.unshift(addMonths(months[0], -1));
+    }
+    // For earned basis we need the YYYY-MM keys to ask the allocator.
+    const monthKeys = months.map((m) => format(m, 'yyyy-MM'));
+    const earnedByMonth = basis === 'earned'
+      ? earnedIncomeByMonth(jobs, entries, monthKeys)
+      : null;
+
+    return months.map((m, i) => {
+      const monthEntries = entries.filter((e) => isSameMonth(parseISO(e.entryDate), m));
+      const cashRev = monthEntries
+        .filter((e) => e.type === 'income')
+        .reduce((s, e) => s + (e.amount ?? 0), 0);
+      const earnedRev = earnedByMonth?.get(monthKeys[i]) ?? 0;
       return {
-        month: format(month, 'MMM'),
-        revenue: monthEntries.filter((e) => e.type === 'income').reduce((s, e) => s + (e.amount ?? 0), 0),
+        month: format(m, 'MMM'),
+        revenue: basis === 'earned' ? earnedRev : cashRev,
         expenses: monthEntries.filter((e) => e.type === 'expense').reduce((s, e) => s + (e.amount ?? 0), 0),
       };
     });
-  }, [entries]);
+  }, [entries, jobs, frame.start, frame.end, basis]);
 
-  // Expense breakdown (all time)
+  // Expense breakdown for the selected window.
   const expenseByCategory: CategoryData[] = useMemo(() => {
     const map: Record<string, number> = {};
-    entries
+    windowEntries
       .filter((e) => e.type === 'expense' && e.category)
       .forEach((e) => {
         const cat = e.category!;
@@ -83,28 +132,75 @@ export default function MoneyPage() {
     return Object.entries(map)
       .map(([category, amount]) => ({ category, amount }))
       .sort((a, b) => b.amount - a.amount);
-  }, [entries]);
+  }, [windowEntries]);
 
   const fmt = (n: number) => `$${n.toLocaleString('en-NZ')}`;
+
+  // Headings adapt to the selected window so labels never lie.
+  const isMultiMonth = differenceInCalendarMonths(parseISO(frame.end), parseISO(frame.start)) >= 1;
+  const periodLabel = isMultiMonth ? 'in period' : 'this month';
 
   return (
     <div className="flex flex-col min-h-full">
       <PageHeader
         title="Money"
-        subtitle={format(now, 'MMMM yyyy')}
+        subtitle={frame.label}
       />
 
       <div className="px-4 md:px-6 pb-6 space-y-3">
-        {/* Top stats grid */}
+        {/* Timeframe filter */}
+        <TimeframeSelector
+          kind={kind}
+          custom={customFrame}
+          onChange={(k, c) => { setKind(k); setCustomFrame(c); }}
+        />
+
+        {/* Cash vs Earned basis toggle */}
+        <div className="flex items-center gap-2">
+          <div className="inline-flex bg-muted rounded-lg p-0.5">
+            <button
+              onClick={() => setBasis('earned')}
+              className={cn(
+                'px-3 h-8 rounded-md text-xs font-medium transition-colors',
+                basis === 'earned'
+                  ? 'bg-card shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              Earned
+            </button>
+            <button
+              onClick={() => setBasis('cash')}
+              className={cn(
+                'px-3 h-8 rounded-md text-xs font-medium transition-colors',
+                basis === 'cash'
+                  ? 'bg-card shadow-sm text-foreground'
+                  : 'text-muted-foreground hover:text-foreground',
+              )}
+            >
+              Cash
+            </button>
+          </div>
+          <p className="text-[10px] text-muted-foreground italic flex-1">
+            {basis === 'earned'
+              ? 'Income split across months by hours worked. Pending jobs excluded.'
+              : 'Income on the date payment hit the bank.'}
+          </p>
+        </div>
+
+        {/* Top stats grid — bound to the selected window */}
         <div className="grid grid-cols-2 gap-2.5">
           <StatCard
-            label="Revenue this month"
+            label={`Revenue ${periodLabel}`}
             value={fmt(revenue)}
             icon={TrendingUp}
             accent="green"
+            subvalue={basis === 'earned' && cashRevenue !== earnedRevenue
+              ? `Cash received: ${fmt(cashRevenue)}`
+              : undefined}
           />
           <StatCard
-            label="Expenses this month"
+            label={`Expenses ${periodLabel}`}
             value={fmt(expenses)}
             icon={Receipt}
             accent="red"
@@ -114,7 +210,7 @@ export default function MoneyPage() {
             value={fmt(profit)}
             icon={DollarSign}
             accent={profit >= 0 ? 'green' : 'red'}
-            subvalue={totalHoursThisMonth > 0 ? `${totalHoursThisMonth}h worked` : undefined}
+            subvalue={totalHoursInWindow > 0 ? `${totalHoursInWindow}h worked` : undefined}
           />
           <StatCard
             label="Avg hourly return"
@@ -124,7 +220,7 @@ export default function MoneyPage() {
           />
         </div>
 
-        {/* Secondary stats */}
+        {/* Secondary stats — state of the business, NOT period-bound */}
         <div className="grid grid-cols-2 gap-2.5">
           <StatCard
             label="Unpaid invoices"
@@ -154,20 +250,51 @@ export default function MoneyPage() {
           />
         </div>
 
-        {/* Tax exposure — glanceable estimate of GST + income tax for the year */}
+        {/* Tax exposure — independent annual scope */}
         <TaxExposureCard />
 
-        {/* Charts */}
+        {/* Reconcile entry point */}
+        <ReconcileEntryCard />
+
+        {/* Charts — adapt to the selected window */}
         <RevenueChart data={monthlyData} />
         {expenseByCategory.length > 0 && <ExpenseChart data={expenseByCategory} />}
 
-        {/* Pipeline by status */}
+        {/* Pipeline — state of business, not period-bound */}
         <PipelineBreakdown jobs={jobs} />
 
-        {/* Transactions — for spot-checking and duplicate hunting */}
+        {/* Transactions — has its own internal 30-day window + filters */}
         <TransactionList />
       </div>
     </div>
+  );
+}
+
+function ReconcileEntryCard() {
+  const { bankTransactions } = useStore();
+  const pending = bankTransactions.filter((t) => t.status === 'unreconciled').length;
+
+  return (
+    <a
+      href="/reconcile"
+      className="block bg-card border border-border rounded-2xl p-4 hover:bg-muted/30 active:bg-muted/50 transition-colors"
+    >
+      <div className="flex items-center justify-between gap-3">
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-foreground">Bank reconcile</p>
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            {pending > 0
+              ? `${pending} bank transaction${pending !== 1 ? 's' : ''} waiting`
+              : 'Drop in a BNZ CSV to reconcile transactions'}
+          </p>
+        </div>
+        {pending > 0 && (
+          <span className="inline-flex items-center justify-center min-w-[1.5rem] h-6 px-2 rounded-full bg-amber-100 text-amber-800 text-[11px] font-bold tabular-nums">
+            {pending}
+          </span>
+        )}
+      </div>
+    </a>
   );
 }
 

@@ -134,7 +134,32 @@ export interface Entry {
   paid?: boolean;
   paidDate?: string;
   paymentRef?: string;
+  /** Set when reconciled to a bank transaction. */
+  bankTransactionId?: string;
   createdAt: string;
+}
+
+export type BankTransactionStatus = 'unreconciled' | 'matched' | 'ignored' | 'personal';
+
+export interface BankTransaction {
+  id: string;
+  businessId: string;
+  bankAccountId?: string;
+  txnDate: string;
+  /** Signed: negative for debits, positive for credits. */
+  amount: number;
+  payee?: string;
+  particulars?: string;
+  code?: string;
+  reference?: string;
+  tranType?: string;
+  otherPartyAccount?: string;
+  description: string;
+  fingerprint: string;
+  status: BankTransactionStatus;
+  entryId?: string;
+  notes?: string;
+  importedAt: string;
 }
 
 export interface Material {
@@ -188,6 +213,29 @@ export interface Setting {
   updatedAt: string;
 }
 
+export type InvoiceKind = 'deposit' | 'progress' | 'final';
+
+export interface Invoice {
+  id: string;
+  businessId: string;
+  jobId: string;
+  invoiceNumber: string;
+  invoiceDate: string;
+  kind: InvoiceKind;
+  amountExGst: number;
+  gstApplies: boolean;
+  gstComponent?: number;
+  amountInclGst?: number;
+  paid: boolean;
+  paidDate?: string;
+  paidVia?: string;
+  /** When marked paid, an income entry is auto-created and linked here. */
+  incomeEntryId?: string;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface ScheduleItem {
   id: string;
   businessId: string;
@@ -220,6 +268,8 @@ export interface ParsedEntry {
   supplier?: string;
   description: string;
   dueDate?: string;
+  /** ISO YYYY-MM-DD if the parser detected a date in the text. */
+  entryDate?: string;
   confidence: 'high' | 'medium' | 'low';
 }
 

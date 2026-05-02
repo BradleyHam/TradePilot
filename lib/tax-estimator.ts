@@ -27,11 +27,22 @@ export function taxYearOf(date: Date = new Date()): TaxYear {
   const y = date.getFullYear();
   // April 1 → March 31. If we're in Jan/Feb/Mar, the tax year started the prior April.
   const startYear = date.getMonth() < 3 ? y - 1 : y;
+  return taxYearStartingIn(startYear);
+}
+
+/** Build a TaxYear given the calendar year it STARTS in (April). */
+export function taxYearStartingIn(startYear: number): TaxYear {
   return {
     start: `${startYear}-04-01`,
     end:   `${startYear + 1}-03-31`,
     label: `${String(startYear).slice(-2)}/${String(startYear + 1).slice(-2)}`,
   };
+}
+
+/** Returns the NZ tax year that finished immediately before `date`. */
+export function previousTaxYearOf(date: Date = new Date()): TaxYear {
+  const cur = taxYearOf(date);
+  return taxYearStartingIn(parseInt(cur.start.slice(0, 4), 10) - 1);
 }
 
 /** How many days into the tax year `now` is. Clamped to [0, daysInYear]. */

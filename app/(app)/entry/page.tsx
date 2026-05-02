@@ -65,7 +65,9 @@ export default function EntryPage() {
       supplier: parsed.supplier,
       gstApplies: parsed.type === 'expense' || parsed.type === 'income' || parsed.type === 'bill',
       description: parsed.description,
-      entryDate: new Date().toISOString().split('T')[0],
+      // Use the date the parser detected if present (e.g. "8th of April"),
+      // otherwise default to today.
+      entryDate: parsed.entryDate ?? new Date().toISOString().split('T')[0],
       createdAt: new Date().toISOString(),
     };
     addEntry(entry);

@@ -2,9 +2,10 @@
 // Keep all column-name knowledge here so the rest of the app stays clean.
 
 import type {
-  Job, Entry, ScheduleItem, Material, Quote, Setting,
+  Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
-  ProductType, Finish, Unit, QuoteStatus, ScheduleItemType,
+  ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
+  BankTransactionStatus,
 } from '../types';
 
 type Row = Record<string, unknown>;
@@ -92,6 +93,7 @@ export function rowToEntry(r: Row): Entry {
     paid: asBool(r.paid, false),
     paidDate: asString(r.paid_date),
     paymentRef: asString(r.payment_ref),
+    bankTransactionId: asString(r.bank_transaction_id),
     createdAt: r.created_at as string,
   };
 }
@@ -117,6 +119,7 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.paid !== undefined) out.paid = e.paid;
   if (e.paidDate !== undefined) out.paid_date = e.paidDate || null;
   if (e.paymentRef !== undefined) out.payment_ref = e.paymentRef || null;
+  if (e.bankTransactionId !== undefined) out.bank_transaction_id = e.bankTransactionId || null;
   return out;
 }
 
@@ -209,4 +212,89 @@ export function rowToSetting(r: Row): Setting {
     notes: asString(r.notes),
     updatedAt: r.updated_at as string,
   };
+}
+
+// ── Invoice ─────────────────────────────────────────────────────────────────
+export function rowToInvoice(r: Row): Invoice {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    invoiceNumber: r.invoice_number as string,
+    invoiceDate: r.invoice_date as string,
+    kind: (r.kind as InvoiceKind) ?? 'final',
+    amountExGst: asNumber(r.amount_ex_gst) ?? 0,
+    gstApplies: asBool(r.gst_applies, true),
+    gstComponent: asNumber(r.gst_component),
+    amountInclGst: asNumber(r.amount_incl_gst),
+    paid: asBool(r.paid, false),
+    paidDate: asString(r.paid_date),
+    paidVia: asString(r.paid_via),
+    incomeEntryId: asString(r.income_entry_id),
+    notes: asString(r.notes),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function invoiceToRow(inv: Partial<Invoice>): Row {
+  const out: Row = {};
+  if (inv.businessId !== undefined)     out.business_id     = inv.businessId;
+  if (inv.jobId !== undefined)          out.job_id          = inv.jobId;
+  if (inv.invoiceNumber !== undefined)  out.invoice_number  = inv.invoiceNumber;
+  if (inv.invoiceDate !== undefined)    out.invoice_date    = inv.invoiceDate;
+  if (inv.kind !== undefined)           out.kind            = inv.kind;
+  if (inv.amountExGst !== undefined)    out.amount_ex_gst   = inv.amountExGst;
+  if (inv.gstApplies !== undefined)     out.gst_applies     = inv.gstApplies;
+  if (inv.gstComponent !== undefined)   out.gst_component   = inv.gstComponent ?? null;
+  if (inv.amountInclGst !== undefined)  out.amount_incl_gst = inv.amountInclGst ?? null;
+  if (inv.paid !== undefined)           out.paid            = inv.paid;
+  if (inv.paidDate !== undefined)       out.paid_date       = inv.paidDate || null;
+  if (inv.paidVia !== undefined)        out.paid_via        = inv.paidVia || null;
+  if (inv.incomeEntryId !== undefined)  out.income_entry_id = inv.incomeEntryId || null;
+  if (inv.notes !== undefined)          out.notes           = inv.notes || null;
+  return out;
+}
+
+// ── BankTransaction ─────────────────────────────────────────────────────────
+export function rowToBankTransaction(r: Row): BankTransaction {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    bankAccountId: asString(r.bank_account_id),
+    txnDate: r.txn_date as string,
+    amount: asNumber(r.amount) ?? 0,
+    payee: asString(r.payee),
+    particulars: asString(r.particulars),
+    code: asString(r.code),
+    reference: asString(r.reference),
+    tranType: asString(r.tran_type),
+    otherPartyAccount: asString(r.other_party_account),
+    description: r.description as string,
+    fingerprint: r.fingerprint as string,
+    status: (r.status as BankTransactionStatus) ?? 'unreconciled',
+    entryId: asString(r.entry_id),
+    notes: asString(r.notes),
+    importedAt: r.imported_at as string,
+  };
+}
+
+export function bankTransactionToRow(t: Partial<BankTransaction>): Row {
+  const out: Row = {};
+  if (t.businessId !== undefined)        out.business_id         = t.businessId;
+  if (t.bankAccountId !== undefined)     out.bank_account_id     = t.bankAccountId || null;
+  if (t.txnDate !== undefined)           out.txn_date            = t.txnDate;
+  if (t.amount !== undefined)            out.amount              = t.amount;
+  if (t.payee !== undefined)             out.payee               = t.payee || null;
+  if (t.particulars !== undefined)       out.particulars         = t.particulars || null;
+  if (t.code !== undefined)              out.code                = t.code || null;
+  if (t.reference !== undefined)         out.reference           = t.reference || null;
+  if (t.tranType !== undefined)          out.tran_type           = t.tranType || null;
+  if (t.otherPartyAccount !== undefined) out.other_party_account = t.otherPartyAccount || null;
+  if (t.description !== undefined)       out.description         = t.description;
+  if (t.fingerprint !== undefined)       out.fingerprint         = t.fingerprint;
+  if (t.status !== undefined)            out.status              = t.status;
+  if (t.entryId !== undefined)           out.entry_id            = t.entryId || null;
+  if (t.notes !== undefined)             out.notes               = t.notes || null;
+  return out;
 }
