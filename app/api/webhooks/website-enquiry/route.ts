@@ -122,14 +122,11 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  // Either a message or a service must be present so the lead has *some*
-  // context. Both being empty likely means a misconfigured caller.
-  if (!message && !service) {
-    return NextResponse.json(
-      { ok: false, error: 'Need at least one of message or service.' },
-      { status: 400 },
-    );
-  }
+  // Message and service are both optional. The hero form on the website
+  // doesn't have a message field and has an unselected service dropdown by
+  // default — a name + contact-method-only submission is still a real lead
+  // that we want to capture. The job will be named "Website enquiry — {name}"
+  // in that case.
 
   // ── 3. Resolve business id ─────────────────────────────────────────────
   const businessId = process.env.TRADEPILOT_BUSINESS_ID;
@@ -169,33 +166,33 @@ export async function POST(req: Request) {
   }
 
   // ── 5. Compose name + notes ────────────────────────────────────────────
-  // Notes (priority): full message → service → "(no details provided)"
-  // Always append the page URL if present, for context.
+  // Notes (priority): full message → service line → "Website enquiry — no
+  // additional details provided." Always append the page URL if present.
   const notesParts: string[] = [];
   if (message) {
     notesParts.push(message);
   } else if (service) {
     notesParts.push(`Service requested: ${service}`);
   } else {
-    notesParts.push('(no details provided)');
+    notesParts.push('Website enquiry — no additional details provided. Follow up with the contact details on file.');
   }
   if (pageUrl) notesParts.push(`\n\n— from ${pageUrl}`);
   const notes = notesParts.join('');
 
   // Job name (priority):
   //   1. First sentence of message if it's a reasonable length
-  //   2. "{Service} enquiry — {name}" if a service was selected
-  //   3. "Enquiry from {name}" as the boring fallback
+  //   2. "{Service} — {name}" if a service was selected
+  //   3. "Website enquiry — {name}" as the boring fallback
   let jobName: string;
   if (message) {
     const firstLine = message.split(/[\n.]/)[0].trim();
     jobName = firstLine.length >= 4 && firstLine.length <= 80
       ? firstLine
-      : `Enquiry from ${name}`;
+      : `Website enquiry — ${name}`;
   } else if (service) {
     jobName = `${service} — ${name}`;
   } else {
-    jobName = `Enquiry from ${name}`;
+    jobName = `Website enquiry — ${name}`;
   }
 
   const { data: inserted, error: insertErr } = await admin
