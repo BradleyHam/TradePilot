@@ -34,6 +34,8 @@ const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
   { label: 'Booked',      value: 'booked' },
   { label: 'Invoiced',    value: 'invoiced' },
   { label: 'Paid',        value: 'paid' },
+  // Sits at the end — only relevant when reviewing what didn't convert.
+  { label: 'Lost',        value: 'lost' },
 ];
 
 export default function JobsPage() {
@@ -45,7 +47,10 @@ export default function JobsPage() {
 
   const filteredJobs = jobs.filter((j) => {
     const matchesFilter =
-      filter === 'all' ? true
+      // 'All' hides lost jobs by default — they only appear when explicitly
+      // requested via the 'Lost' chip. Avoids cluttering the default view
+      // with dead leads while still leaving them findable.
+      filter === 'all' ? j.status !== 'lost'
       : filter === 'coming-up' ? COMING_UP_STATUSES.includes(j.status)
       : j.status === filter;
     const matchesSearch =
