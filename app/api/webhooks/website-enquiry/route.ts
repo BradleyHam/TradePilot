@@ -26,11 +26,30 @@ interface EnquiryPayload {
   name?: unknown;
   email?: unknown;
   phone?: unknown;
+  /** Optional. Long-form text from a textarea/message field. */
   message?: unknown;
+  /** Optional. Service category from a dropdown, e.g. "interior", "exterior". */
+  service?: unknown;
   /** e.g. "/contact", "/services/exterior". Stored in notes for context. */
   pageUrl?: unknown;
   /** Defaults to 'website' when omitted. */
   source?: unknown;
+}
+
+/** Map raw service slugs from the form's dropdown to friendlier display text. */
+function prettyService(slug: string): string {
+  const normalized = slug.toLowerCase().trim();
+  const map: Record<string, string> = {
+    interior: 'Interior painting',
+    exterior: 'Exterior painting',
+    roof: 'Roof painting',
+    wallpapering: 'Wallpapering',
+    wallpaper: 'Wallpapering',
+    commercial: 'Commercial',
+    residential: 'Residential',
+    other: 'Other services',
+  };
+  return map[normalized] ?? slug;
 }
 
 function asString(v: unknown): string | undefined {
@@ -86,6 +105,8 @@ export async function POST(req: Request) {
   const email = asString(body.email);
   const phone = asString(body.phone);
   const message = asString(body.message);
+  const serviceRaw = asString(body.service);
+  const service = serviceRaw ? prettyService(serviceRaw) : undefined;
   const pageUrl = asString(body.pageUrl);
   const source = asString(body.source) ?? 'website';
 
@@ -101,9 +122,11 @@ export async function POST(req: Request) {
       { status: 400 },
     );
   }
-  if (!message) {
+  // Either a message or a service must be present so the lead has *some*
+  // context. Both being empty likely means a misconfigured caller.
+  if (!message && !service) {
     return NextResponse.json(
-      { ok: false, error: 'Missing required field: message.' },
+      { ok: false, error: 'Need at least one of message or service.' },
       { status: 400 },
     );
   }
@@ -123,38 +146,57 @@ export async function POST(req: Request) {
   }
   const admin = adminOrErr;
 
-  // ── 4. Dedupe: skip if same email + same message arrived in last 5 min ─
+  // ── 4. Dedupe: any lead from the same email + same source within the last
+  //    5 minutes is treated as a duplicate. We don't bother matching message
+  //    contents — two submissions from the same email in 5 minutes is almost
+  //    certainly a double-click rather than two genuine enquiries.
   if (email) {
     const fiveMinAgo = new Date(Date.now() - 5 * 60 * 1000).toISOString();
-    const messagePrefix = message.slice(0, 100);
     const { data: existing, error: dedupeErr } = await admin
       .from('jobs')
-      .select('id, notes')
+      .select('id')
       .eq('business_id', businessId)
       .eq('client_email', email)
       .eq('source', source)
       .gte('created_at', fiveMinAgo)
-      .limit(5);
+      .limit(1);
     if (dedupeErr) {
       console.error('[website-enquiry] dedupe query failed', dedupeErr);
       // Don't block on dedupe failure — better to risk a dupe than lose a lead.
-    } else if (existing && existing.some(row => (row.notes as string | null)?.includes(messagePrefix))) {
-      const dupId = existing.find(row => (row.notes as string | null)?.includes(messagePrefix))!.id as string;
-      return NextResponse.json({ ok: true, jobId: dupId, dedup: true });
+    } else if (existing && existing.length > 0) {
+      return NextResponse.json({ ok: true, jobId: existing[0].id as string, dedup: true });
     }
   }
 
-  // ── 5. Insert lead ─────────────────────────────────────────────────────
-  const notesParts: string[] = [message];
+  // ── 5. Compose name + notes ────────────────────────────────────────────
+  // Notes (priority): full message → service → "(no details provided)"
+  // Always append the page URL if present, for context.
+  const notesParts: string[] = [];
+  if (message) {
+    notesParts.push(message);
+  } else if (service) {
+    notesParts.push(`Service requested: ${service}`);
+  } else {
+    notesParts.push('(no details provided)');
+  }
   if (pageUrl) notesParts.push(`\n\n— from ${pageUrl}`);
   const notes = notesParts.join('');
 
-  // Job name: use the message's first sentence/line, capped at 80 chars,
-  // falling back to the client name if the message starts with junk.
-  const firstLine = message.split(/[\n.]/)[0].trim();
-  const jobName = firstLine.length >= 4 && firstLine.length <= 80
-    ? firstLine
-    : `Enquiry from ${name}`;
+  // Job name (priority):
+  //   1. First sentence of message if it's a reasonable length
+  //   2. "{Service} enquiry — {name}" if a service was selected
+  //   3. "Enquiry from {name}" as the boring fallback
+  let jobName: string;
+  if (message) {
+    const firstLine = message.split(/[\n.]/)[0].trim();
+    jobName = firstLine.length >= 4 && firstLine.length <= 80
+      ? firstLine
+      : `Enquiry from ${name}`;
+  } else if (service) {
+    jobName = `${service} — ${name}`;
+  } else {
+    jobName = `Enquiry from ${name}`;
+  }
 
   const { data: inserted, error: insertErr } = await admin
     .from('jobs')
