@@ -171,6 +171,11 @@ export async function POST(req: Request) {
     );
   }
 
+  // TEMP: log full payload so we can grab the Gmail forwarding-address
+  // verification code/URL when adding bradleyjamesham@gmail.com as a
+  // forwarding source. REMOVE once the One NZ filter is verified.
+  console.log('CLOUDMAILIN_RAW_PAYLOAD:', JSON.stringify(body));
+
   // CloudMailin lowercases header keys. Tolerate either case anyway.
   const headers = (body.headers && typeof body.headers === 'object')
     ? body.headers as Record<string, unknown>
