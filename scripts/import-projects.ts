@@ -3,22 +3,36 @@
  *
  * Walks /Users/bradleyhamilton/Desktop/lakeside-painting/projects (or a
  * configurable path), identifies each per-job folder, matches it to an
- * existing `jobs` row, classifies the files inside, and either prints a
- * dry-run report (default) or actually creates/updates `quotes` rows +
- * uploads attachments (--apply).
+ * existing `jobs` row, classifies the files, and either prints a dry-run
+ * report (default) or stages the import via the `job_imports` table for
+ * user review on Home (--apply).
  *
- * This first commit implements DRY RUN ONLY — no writes, no uploads. The
- * --apply path is wired up structurally (with TODO logging) so we can
- * verify the match logic against Brad's eyes before any data lands.
+ * The --apply step is non-destructive to real tables:
+ *   - Inserts/updates one row per folder in `job_imports` (NOT `jobs` or
+ *     `quotes` yet). Status = 'pending'.
+ *   - Uploads selected attachments (plans + a sample of photos) to the
+ *     `quote-attachments` bucket under a `_pending/{importId}/` prefix.
+ *   - Parses any quote PDF in the folder via Anthropic and stores the
+ *     extracted fields in `job_imports.parsed_data` for later review.
+ *
+ * The user then opens Home, sees "X imports to review" in the Flags
+ * card, expands it, and per-row taps Link / Create / Skip. The commit
+ * step (in the app, not here) copies the staged data into the real
+ * `jobs`/`quotes`/`quote_attachments` tables.
  *
  *   npx tsx scripts/import-projects.ts
- *     dry run, prints the proposed action per folder
+ *     dry run, prints the proposed action per folder + writes the
+ *     mapping CSV alongside the script
  *
  *   npx tsx scripts/import-projects.ts --projects-dir=/path/to/projects
  *     override the input folder if not at the default
  *
  *   npx tsx scripts/import-projects.ts --apply
- *     (not yet implemented — currently aborts with a TODO message)
+ *     write job_imports rows + upload files. Idempotent on re-run:
+ *     existing imports get UPDATED rather than duplicated.
+ *
+ *   npx tsx scripts/import-projects.ts --apply --limit=N
+ *     only process the first N folders (useful for incremental testing)
  *
  * Match strategy per folder, in order:
  *   1. Scan invoice filenames for a J-ID pattern (e.g. INV-J12-*.pdf
@@ -26,14 +40,19 @@
  *   2. If no J-ID found, fuzzy-match folder name against
  *      jobs.name + jobs.location + jobs.client_name. Score >= threshold
  *      = medium confidence; below = low/no match.
- *   3. Anything ambiguous is reported and skipped (no writes in --apply).
+ *   3. Anything ambiguous is reported. --apply still stages it as
+ *      pending with low/none confidence so the user can decide in-app.
  */
 
 import { config } from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { readdirSync, statSync, writeFileSync } from 'node:fs';
+import { readdirSync, readFileSync, statSync, writeFileSync } from 'node:fs';
 import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
+import { randomUUID } from 'node:crypto';
+import { extractText, getDocumentProxy } from 'unpdf';
+import { parseQuoteText } from '../lib/quote-parser';
+import type { FolderFileCounts, ParsedQuote } from '../lib/types';
 
 const HERE = dirname(fileURLToPath(import.meta.url));
 config({ path: join(HERE, '..', '.env.local') });
@@ -42,16 +61,30 @@ config({ path: join(HERE, '..', '.env.local') });
 const args = process.argv.slice(2);
 const APPLY = args.includes('--apply');
 const projectsDirArg = args.find((a) => a.startsWith('--projects-dir='));
+const limitArg = args.find((a) => a.startsWith('--limit='));
+const LIMIT = limitArg ? Number(limitArg.slice('--limit='.length)) : Infinity;
 const DEFAULT_PROJECTS_DIR = '/Users/bradleyhamilton/Desktop/lakeside-painting/projects';
 const PROJECTS_DIR = projectsDirArg
   ? projectsDirArg.slice('--projects-dir='.length)
   : DEFAULT_PROJECTS_DIR;
 
+// Photos per folder we'll upload. Plans are always all uploaded; photos
+// we sample down to keep Storage usage reasonable (per the earlier scope
+// decision: "plans + before/after photos only, ~100-150 files total").
+const MAX_PHOTOS_PER_IMPORT = 4;
+// Max file size we'll bother uploading. PDFs/photos over this skip.
+const MAX_FILE_BYTES = 12 * 1024 * 1024; // 12 MB
+
 // ─── Supabase ────────────────────────────────────────────────────────────────
 const SUPABASE_URL = process.env.NEXT_PUBLIC_SUPABASE_URL!;
 const SERVICE_KEY = process.env.SUPABASE_SERVICE_ROLE_KEY!;
+const BUSINESS_ID = process.env.TRADEPILOT_BUSINESS_ID!;
 if (!SUPABASE_URL || !SERVICE_KEY) {
   console.error('Missing NEXT_PUBLIC_SUPABASE_URL or SUPABASE_SERVICE_ROLE_KEY in .env.local');
+  process.exit(1);
+}
+if (APPLY && !BUSINESS_ID) {
+  console.error('Missing TRADEPILOT_BUSINESS_ID in .env.local (required for --apply)');
   process.exit(1);
 }
 const sb = createClient(SUPABASE_URL, SERVICE_KEY, {
@@ -453,17 +486,250 @@ async function main() {
 
   printReport(summaries);
 
-  // Write the mapping CSV alongside the script — Brad opens this in
-  // Numbers/Sheets to review and adjust decisions before --apply runs.
+  // Write the mapping CSV alongside the script — useful as a reference
+  // when reviewing on Home, even though the in-app review is now the
+  // primary interface. Same file as before; previous decisions you've
+  // hand-edited get overwritten on rerun.
   const mappingPath = join(HERE, 'import-projects-mapping.csv');
   writeMappingCsv(summaries, mappingPath);
   console.log(`\n📝  Mapping CSV written to:\n    ${mappingPath}\n`);
-  console.log('    Open this in Numbers/Sheets and review the `decision` column:');
-  console.log('      link    = use the suggested job_id (default for HIGH confidence)');
-  console.log('      review  = needs eyeballs (default for MEDIUM/LOW)');
-  console.log('      create  = create a new jobs row from this folder');
-  console.log('      skip    = leave this folder un-imported');
-  console.log('    Adjust suggested_job_id where the match is wrong, then re-run with --apply.');
+
+  if (!APPLY) {
+    console.log('💡  Dry run complete. Re-run with --apply to stage these into job_imports.');
+    return;
+  }
+
+  // ── APPLY: stage each folder into job_imports + upload attachments ───
+  console.log('\n🚀  --apply mode: writing job_imports rows + uploading attachments…');
+  if (LIMIT < summaries.length) {
+    console.log(`   (--limit=${LIMIT}; only the first ${LIMIT} folders will be processed)`);
+  }
+  let processed = 0;
+  let staged = 0;
+  let updated = 0;
+  let attachmentsUploaded = 0;
+  let parsesAttempted = 0;
+  let parsesSucceeded = 0;
+  for (const summary of summaries) {
+    if (processed >= LIMIT) break;
+    processed++;
+    const result = await applyOne(summary);
+    if (result.action === 'inserted') staged++;
+    else if (result.action === 'updated') updated++;
+    attachmentsUploaded += result.attachmentsUploaded;
+    if (result.parseAttempted) parsesAttempted++;
+    if (result.parseSucceeded) parsesSucceeded++;
+  }
+  console.log(`\n✅  --apply complete:`);
+  console.log(`   ${staged} new + ${updated} updated job_imports rows`);
+  console.log(`   ${attachmentsUploaded} files uploaded to Storage`);
+  console.log(`   ${parsesSucceeded}/${parsesAttempted} quote PDFs parsed`);
+  console.log(`\n   Open the app's Home page — the "Imports to review" flag should now`);
+  console.log(`   show ${staged + updated} drafts waiting for your decision.`);
+}
+
+// ── apply: per-folder commit logic ──────────────────────────────────────────
+
+interface ApplyResult {
+  action: 'inserted' | 'updated' | 'skipped-existing-committed' | 'error';
+  attachmentsUploaded: number;
+  parseAttempted: boolean;
+  parseSucceeded: boolean;
+  error?: string;
+}
+
+async function applyOne(summary: FolderSummary): Promise<ApplyResult> {
+  // Check whether this folder already has a job_imports row (idempotency).
+  const { data: existing, error: lookupErr } = await sb
+    .from('job_imports')
+    .select('id, status, attachments_storage_prefix')
+    .eq('business_id', BUSINESS_ID)
+    .eq('source_path', summary.folderPath)
+    .maybeSingle();
+  if (lookupErr) {
+    console.warn(`  ✗ ${summary.folder}: lookup failed —`, lookupErr.message);
+    return { action: 'error', attachmentsUploaded: 0, parseAttempted: false, parseSucceeded: false, error: lookupErr.message };
+  }
+
+  // If a row exists AND it's already been committed/skipped by the user,
+  // don't blow it away on a re-run. Idempotency without overwriting human
+  // decisions.
+  if (existing && existing.status !== 'pending') {
+    console.log(`  ⏭  ${summary.folder}: already ${existing.status}, leaving alone.`);
+    return { action: 'skipped-existing-committed', attachmentsUploaded: 0, parseAttempted: false, parseSucceeded: false };
+  }
+
+  // Determine the storage prefix. New imports get a fresh UUID; existing
+  // pending rows reuse their prefix (so re-running --apply doesn't leave
+  // orphan storage objects from the previous run).
+  const importId = existing?.id ?? randomUUID();
+  const storagePrefix = existing?.attachments_storage_prefix
+    ?? `_pending/${importId}`;
+
+  // ── 1. Upload selected attachments ────────────────────────────────────
+  // Plans: upload all. Photos: pick the first MAX_PHOTOS_PER_IMPORT
+  // (deterministic — sort by name so re-runs hit the same files).
+  // Quote PDF: upload (for inline preview), AND parse below.
+  const filesToUpload: { localPath: string; storageKey: string; kind: string }[] = [];
+
+  const allFiles = listAllFilesUpToDepth(summary.folderPath, 3);
+  const plans = allFiles.filter((f) => classifyFile(basename(f)) === 'plan');
+  const photos = allFiles
+    .filter((f) => {
+      const k = classifyFile(basename(f));
+      return k === 'before_photo' || k === 'after_photo' || k === 'scope_photo';
+    })
+    .sort()
+    .slice(0, MAX_PHOTOS_PER_IMPORT);
+  const quotePdfs = allFiles.filter((f) => classifyFile(basename(f)) === 'quote_pdf');
+
+  for (const p of [...plans, ...photos, ...quotePdfs]) {
+    const name = basename(p);
+    const safeName = name.replace(/[^a-zA-Z0-9._-]+/g, '_');
+    const storageKey = `${BUSINESS_ID}/${storagePrefix}/${randomUUID()}__${safeName}`;
+    filesToUpload.push({ localPath: p, storageKey, kind: classifyFile(name) });
+  }
+
+  let uploaded = 0;
+  for (const f of filesToUpload) {
+    try {
+      const st = statSync(f.localPath);
+      if (st.size > MAX_FILE_BYTES) continue;
+      const bytes = readFileSync(f.localPath);
+      const contentType = guessContentType(f.localPath);
+      const { error: upErr } = await sb.storage
+        .from('quote-attachments')
+        .upload(f.storageKey, bytes, {
+          contentType,
+          upsert: true,
+        });
+      if (upErr) {
+        console.warn(`    ⚠ upload failed: ${basename(f.localPath)} —`, upErr.message);
+        continue;
+      }
+      uploaded++;
+    } catch (err) {
+      console.warn(`    ⚠ read/upload error: ${basename(f.localPath)} —`, err);
+    }
+  }
+
+  // ── 2. Parse any quote PDF via Anthropic ───────────────────────────────
+  let parsed: ParsedQuote | null = null;
+  let parseAttempted = false;
+  let parseSucceeded = false;
+  if (quotePdfs.length > 0) {
+    parseAttempted = true;
+    // Use only the first quote PDF for parsing — multiples on the same
+    // job are rare and re-parsing them is wasteful API spend.
+    const text = await extractPdfText(quotePdfs[0]).catch(() => null);
+    if (text && text.length > 20) {
+      try {
+        parsed = await parseQuoteText(text);
+        parseSucceeded = true;
+      } catch (err) {
+        const msg = err instanceof Error ? err.message : String(err);
+        console.warn(`    ⚠ parse failed: ${basename(quotePdfs[0])} — ${msg}`);
+      }
+    }
+  }
+
+  // ── 3. Upsert the job_imports row ──────────────────────────────────────
+  const rowData: Record<string, unknown> = {
+    business_id: BUSINESS_ID,
+    source_path: summary.folderPath,
+    folder_name: summary.folder,
+    suggested_job_id: summary.matchedJob?.id ?? null,
+    suggested_legacy_id: summary.matchedJob?.legacy_id ?? null,
+    suggested_label: summary.matchedJob
+      ? `${summary.matchedJob.name ?? ''} · ${summary.matchedJob.client_name ?? ''}`
+      : null,
+    match_confidence: summary.matchConfidence,
+    match_source: summary.matchSource === 'jid'
+      ? `J-ID via ${summary.matchSourceFile ?? ''}`
+      : summary.matchSource === 'fuzzy'
+        ? `fuzzy ${summary.matchScore}`
+        : null,
+    files_summary: trimFolderCountsForJson(summary.fileCounts),
+    attachments_storage_prefix: storagePrefix,
+    parsed_data: parsed,
+    status: 'pending',
+    notes: summary.notes.join(' | ') || null,
+  };
+
+  if (existing) {
+    const { error: upErr } = await sb
+      .from('job_imports')
+      .update(rowData)
+      .eq('id', existing.id);
+    if (upErr) {
+      console.warn(`  ✗ ${summary.folder}: update failed —`, upErr.message);
+      return { action: 'error', attachmentsUploaded: uploaded, parseAttempted, parseSucceeded, error: upErr.message };
+    }
+    console.log(`  ⟳ ${summary.folder}: updated (${uploaded} files, parse: ${parseSucceeded ? 'ok' : 'no'})`);
+    return { action: 'updated', attachmentsUploaded: uploaded, parseAttempted, parseSucceeded };
+  } else {
+    rowData.id = importId;
+    const { error: insErr } = await sb.from('job_imports').insert(rowData);
+    if (insErr) {
+      console.warn(`  ✗ ${summary.folder}: insert failed —`, insErr.message);
+      return { action: 'error', attachmentsUploaded: uploaded, parseAttempted, parseSucceeded, error: insErr.message };
+    }
+    console.log(`  + ${summary.folder}: staged (${uploaded} files, parse: ${parseSucceeded ? 'ok' : 'no'})`);
+    return { action: 'inserted', attachmentsUploaded: uploaded, parseAttempted, parseSucceeded };
+  }
+}
+
+// ── Helpers used by apply ───────────────────────────────────────────────────
+
+function listAllFilesUpToDepth(dir: string, maxDepth: number): string[] {
+  const out: string[] = [];
+  function walk(d: string, depth: number) {
+    let entries: string[] = [];
+    try { entries = readdirSync(d); } catch { return; }
+    for (const name of entries) {
+      const p = join(d, name);
+      let st;
+      try { st = statSync(p); } catch { continue; }
+      if (st.isDirectory()) {
+        if (depth < maxDepth) walk(p, depth + 1);
+      } else {
+        out.push(p);
+      }
+    }
+  }
+  walk(dir, 0);
+  return out;
+}
+
+/** unpdf-based text extraction. Reads PDF buffer, returns plain text. */
+async function extractPdfText(path: string): Promise<string> {
+  const buffer = readFileSync(path);
+  const data = new Uint8Array(buffer);
+  const doc = await getDocumentProxy(data);
+  const { text: pagesText } = await extractText(doc, { mergePages: false });
+  const joined = Array.isArray(pagesText) ? pagesText.join('\n\n') : String(pagesText);
+  return joined.trim();
+}
+
+function guessContentType(path: string): string {
+  const ext = extname(path).toLowerCase();
+  if (ext === '.pdf') return 'application/pdf';
+  if (ext === '.jpg' || ext === '.jpeg') return 'image/jpeg';
+  if (ext === '.png') return 'image/png';
+  if (ext === '.webp') return 'image/webp';
+  if (ext === '.heic') return 'image/heic';
+  if (ext === '.mp4') return 'video/mp4';
+  if (ext === '.mov') return 'video/quicktime';
+  return 'application/octet-stream';
+}
+
+/** Strip out zero counts so the jsonb blob is smaller / cleaner to read. */
+function trimFolderCountsForJson(counts: Record<FileKind, number>): FolderFileCounts {
+  const out: FolderFileCounts = {};
+  for (const [k, v] of Object.entries(counts)) {
+    if (v > 0) (out as Record<string, number>)[k] = v;
+  }
+  return out;
 }
 
 main().catch((err) => {

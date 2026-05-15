@@ -344,6 +344,82 @@ export type QuoteAttachmentKind =
   | 'quote_pdf'
   | 'other';
 
+/**
+ * Project archive import staging row. One per folder discovered by
+ * scripts/import-projects.ts --apply. Holds the suggested job match +
+ * classified files + LLM-parsed quote data BEFORE it lands in real
+ * jobs/quotes/quote_attachments tables. User reviews each row in the
+ * "Imports to review" flag on Home and commits it as link/create/skip.
+ */
+export type ImportConfidence = 'high' | 'medium' | 'low' | 'none';
+export type ImportStatus = 'pending' | 'committed' | 'skipped';
+export type ImportDecision = 'link' | 'create' | 'skip';
+
+/** Counts of classified files in a folder, returned by the importer walker. */
+export interface FolderFileCounts {
+  plan?: number;
+  quote_pdf?: number;
+  invoice_pdf?: number;
+  before_photo?: number;
+  after_photo?: number;
+  scope_photo?: number;
+  notes_md?: number;
+  video?: number;
+  spreadsheet?: number;
+  other?: number;
+}
+
+/**
+ * Result of parsing a quote PDF via Anthropic. Mirrors the shape of
+ * ParsedBill but for the quote use case — extracted fields land here,
+ * then on commit they flow into the corresponding `quotes` row.
+ */
+export interface ParsedQuote {
+  clientName?: string;
+  jobAddress?: string;
+  jobType?: string;
+  scopeSummary?: string;
+  baseAmountExGst?: number;
+  totalAmountInclGst?: number;
+  dateSent?: string;
+  lineItems?: { description: string; amount?: number }[];
+  /** Optional surface-area-by-zone extracted from the quote scope text. */
+  surfaceAreaM2ByZone?: Record<string, number>;
+  /** Free-form surface description if the quote mentions it ("weatherboard"). */
+  surfaceType?: string;
+  prepLevel?: PrepLevel;
+  confidence: 'high' | 'medium' | 'low';
+}
+
+export interface JobImport {
+  id: string;
+  businessId: string;
+  /** Absolute filesystem path the folder was discovered at. Audit only. */
+  sourcePath: string;
+  /** Display name (basename) of the folder. */
+  folderName: string;
+  /** Suggested existing job from the dry-run matcher; user can override. */
+  suggestedJobId?: string;
+  suggestedLegacyId?: string;
+  suggestedLabel?: string;
+  matchConfidence: ImportConfidence;
+  matchSource?: string;
+  /** Classified file counts — for the UI's at-a-glance summary. */
+  filesSummary: FolderFileCounts;
+  /** Storage prefix where staged attachments live ("_pending/{importId}/"). */
+  attachmentsStoragePrefix?: string;
+  /** LLM-extracted quote fields if a quote PDF was found in the folder. */
+  parsedData?: ParsedQuote;
+  status: ImportStatus;
+  commitAction?: ImportDecision;
+  commitTargetJobId?: string;
+  commitTargetQuoteId?: string;
+  committedAt?: string;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface QuoteAttachment {
   id: string;
   businessId: string;

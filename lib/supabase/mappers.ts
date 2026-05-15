@@ -4,6 +4,8 @@
 import type {
   Job, Entry, ScheduleItem, Material, Quote, QuoteAttachment, QuoteAttachmentKind,
   Setting, Invoice, BankTransaction,
+  JobImport, ImportConfidence, ImportStatus, ImportDecision,
+  FolderFileCounts, ParsedQuote,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
   ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
@@ -312,6 +314,56 @@ export function quoteAttachmentToRow(a: Partial<QuoteAttachment>): Row {
   if (a.pageCount !== undefined) out.page_count = a.pageCount ?? null;
   if (a.parsedM2ByZone !== undefined) out.parsed_m2_by_zone = a.parsedM2ByZone ?? null;
   if (a.parsedConfidence !== undefined) out.parsed_confidence = a.parsedConfidence || null;
+  return out;
+}
+
+// ── JobImport ───────────────────────────────────────────────────────────────
+export function rowToJobImport(r: Row): JobImport {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    sourcePath: r.source_path as string,
+    folderName: r.folder_name as string,
+    suggestedJobId: asString(r.suggested_job_id),
+    suggestedLegacyId: asString(r.suggested_legacy_id),
+    suggestedLabel: asString(r.suggested_label),
+    matchConfidence: (asString(r.match_confidence) as ImportConfidence | undefined) ?? 'none',
+    matchSource: asString(r.match_source),
+    filesSummary: (r.files_summary as FolderFileCounts | null) ?? {},
+    attachmentsStoragePrefix: asString(r.attachments_storage_prefix),
+    parsedData: (r.parsed_data as ParsedQuote | null) ?? undefined,
+    status: (asString(r.status) as ImportStatus | undefined) ?? 'pending',
+    commitAction: (asString(r.commit_action) as ImportDecision | undefined),
+    commitTargetJobId: asString(r.commit_target_job_id),
+    commitTargetQuoteId: asString(r.commit_target_quote_id),
+    committedAt: asString(r.committed_at),
+    notes: asString(r.notes),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function jobImportToRow(i: Partial<JobImport>): Row {
+  const out: Row = {};
+  if (i.businessId !== undefined) out.business_id = i.businessId;
+  if (i.sourcePath !== undefined) out.source_path = i.sourcePath;
+  if (i.folderName !== undefined) out.folder_name = i.folderName;
+  if (i.suggestedJobId !== undefined) out.suggested_job_id = i.suggestedJobId || null;
+  if (i.suggestedLegacyId !== undefined) out.suggested_legacy_id = i.suggestedLegacyId || null;
+  if (i.suggestedLabel !== undefined) out.suggested_label = i.suggestedLabel || null;
+  if (i.matchConfidence !== undefined) out.match_confidence = i.matchConfidence;
+  if (i.matchSource !== undefined) out.match_source = i.matchSource || null;
+  if (i.filesSummary !== undefined) out.files_summary = i.filesSummary ?? {};
+  if (i.attachmentsStoragePrefix !== undefined) {
+    out.attachments_storage_prefix = i.attachmentsStoragePrefix || null;
+  }
+  if (i.parsedData !== undefined) out.parsed_data = i.parsedData ?? null;
+  if (i.status !== undefined) out.status = i.status;
+  if (i.commitAction !== undefined) out.commit_action = i.commitAction || null;
+  if (i.commitTargetJobId !== undefined) out.commit_target_job_id = i.commitTargetJobId || null;
+  if (i.commitTargetQuoteId !== undefined) out.commit_target_quote_id = i.commitTargetQuoteId || null;
+  if (i.committedAt !== undefined) out.committed_at = i.committedAt || null;
+  if (i.notes !== undefined) out.notes = i.notes || null;
   return out;
 }
 
