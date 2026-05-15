@@ -31,11 +31,12 @@
 
 import { config } from 'dotenv';
 import { createClient } from '@supabase/supabase-js';
-import { readdirSync, statSync } from 'node:fs';
+import { readdirSync, statSync, writeFileSync } from 'node:fs';
 import { join, dirname, basename, extname } from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-config({ path: join(dirname(fileURLToPath(import.meta.url)), '..', '.env.local') });
+const HERE = dirname(fileURLToPath(import.meta.url));
+config({ path: join(HERE, '..', '.env.local') });
 
 // ─── Args ────────────────────────────────────────────────────────────────────
 const args = process.argv.slice(2);
@@ -343,8 +344,87 @@ function printReport(summaries: FolderSummary[]) {
     console.log('    3. inserts/updates into quotes + quote_attachments tables');
     console.log('    Re-run without --apply for now to inspect proposed actions.');
   } else {
-    console.log('💡  Dry run complete. Re-run with --apply once writes are implemented.');
+    console.log('💡  Dry run complete. Mapping CSV written — see below.');
   }
+}
+
+/**
+ * Build a one-row-per-folder summary of what the importer would do, save
+ * it to scripts/import-projects-mapping.csv for Brad to open in Numbers
+ * and edit. Each row defaults to a `decision` he can adjust:
+ *   - "link"   = use the suggested job (default for HIGH-confidence rows)
+ *   - "review" = needs eyeballs (default for MEDIUM/LOW)
+ *   - "skip"   = don't import this folder
+ *   - "create" = create a new job from this folder
+ * He can also overwrite `suggested_job_id` if our match was wrong.
+ *
+ * The --apply step (next commit) reads this CSV instead of re-running
+ * fuzzy matching, so his decisions are the source of truth.
+ */
+function writeMappingCsv(summaries: FolderSummary[], outPath: string) {
+  // Header columns chosen to match what's actionable in a spreadsheet.
+  // Keep them short so the file is browsable; the report on stdout shows
+  // the full file-kind breakdown.
+  const headers = [
+    'folder',
+    'suggested_job_id',
+    'suggested_legacy_id',
+    'suggested_job_label',
+    'confidence',
+    'match_source',
+    'decision',
+    'files_summary',
+    'notes',
+  ];
+
+  // Default the decision based on confidence so the easy wins are
+  // pre-approved and Brad only has to touch the rows that need it.
+  function defaultDecision(s: FolderSummary): string {
+    if (s.matchConfidence === 'high') return 'link';
+    return 'review';
+  }
+
+  function filesSummary(s: FolderSummary): string {
+    const c = s.fileCounts;
+    const parts: string[] = [];
+    if (c.plan) parts.push(`${c.plan}plan`);
+    if (c.quote_pdf) parts.push(`${c.quote_pdf}quote`);
+    if (c.invoice_pdf) parts.push(`${c.invoice_pdf}inv`);
+    const photos = c.before_photo + c.after_photo + c.scope_photo;
+    if (photos) parts.push(`${photos}photo`);
+    if (c.video) parts.push(`${c.video}vid`);
+    if (c.notes_md) parts.push(`${c.notes_md}note`);
+    return parts.join('+') || `${s.totalFiles}files`;
+  }
+
+  function csvEscape(v: string | number | null | undefined): string {
+    const s = v == null ? '' : String(v);
+    // RFC4180-style: wrap in double quotes if it contains comma/quote/newline.
+    if (/[",\n]/.test(s)) return `"${s.replace(/"/g, '""')}"`;
+    return s;
+  }
+
+  const rows: string[] = [];
+  rows.push(headers.join(','));
+  for (const s of summaries) {
+    rows.push([
+      csvEscape(s.folder),
+      csvEscape(s.matchedJob?.id ?? ''),
+      csvEscape(s.matchedJob?.legacy_id ?? ''),
+      csvEscape(s.matchedJob ? `${s.matchedJob.name ?? ''} · ${s.matchedJob.client_name ?? ''}` : ''),
+      csvEscape(s.matchConfidence),
+      csvEscape(s.matchSource === 'jid'
+        ? `J-ID via ${s.matchSourceFile ?? ''}`
+        : s.matchSource === 'fuzzy'
+          ? `fuzzy ${s.matchScore}`
+          : ''),
+      csvEscape(defaultDecision(s)),
+      csvEscape(filesSummary(s)),
+      csvEscape(s.notes.join(' | ')),
+    ].join(','));
+  }
+
+  writeFileSync(outPath, rows.join('\n') + '\n', 'utf-8');
 }
 
 // ─── Main ───────────────────────────────────────────────────────────────────
@@ -372,6 +452,18 @@ async function main() {
   }
 
   printReport(summaries);
+
+  // Write the mapping CSV alongside the script — Brad opens this in
+  // Numbers/Sheets to review and adjust decisions before --apply runs.
+  const mappingPath = join(HERE, 'import-projects-mapping.csv');
+  writeMappingCsv(summaries, mappingPath);
+  console.log(`\n📝  Mapping CSV written to:\n    ${mappingPath}\n`);
+  console.log('    Open this in Numbers/Sheets and review the `decision` column:');
+  console.log('      link    = use the suggested job_id (default for HIGH confidence)');
+  console.log('      review  = needs eyeballs (default for MEDIUM/LOW)');
+  console.log('      create  = create a new jobs row from this folder');
+  console.log('      skip    = leave this folder un-imported');
+  console.log('    Adjust suggested_job_id where the match is wrong, then re-run with --apply.');
 }
 
 main().catch((err) => {

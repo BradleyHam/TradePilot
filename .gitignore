@@ -51,3 +51,4 @@ scripts/service-worker.json
 # Editor
 .vscode/
 .idea/
+scripts/import-projects-mapping.csv
