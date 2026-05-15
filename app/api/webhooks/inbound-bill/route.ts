@@ -220,20 +220,6 @@ export async function POST(req: Request) {
     });
 
   if (!pdfAttachment) {
-    // TEMP — Gmail forwarding verification flow.
-    // CloudMailin free tier doesn't store message bodies, so Google's
-    // verification URL is otherwise invisible. When we receive an email
-    // from forwarding-noreply@google.com we dump body.plain + body.html
-    // into the function log so the verification link can be read out of
-    // Vercel logs.
-    // REMOVE this block once all Gmail forwarders we want are verified.
-    const looksLikeGoogleVerification = (fromAddress ?? '').toLowerCase()
-      .includes('forwarding-noreply@google.com');
-    if (looksLikeGoogleVerification) {
-      console.info('[inbound-bill] (TEMP) Gmail forwarding verification email — dumping body so the URL is reachable:');
-      console.info('[inbound-bill] (TEMP) plain:', body.plain);
-      console.info('[inbound-bill] (TEMP) html:', body.html);
-    }
     // Not all supplier emails carry a PDF (some are payment reminders,
     // statements, marketing). Accept and skip — don't 4xx because that
     // would cause CloudMailin to retry indefinitely.
