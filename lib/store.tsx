@@ -1,15 +1,43 @@
 'use client';
 
-import React, { createContext, useContext, useEffect, useState, useCallback } from 'react';
+import React, { createContext, useContext, useEffect, useState, useCallback, useRef } from 'react';
 import { supabase } from './supabase/client';
 import {
   rowToJob, rowToEntry, rowToScheduleItem,
   rowToMaterial, rowToQuote, rowToSetting, rowToInvoice, rowToBankTransaction,
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
+  materialToRow,
 } from './supabase/mappers';
 import type {
   Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
+  JobStatus,
 } from './types';
+
+/**
+ * Supabase's `PostgrestError` doesn't enumerate its fields (Chrome devtools
+ * prints it as `{}`). This helper unwraps the relevant pieces into a plain
+ * string so logs and `error` state are useful instead of cryptic.
+ *
+ * Always include code/details/hint when present — that's where the real
+ * "what went wrong" usually lives (e.g. `PGRST116` = no rows, `42501` =
+ * RLS denied, `23503` = FK violation).
+ */
+function describeError(err: unknown): string {
+  if (!err) return 'Unknown error';
+  if (typeof err === 'string') return err;
+  if (typeof err === 'object') {
+    const e = err as { message?: string; code?: string; details?: string; hint?: string };
+    const parts = [
+      e.message,
+      e.code ? `code=${e.code}` : '',
+      e.details ? `details=${e.details}` : '',
+      e.hint ? `hint=${e.hint}` : '',
+    ].filter(Boolean);
+    if (parts.length > 0) return parts.join(' · ');
+    try { return JSON.stringify(err); } catch { return String(err); }
+  }
+  return String(err);
+}
 
 // Public shape stays close to the original so existing pages keep working.
 // New: materials, quotes, settings, loading, error, refresh.
@@ -29,7 +57,27 @@ interface StoreState {
   // Mutators — optimistic local update + Supabase write-behind.
   addJob: (job: Job) => void;
   updateJob: (id: string, updates: Partial<Job>) => void;
+  /**
+   * One-shot cleanup of a job's schedule items against reality. Auto-runs
+   * inside updateJob on the first transition into a terminal status; can
+   * also be called directly (e.g. from a "Reconcile schedule" button) to
+   * fix already-completed jobs whose past plans are still cluttering the
+   * calendar.
+   *
+   * `asLost` = true means treat as a `lost` job — only future incomplete
+   * items are removed and history is left alone. Otherwise applies the
+   * "smart reconcile" rules: items past the actual completion date are
+   * deleted, items on/before are marked done.
+   */
+  reconcileJobSchedule: (
+    jobId: string,
+    asLost: boolean,
+    /** Explicit completion date (overrides job.endDate / latest-hours / today). */
+    explicitCompletionDate?: string,
+  ) => Promise<{ completed: number; deleted: number }>;
   addEntry: (entry: Entry) => void;
+  updateEntry: (id: string, updates: Partial<Entry>) => void;
+  deleteEntry: (id: string) => void;
   addScheduleItem: (item: ScheduleItem) => void;
   updateScheduleItem: (id: string, updates: Partial<ScheduleItem>) => void;
   deleteScheduleItem: (id: string) => void;
@@ -53,6 +101,42 @@ interface StoreState {
    */
   markInvoicePaid: (id: string, paidDate: string, paidVia?: string) => void;
 
+  /**
+   * Flip a draft bill (isDraft=true) into a real, counted bill. Optional
+   * `patches` lets the caller adjust fields at the same time — typically
+   * the user-picked jobId on the Home confirm row, but any Entry field is
+   * valid (e.g. correcting the amount before confirming).
+   *
+   * Thin wrapper around updateEntry — included on the store interface so
+   * callers don't have to remember to pass `isDraft: false` every time.
+   */
+  confirmBillDraft: (id: string, patches?: Partial<Entry>) => void;
+
+  /**
+   * Confirm a draft bill AND bulk-insert the line items as `materials`
+   * rows tied to the bill via `entry_id`. Used by the per-line allocation
+   * UI on the Home "Bills to confirm" flag.
+   *
+   * The bill update is the source of truth — if it fails (RLS, network),
+   * we bail and DON'T touch materials. If the bill succeeds but some
+   * materials rows fail to insert, we log loudly and set `error` but the
+   * bill stays confirmed. Materials are derived data; the bill itself
+   * still carries the parser_raw blob so re-deriving later is possible.
+   */
+  confirmBillDraftWithMaterials: (
+    billId: string,
+    opts: { jobId: string | null; materials: Omit<Material, 'id' | 'businessId' | 'createdAt'>[] },
+  ) => Promise<void>;
+
+  /**
+   * Generic bulk-insert for materials rows. Reusable beyond bill confirms
+   * (e.g. future "log a material I bought in person" flow). Returns
+   * counts so callers can report partial success.
+   */
+  addMaterials: (
+    rows: Omit<Material, 'id' | 'businessId' | 'createdAt'>[],
+  ) => Promise<{ inserted: number; failed: number }>;
+
   // Re-fetch everything from Supabase (useful after a write succeeds).
   refresh: () => Promise<void>;
 }
@@ -63,6 +147,22 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [jobs, setJobs] = useState<Job[]>([]);
   const [entries, setEntries] = useState<Entry[]>([]);
   const [scheduleItems, setScheduleItems] = useState<ScheduleItem[]>([]);
+
+  // Refs that mirror the latest values of the lists above, so async mutators
+  // (like reconcileJobSchedule) can read current state without depending on
+  // closure capture or relying on setState callbacks running synchronously.
+  // Updated synchronously during render so the ref is always current — that's
+  // why the lint rule is suppressed below. (Using an effect instead would
+  // leave the ref stale during user-event handlers, which is the whole point
+  // of having the ref.)
+  const jobsRef = useRef(jobs);
+  const entriesRef = useRef(entries);
+  const scheduleItemsRef = useRef(scheduleItems);
+  /* eslint-disable react-hooks/refs */
+  jobsRef.current = jobs;
+  entriesRef.current = entries;
+  scheduleItemsRef.current = scheduleItems;
+  /* eslint-enable react-hooks/refs */
   const [materials, setMaterials] = useState<Material[]>([]);
   const [quotes, setQuotes] = useState<Quote[]>([]);
   const [settings, setSettings] = useState<Setting[]>([]);
@@ -212,6 +312,147 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
   }, [businessId]);
 
+  /**
+   * Reconcile a job's schedule items with reality. Called automatically
+   * when a job transitions into a terminal status, and exposed as a
+   * standalone mutator so the UI can offer a "Reconcile schedule" button on
+   * already-completed jobs whose past plans are still cluttering the calendar.
+   *
+   * `completionDate` resolution priority (when `asLost` is false):
+   *   1. Caller-provided `completionDate` (the user's explicit answer when
+   *      marking the job complete — most reliable).
+   *   2. The job's stored `endDate` (set by the completion-date prompt).
+   *   3. Latest entryDate of any hours entry on this job (heuristic — only
+   *      meaningful if the user actually logged hours on this job).
+   *   4. Today.
+   *
+   * Behaviour:
+   *   asLost = false  (completed/invoiced/paid):
+   *     - past items on/before completionDate not done → mark done.
+   *     - items after completionDate (past or future) → delete.
+   *   asLost = true:
+   *     - delete only future incomplete items. Past items are still real
+   *       history (quote visits, follow-ups) and aren't touched.
+   *
+   * Returns counts for the caller's UX (e.g. toast: "Marked 3 items done,
+   * removed 2 stale items").
+   */
+  const reconcileJobSchedule = useCallback(async (
+    jobId: string,
+    asLost: boolean,
+    explicitCompletionDate?: string,
+  ): Promise<{ completed: number; deleted: number }> => {
+    const now = new Date();
+    const todayISO = `${now.getFullYear()}-${String(now.getMonth() + 1).padStart(2, '0')}-${String(now.getDate()).padStart(2, '0')}`;
+
+    let completionDate: string = todayISO;
+    if (!asLost) {
+      // Priority 1: caller-provided explicit date.
+      if (explicitCompletionDate) {
+        completionDate = explicitCompletionDate;
+      } else {
+        // Priority 2: the job's stored endDate. Read from the ref so we
+        // see the latest committed value, not a stale closure capture.
+        const storedEndDate = jobsRef.current.find((j) => j.id === jobId)?.endDate;
+        if (storedEndDate) {
+          completionDate = storedEndDate;
+        } else {
+          // Priority 3: latest hours-entry date on this job.
+          let latestHoursDate = '';
+          for (const e of entriesRef.current) {
+            if (e.jobId === jobId && e.type === 'hours' && e.entryDate) {
+              if (!latestHoursDate || e.entryDate > latestHoursDate) {
+                latestHoursDate = e.entryDate;
+              }
+            }
+          }
+          if (latestHoursDate && latestHoursDate <= todayISO) {
+            completionDate = latestHoursDate;
+          }
+          // Priority 4: today (already the default).
+        }
+      }
+      // Clamp future-dated completion (e.g. user typo) so we never delete
+      // every past plan as "after completion". Cap at today.
+      if (completionDate > todayISO) {
+        completionDate = todayISO;
+      }
+    }
+
+    // Decide which items to touch by reading the current schedule list
+    // straight from the ref. Pure read — no side effects — then we apply the
+    // update in a single setScheduleItems call below. This avoids the
+    // double-invocation pitfall of mutating arrays inside the updater.
+    const toDeleteIds: string[] = [];
+    const toCompleteIds: string[] = [];
+    for (const s of scheduleItemsRef.current) {
+      if (s.jobId !== jobId) continue;
+      if (asLost) {
+        if (!s.completed && s.date > todayISO) toDeleteIds.push(s.id);
+        continue;
+      }
+      if (s.date > completionDate) {
+        toDeleteIds.push(s.id);
+      } else if (!s.completed) {
+        toCompleteIds.push(s.id);
+      }
+    }
+
+    if (toDeleteIds.length === 0 && toCompleteIds.length === 0) {
+      return { completed: 0, deleted: 0 };
+    }
+
+    // Apply optimistically.
+    setScheduleItems((prev) => prev.flatMap((s) => {
+      if (toDeleteIds.includes(s.id)) return [];
+      if (toCompleteIds.includes(s.id)) return [{ ...s, completed: true }];
+      return [s];
+    }));
+
+    console.info('[store] reconcileJobSchedule', {
+      jobId,
+      asLost,
+      completionDate,
+      deleteCount: toDeleteIds.length,
+      completeCount: toCompleteIds.length,
+    });
+
+    if (toDeleteIds.length > 0) {
+      // .select() so we can detect the silent "0 rows affected" case (RLS).
+      const { data: deleted, error: delErr } = await supabase
+        .from('schedule_items')
+        .delete()
+        .in('id', toDeleteIds)
+        .select('id');
+      if (delErr) {
+        console.error('[store] reconcileJobSchedule delete failed:', describeError(delErr));
+        setError(`Couldn't remove stale schedule items: ${describeError(delErr)}`);
+      } else if (!deleted || deleted.length !== toDeleteIds.length) {
+        console.warn('[store] reconcileJobSchedule delete: expected', toDeleteIds.length,
+          'rows but got', deleted?.length ?? 0,
+          '— RLS may have silently blocked some.');
+      }
+    }
+
+    if (toCompleteIds.length > 0) {
+      const { data: updated, error: updItemsErr } = await supabase
+        .from('schedule_items')
+        .update({ completed: true })
+        .in('id', toCompleteIds)
+        .select('id');
+      if (updItemsErr) {
+        console.error('[store] reconcileJobSchedule complete failed:', describeError(updItemsErr));
+        setError(`Couldn't mark past schedule items done: ${describeError(updItemsErr)}`);
+      } else if (!updated || updated.length !== toCompleteIds.length) {
+        console.warn('[store] reconcileJobSchedule update: expected', toCompleteIds.length,
+          'rows but got', updated?.length ?? 0,
+          '— RLS may have silently blocked some.');
+      }
+    }
+
+    return { completed: toCompleteIds.length, deleted: toDeleteIds.length };
+  }, []);
+
   const updateJob = useCallback((id: string, updates: Partial<Job>) => {
     let prevJob: Job | undefined;
     setJobs((prev) => {
@@ -233,7 +474,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         }
       }
     })();
-  }, []);
+
+    // When a job transitions into a "done" status, reconcile its schedule
+    // items with reality so the calendar stops lying. The hours entries are
+    // the source of truth for what actually happened; schedule items were
+    // just the plan. See `reconcileJobSchedule` above for the rules.
+    const TERMINAL: JobStatus[] = ['completed', 'invoiced', 'paid', 'lost'];
+    const isNowTerminal = !!(updates.status && TERMINAL.includes(updates.status));
+    const wasTerminal = !!(prevJob?.status && TERMINAL.includes(prevJob.status));
+    if (isNowTerminal && !wasTerminal) {
+      reconcileJobSchedule(id, updates.status === 'lost').catch((err) => {
+        console.error('[store] auto-reconcile after status change failed:', describeError(err));
+      });
+    }
+  }, [reconcileJobSchedule]);
 
   const addEntry = useCallback((entry: Entry) => {
     if (!businessId) {
@@ -257,6 +511,155 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setEntries((prev) => prev.map((e) => (e.id === tempId ? persisted : e)));
     })();
   }, [businessId]);
+
+  const updateEntry = useCallback((id: string, updates: Partial<Entry>) => {
+    let prevEntry: Entry | undefined;
+    setEntries((prev) => {
+      prevEntry = prev.find((e) => e.id === id);
+      return prev.map((e) => (e.id === id ? { ...e, ...updates } : e));
+    });
+
+    (async () => {
+      const row = entryToRow(updates);
+      const { error: updErr } = await supabase.from('entries').update(row).eq('id', id);
+      if (updErr) {
+        console.error('[store] updateEntry failed:', updErr);
+        setError(updErr.message);
+        if (prevEntry) {
+          setEntries((prev) => prev.map((e) => (e.id === id ? prevEntry! : e)));
+        }
+      }
+    })();
+  }, []);
+
+  /**
+   * Confirm a draft bill — flips isDraft from true to false, optionally
+   * applying user adjustments at the same time (typically the job picked
+   * on the Home confirm row). Once confirmed, the bill starts counting in
+   * job profit, tax estimator, expense totals, and the bank-reconcile
+   * matcher — i.e. everywhere the audit pass in commit 1 added !isDraft.
+   *
+   * Thin wrapper around updateEntry so callers don't have to remember to
+   * pass `isDraft: false`. Optimistic + rollback semantics are inherited.
+   */
+  const confirmBillDraft = useCallback((id: string, patches?: Partial<Entry>) => {
+    updateEntry(id, { ...(patches ?? {}), isDraft: false });
+  }, [updateEntry]);
+
+  /**
+   * Bulk-insert materials rows. Optimistic: synthesises local rows with
+   * temp ids prepended to the materials state, then replaces with the
+   * persisted server rows when the insert returns. Per-row failures
+   * (e.g. a single bad enum value) don't fail the whole batch — Supabase
+   * either inserts all-or-nothing, but we treat the error as "failed"
+   * and let the caller decide what to surface.
+   *
+   * Returns counts so the caller can show "imported X, Y failed".
+   */
+  const addMaterials = useCallback(async (
+    rows: Omit<Material, 'id' | 'businessId' | 'createdAt'>[],
+  ): Promise<{ inserted: number; failed: number }> => {
+    if (!businessId || rows.length === 0) return { inserted: 0, failed: 0 };
+
+    // Synthesise local rows for optimistic prepend. Real ids overwrite
+    // these once the insert returns.
+    const tempBase = Date.now();
+    const optimistic: Material[] = rows.map((r, i) => ({
+      ...r,
+      id: `mat_${tempBase}_${i}`,
+      businessId,
+      createdAt: new Date().toISOString(),
+    }));
+    setMaterials((prev) => [...optimistic, ...prev]);
+    const tempIds = optimistic.map((m) => m.id);
+
+    // Build the row payloads via the new materialToRow mapper.
+    const payloads = rows.map((r) => ({
+      ...materialToRow(r),
+      business_id: businessId,
+    }));
+
+    const { data, error: insErr } = await supabase
+      .from('materials')
+      .insert(payloads)
+      .select('*');
+
+    if (insErr || !data) {
+      const msg = describeError(insErr) || 'Failed to insert materials';
+      console.error('[store] addMaterials failed:', msg, insErr);
+      setError(msg);
+      // Roll back the optimistic prepend.
+      setMaterials((prev) => prev.filter((m) => !tempIds.includes(m.id)));
+      return { inserted: 0, failed: rows.length };
+    }
+
+    // Replace the temp rows with persisted ones.
+    const persisted = data.map(rowToMaterial);
+    setMaterials((prev) => {
+      const withoutTemps = prev.filter((m) => !tempIds.includes(m.id));
+      return [...persisted, ...withoutTemps];
+    });
+    return { inserted: persisted.length, failed: rows.length - persisted.length };
+  }, [businessId]);
+
+  /**
+   * Confirm a draft bill AND bulk-insert its line items as materials.
+   * Order matters: bill update first (source of truth). If that fails
+   * we don't touch materials. If the bill succeeds but materials fail,
+   * we log loudly + set error but the bill stays confirmed — materials
+   * are derived and the parser_raw blob on the entry preserves recovery.
+   */
+  const confirmBillDraftWithMaterials = useCallback(async (
+    billId: string,
+    opts: { jobId: string | null; materials: Omit<Material, 'id' | 'businessId' | 'createdAt'>[] },
+  ): Promise<void> => {
+    // Defensive guard: if the bill is still on its temp id (upload happened
+    // moments ago and the persisted id hasn't replaced it yet), bail with
+    // a clear message rather than writing a temp id into materials.entry_id.
+    if (billId.startsWith('ent_')) {
+      setError('Still saving the bill — give it a moment and try again.');
+      console.warn('[store] confirmBillDraftWithMaterials: bill still on temp id', billId);
+      return;
+    }
+
+    // Bill side first — optimistic + rolling back inside updateEntry.
+    const patches: Partial<Entry> = { isDraft: false };
+    if (opts.jobId !== null) patches.jobId = opts.jobId;
+    updateEntry(billId, patches);
+
+    if (opts.materials.length === 0) return;
+
+    // Materials side — best-effort, don't unwind the bill if these fail.
+    // Stamp each row with entry_id so they link back to the source bill.
+    const stamped = opts.materials.map((m) => ({ ...m, entryId: billId }));
+    const { inserted, failed } = await addMaterials(stamped);
+    if (failed > 0) {
+      console.error('[store] confirmBillDraftWithMaterials: materials partial failure',
+        { inserted, failed, billId });
+      // setError already called from addMaterials on a hard failure.
+    }
+  }, [updateEntry, addMaterials]);
+
+  const deleteEntry = useCallback((id: string) => {
+    let prevEntry: Entry | undefined;
+    setEntries((prev) => {
+      prevEntry = prev.find((e) => e.id === id);
+      return prev.filter((e) => e.id !== id);
+    });
+
+    (async () => {
+      const { error: delErr } = await supabase.from('entries').delete().eq('id', id);
+      if (delErr) {
+        console.error('[store] deleteEntry failed:', delErr);
+        setError(delErr.message);
+        if (prevEntry) {
+          // Best-effort restore: prepend. Sorting in pages is by date/createdAt
+          // so position doesn't matter for visual correctness.
+          setEntries((prev) => [prevEntry!, ...prev]);
+        }
+      }
+    })();
+  }, []);
 
   const addScheduleItem = useCallback((item: ScheduleItem) => {
     if (!businessId) {
@@ -323,6 +726,49 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   // ── Invoice mutators ─────────────────────────────────────────────────────
+
+  /**
+   * Auto-advance job.status based on invoice state. Called after invoice
+   * inserts/updates. Only ever moves the status FORWARD along the chain
+   *   completed → invoiced → paid
+   * — never demotes, never touches earlier statuses (lead/quoted/accepted
+   * /booked/in-progress/lost) because those are user-driven.
+   *
+   * Rules:
+   *  - If the job has any invoices and status is `completed` → bump to
+   *    `invoiced`. (You issued an invoice, so we know it's been invoiced.)
+   *  - If the job has at least one paid `final` invoice AND every invoice on
+   *    the job is paid → bump to `paid`. (Deposit-only paid jobs do NOT
+   *    promote — final invoice is the signal that the job is fully billed.)
+   *
+   * Reads live state via the setter callbacks so it doesn't capture stale
+   * closures from the optimistic-update flow above.
+   */
+  const maybeAdvanceJobStatus = useCallback((jobId: string | null | undefined) => {
+    if (!jobId) return;
+    let job: Job | undefined;
+    setJobs((js) => { job = js.find((j) => j.id === jobId); return js; });
+    if (!job) return;
+    // Only auto-advance from these statuses. Anything earlier (lead/quoted
+    // /accepted/booked/in-progress) or `lost` is user-driven; don't override.
+    if (job.status !== 'completed' && job.status !== 'invoiced') return;
+
+    let jobInvoices: Invoice[] = [];
+    setInvoices((list) => { jobInvoices = list.filter((i) => i.jobId === jobId); return list; });
+    if (jobInvoices.length === 0) return;
+
+    const allPaid = jobInvoices.every((i) => i.paid);
+    const hasPaidFinal = jobInvoices.some((i) => i.paid && i.kind === 'final');
+
+    let nextStatus: JobStatus | null = null;
+    if (allPaid && hasPaidFinal) nextStatus = 'paid';
+    else if (job.status === 'completed') nextStatus = 'invoiced';
+
+    if (nextStatus && nextStatus !== job.status) {
+      updateJob(jobId, { status: nextStatus });
+    }
+  }, [updateJob]);
+
   const addInvoice = useCallback((invoice: Invoice) => {
     if (!businessId) {
       console.warn('[store] addInvoice called with no businessId; ignoring');
@@ -342,8 +788,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
       const persisted = rowToInvoice(data);
       setInvoices((prev) => prev.map((i) => (i.id === tempId ? persisted : i)));
+      maybeAdvanceJobStatus(invoice.jobId);
     })();
-  }, [businessId]);
+  }, [businessId, maybeAdvanceJobStatus]);
 
   const updateInvoice = useCallback((id: string, updates: Partial<Invoice>) => {
     let prev: Invoice | undefined;
@@ -358,9 +805,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         console.error('[store] updateInvoice failed:', updErr);
         setError(updErr.message);
         if (prev) setInvoices((list) => list.map((i) => (i.id === id ? prev! : i)));
+        return;
       }
+      // If the edit affects paid status or moved jobs, re-evaluate job status.
+      // (jobId moves are unlikely but cheap to handle.)
+      const jobId = updates.jobId ?? prev?.jobId;
+      if (jobId) maybeAdvanceJobStatus(jobId);
     })();
-  }, []);
+  }, [maybeAdvanceJobStatus]);
 
   /**
    * Mark an invoice paid AND auto-create a linked income entry on the
@@ -412,8 +864,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const { data: entryData, error: entryErr } = await supabase
         .from('entries').insert(entryRow).select('*').single();
       if (entryErr || !entryData) {
-        console.error('[store] markInvoicePaid: entry insert failed:', entryErr);
-        setError(entryErr?.message ?? 'Failed to log payment');
+        const msg = describeError(entryErr) || 'Failed to log payment';
+        console.error('[store] markInvoicePaid: entry insert failed —', msg, entryErr);
+        setError(msg);
         // Roll back local state
         setEntries((prev) => prev.filter((e) => e.id !== tempEntryId));
         setInvoices((list) => list.map((i) => i.id === id
@@ -424,19 +877,35 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const persistedEntry = rowToEntry(entryData);
       setEntries((prev) => prev.map((e) => (e.id === tempEntryId ? persistedEntry : e)));
 
-      // Now flip the invoice with the link
+      // Now flip the invoice with the link. We `.select()` the updated rows
+      // so we can detect the silent "0 rows changed" case — that happens when
+      // RLS blocks the update without returning an error (Supabase quirk).
       const invRow = invoiceToRow({
         paid: true,
         paidDate,
         paidVia,
         incomeEntryId: persistedEntry.id,
       });
-      const { error: invErr } = await supabase.from('invoices').update(invRow).eq('id', id);
-      if (invErr) {
-        console.error('[store] markInvoicePaid: invoice update failed:', invErr);
-        setError(invErr.message);
+      const { data: updated, error: invErr } = await supabase
+        .from('invoices')
+        .update(invRow)
+        .eq('id', id)
+        .select('id');
+
+      // Differentiate the two failure modes for diagnostics.
+      const noRowsTouched = !invErr && (!updated || updated.length === 0);
+      if (invErr || noRowsTouched) {
+        const msg = invErr
+          ? describeError(invErr)
+          : `No invoice row matched id=${id} (likely RLS — confirm businesses.owner_id matches your auth.uid()).`;
+        console.error('[store] markInvoicePaid: invoice update failed —', msg, invErr ?? '(no error, 0 rows updated)');
+        setError(msg);
         // Best-effort rollback: delete the entry we just created.
-        await supabase.from('entries').delete().eq('id', persistedEntry.id);
+        const { error: rollbackErr } = await supabase
+          .from('entries').delete().eq('id', persistedEntry.id);
+        if (rollbackErr) {
+          console.warn('[store] markInvoicePaid: entry rollback also failed —', describeError(rollbackErr));
+        }
         setEntries((prev) => prev.filter((e) => e.id !== persistedEntry.id));
         setInvoices((list) => list.map((i) => i.id === id
           ? { ...i, paid: false, paidDate: undefined, paidVia: undefined }
@@ -447,8 +916,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setInvoices((list) => list.map((i) => i.id === id
         ? { ...i, incomeEntryId: persistedEntry.id }
         : i));
+      // If this paid invoice means the job is fully billed + paid (final
+      // invoice paid AND all invoices paid), bump status to 'paid'. Same
+      // helper is also called from addInvoice/updateInvoice so the chain
+      // completed → invoiced → paid stays in sync regardless of entry path.
+      maybeAdvanceJobStatus(inv!.jobId);
     })();
-  }, [businessId]);
+  }, [businessId, maybeAdvanceJobStatus]);
 
   // ── Bank transaction mutators ────────────────────────────────────────────
 
@@ -595,8 +1069,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       value={{
         jobs, entries, scheduleItems, materials, quotes, settings, invoices, bankTransactions,
         businessId, loading, error,
-        addJob, updateJob, addEntry, addScheduleItem, updateScheduleItem, deleteScheduleItem,
+        addJob, updateJob, reconcileJobSchedule,
+        addEntry, updateEntry, deleteEntry,
+        addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
+        confirmBillDraft, confirmBillDraftWithMaterials,
+        addMaterials,
         importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry,
         refresh: load,
       }}

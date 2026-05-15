@@ -76,7 +76,9 @@ export default function MoneyPage() {
     .reduce((s, j) => s + (j.invoiceAmount ?? j.quoteAmount ?? 0), 0);
   const awaitingQuotes = jobs.filter((j) => j.status === 'quoted').length;
   const upcomingBills = entries
-    .filter((e) => e.type === 'bill' && e.dueDate && new Date(e.dueDate) >= now)
+    // Exclude drafts: they're shown separately on Home as "Bills to confirm"
+    // and don't represent real upcoming obligations until Brad confirms.
+    .filter((e) => e.type === 'bill' && !e.isDraft && e.dueDate && new Date(e.dueDate) >= now)
     .reduce((s, e) => s + (e.amount ?? 0), 0);
   const pipelineValue = jobs
     .filter((j) => !['paid', 'lost'].includes(j.status))

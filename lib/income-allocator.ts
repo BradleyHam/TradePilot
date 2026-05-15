@@ -123,6 +123,73 @@ export function cashIncomeInWindow(
 }
 
 /**
+ * Ex-GST cash income inside a date window. Same semantics as
+ * `cashIncomeInWindow` but returns the take-home figure (GST stripped) so it
+ * can be compared apples-to-apples against `expensesInWindow` for a profit
+ * calculation. Use this on dashboards where mixing gross income with ex-GST
+ * expenses would over-state profit by the GST component.
+ */
+export function cashIncomeExGstInWindow(
+  entries: Entry[],
+  startISO: string,
+  endISO: string,
+): number {
+  let total = 0;
+  for (const e of entries) {
+    if (e.type !== 'income') continue;
+    if (e.entryDate < startISO || e.entryDate > endISO) continue;
+    total += entryExGstLocal(e);
+  }
+  return total;
+}
+
+/**
+ * Ex-GST expenses inside a date window. Sums:
+ *   - `expense`-type entries that fall in the window (by `entryDate`).
+ *   - `bill`-type entries that are PAID and whose `paidDate` falls in the
+ *     window (matching Brad's payments-basis GST registration; bills don't
+ *     count as expenses until they're paid).
+ *
+ * All values ex-GST so they can be compared directly with cash income for a
+ * "this week's profit" style calculation.
+ */
+export function expensesInWindow(
+  entries: Entry[],
+  startISO: string,
+  endISO: string,
+): number {
+  let total = 0;
+  for (const e of entries) {
+    // Drafts are unconfirmed bills awaiting Brad's review on Home —
+    // they don't represent real expenses yet so they're excluded from
+    // every money-math aggregation across the app.
+    if (e.isDraft) continue;
+    if (e.type === 'expense') {
+      if (e.entryDate < startISO || e.entryDate > endISO) continue;
+      total += entryExGstLocal(e);
+    } else if (e.type === 'bill') {
+      if (!e.paid || !e.paidDate) continue;
+      if (e.paidDate < startISO || e.paidDate > endISO) continue;
+      total += entryExGstLocal(e);
+    }
+  }
+  return total;
+}
+
+/**
+ * Local copy of the ex-GST conversion. Kept inline (rather than importing
+ * `entryExGst` from `job-stats.ts`) to avoid a module cycle — both files are
+ * imported by the same pages and `job-stats.ts` imports nothing from here.
+ */
+const NZ_GST_RATE_LOCAL = 0.15;
+function entryExGstLocal(e: Entry): number {
+  if (e.amountExGst != null) return e.amountExGst;
+  if (e.amount == null) return 0;
+  if (!e.gstApplies) return e.amount;
+  return e.amount / (1 + NZ_GST_RATE_LOCAL);
+}
+
+/**
  * Same as `earnedIncomeInWindow` but returns a per-month breakdown for the
  * window — used by the Revenue vs Expenses chart so its bars also reflect
  * the selected basis.

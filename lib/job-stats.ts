@@ -17,8 +17,12 @@ const NZ_GST_RATE = 0.15;
 /**
  * Pull the ex-GST value out of an entry. Prefers the explicit ex-GST column
  * if populated; otherwise derives from gross amount + gstApplies flag.
+ *
+ * Exported so other components (e.g. the activity-list header on the job
+ * detail sheet) can reuse the same conversion rather than duplicating GST
+ * arithmetic that might drift.
  */
-function entryExGst(e: Entry): number {
+export function entryExGst(e: Entry): number {
   if (e.amountExGst != null) return e.amountExGst;
   if (e.amount == null) return 0;
   if (!e.gstApplies) return e.amount;
@@ -64,8 +68,11 @@ export function jobStats(job: Job, entries: Entry[]): JobStats {
 
   // Bills count as expenses too: they're committed money even if not paid yet.
   // All amounts ex-GST so they're directly comparable to income.
+  // Drafts (unconfirmed bills awaiting Brad's review on Home) DO NOT count
+  // until confirmed — otherwise an LLM-parsed bill with the wrong amount
+  // would silently move the per-job profit numbers.
   const totalExpenses = own
-    .filter((e) => e.type === 'expense' || e.type === 'bill')
+    .filter((e) => (e.type === 'expense' || e.type === 'bill') && !e.isDraft)
     .reduce((s, e) => s + entryExGst(e), 0);
 
   const totalIncome = own

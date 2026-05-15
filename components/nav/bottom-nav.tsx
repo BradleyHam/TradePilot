@@ -2,10 +2,11 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { PenLine, Briefcase, DollarSign, CalendarDays } from 'lucide-react';
+import { Home, PenLine, Briefcase, DollarSign, CalendarDays } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const NAV_ITEMS = [
+  { href: '/home', label: 'Home', icon: Home },
   { href: '/entry', label: 'Entry', icon: PenLine },
   { href: '/jobs', label: 'Jobs', icon: Briefcase },
   { href: '/money', label: 'Money', icon: DollarSign },

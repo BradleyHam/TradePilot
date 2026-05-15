@@ -178,9 +178,15 @@ export function estimateTax(
   // Expenses + paid bills only (unpaid bills aren't a real cash outflow yet
   // for tax purposes on a payments-basis GST registration, which is the
   // default for small NZ businesses).
+  // Drafts (unconfirmed bills from the PDF parser) are skipped — they're
+  // not real cash outflows or real GST claims until Brad confirms them on
+  // Home. Letting them count here would mis-estimate income tax AND mis-
+  // estimate GST owed, both of which would mislead Brad's provisional-tax
+  // planning.
   let gstInput = 0;
   let expensesLogged = 0;
   for (const e of yearEntries) {
+    if (e.isDraft) continue;
     if (e.type === 'expense') {
       expensesLogged += entryExGst(e);
       gstInput       += entryGst(e);

@@ -97,6 +97,45 @@ export type ScheduleItemType =
  */
 export type LeadSource = 'website' | 'email' | 'phone' | 'referral' | 'manual';
 
+/**
+ * Type of work being quoted. `mixed` covers combination scopes
+ * (eg. exterior repaint + deck restain) where one bucket is misleading.
+ */
+export type WorkType =
+  | 'interior'
+  | 'exterior'
+  | 'cedar'
+  | 'wallpaper'
+  | 'roof'
+  | 'mixed';
+
+/**
+ * Loose categorisation of how much prep the job needs. Used to compare
+ * "$/m²" between jobs apples-to-apples — a heavy-prep exterior costs more
+ * per m² than a light-prep one, and we want the data to reflect that.
+ */
+export type PrepLevel = 'light' | 'medium' | 'heavy' | 'full-strip';
+
+/** Why a quoted/accepted job didn't convert. Set when status moves to 'lost'. */
+export type LostReason =
+  | 'price'
+  | 'no-reply'
+  | 'went-elsewhere'
+  | 'scope-changed'
+  | 'project-cancelled'
+  | 'timing'
+  | 'other';
+
+/** Why a quote landed. Set when status moves to 'accepted'. */
+export type WonReason =
+  | 'referral'
+  | 'returning-client'
+  | 'price'
+  | 'trust-rapport'
+  | 'speed-of-response'
+  | 'unique-fit'
+  | 'other';
+
 export interface Job {
   id: string;
   businessId: string;
@@ -116,6 +155,18 @@ export interface Job {
   notes?: string;
   /** How the lead came in. Null for legacy/imported rows. */
   source?: LeadSource;
+  /** What kind of work — drives like-with-like comparisons. */
+  workType?: WorkType;
+  /** Approximate quoted surface area in m². Used for $/m² benchmarks. */
+  surfaceAreaM2?: number;
+  /** Subjective sense of how much prep this job needs. */
+  prepLevel?: PrepLevel;
+  /** Set when status = 'lost'. Mutually exclusive with wonReason. */
+  lostReason?: LostReason;
+  /** Set when status = 'accepted'. Mutually exclusive with lostReason. */
+  wonReason?: WonReason;
+  /** Free-text colour on the win/loss reason. Optional. */
+  outcomeNotes?: string;
   createdAt: string;
   updatedAt: string;
 }
@@ -144,7 +195,54 @@ export interface Entry {
   paymentRef?: string;
   /** Set when reconciled to a bank transaction. */
   bankTransactionId?: string;
+  // Draft-bill fields (populated by the PDF upload + LLM extraction flow).
+  // A draft is an unconfirmed bill — it doesn't count against expenses or
+  // GST until isDraft flips to false (via the Home "Bills to confirm"
+  // Confirm button). EVERY bill-aggregating query in the app must filter
+  // !isDraft or drafts will leak into money math.
+  /** True while awaiting Brad's confirmation. Always undefined/false for non-bill entries. */
+  isDraft?: boolean;
+  /** Object path inside the `bill-pdfs` Supabase Storage bucket. NOT a URL — URLs expire. */
+  billPdfUrl?: string;
+  /** Coarse confidence from the parser; used to nudge Brad to double-check on confirm. */
+  parserConfidence?: 'high' | 'medium' | 'low';
+  /** Raw JSON the parser emitted. Debugging / future re-processing only. */
+  parserRaw?: unknown;
+  /**
+   * Email Message-ID of the inbound webhook that created this draft. Used
+   * for idempotency — retried webhook deliveries with the same Message-ID
+   * hit the unique index and short-circuit. Only set on entries created
+   * via /api/webhooks/inbound-bill; null for manual uploads + legacy data.
+   */
+  sourceMessageId?: string;
   createdAt: string;
+}
+
+/**
+ * Structured fields extracted by the bill PDF parser. Returned by the
+ * /api/parse-bill route. All money values in NZD; dates ISO YYYY-MM-DD.
+ * Every field is optional because parsing is best-effort — the confirm UI
+ * shows what was found and Brad fills any gaps before confirming.
+ */
+export interface ParsedBill {
+  supplier?: string;
+  invoiceNumber?: string;
+  /** Gross amount the bill says to pay. */
+  totalInclGst?: number;
+  /** GST portion of the total. For NZ-registered suppliers this is total ÷ 23 × 3. */
+  gstComponent?: number;
+  /** Derived server-side: totalInclGst - gstComponent. The "real cost" Brad pays. */
+  amountExGst?: number;
+  /** Date the supplier issued the invoice. */
+  invoiceDate?: string;
+  /** Date Brad needs to pay by. */
+  dueDate?: string;
+  /** Optional itemised list. */
+  lineItems?: { description: string; quantity?: number; unitPrice?: number; total?: number }[];
+  /** Freeform text the parser thinks identifies the job: address, PO number, etc. */
+  jobHint?: string;
+  /** Overall confidence — informs the UI's "double-check this" affordance. */
+  confidence: 'high' | 'medium' | 'low';
 }
 
 export type BankTransactionStatus = 'unreconciled' | 'matched' | 'ignored' | 'personal';

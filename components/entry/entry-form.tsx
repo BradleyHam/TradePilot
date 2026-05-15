@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useState } from 'react';
 import { EntryType, Entry, ExpenseCategory, ActivityType } from '@/lib/types';
 import { EXPENSE_CATEGORIES, ACTIVITY_TYPES } from '@/lib/mock-data';
 import { useStore } from '@/lib/store';
@@ -18,6 +18,18 @@ import { cn } from '@/lib/utils';
 
 interface EntryFormProps {
   defaultType?: EntryType;
+  /**
+   * If provided, the form starts in "edit" mode: fields are prefilled, save
+   * button reads "Update", and an `onDelete` button (if supplied) is shown.
+   */
+  defaultValues?: Partial<Entry>;
+  /** Label override for the primary action button. Default: "Save Entry". */
+  submitLabel?: string;
+  /**
+   * If supplied, a Delete button appears next to Cancel/Save. Caller is
+   * responsible for confirming the deletion (this form just calls it).
+   */
+  onDelete?: () => void;
   onSave: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) => void;
   onCancel: () => void;
 }
@@ -32,24 +44,50 @@ const ENTRY_TYPES: { value: EntryType; label: string }[] = [
   { value: 'note', label: 'Note' },
 ];
 
-export function EntryForm({ defaultType = 'expense', onSave, onCancel }: EntryFormProps) {
+const OVERHEAD_PREFIX = '[OH] ';
+
+export function EntryForm({
+  defaultType = 'expense',
+  defaultValues,
+  submitLabel,
+  onDelete,
+  onSave,
+  onCancel,
+}: EntryFormProps) {
   const { jobs } = useStore();
   const today = new Date().toISOString().split('T')[0];
-  const [type, setType] = useState<EntryType>(defaultType);
-  const [description, setDescription] = useState('');
-  const [amount, setAmount] = useState('');
-  const [hours, setHours] = useState('');
-  const [category, setCategory] = useState<ExpenseCategory | ''>('');
-  const [activity, setActivity] = useState<ActivityType | ''>('');
-  const [jobId, setJobId] = useState('');
+
+  // When prefilling from an existing entry, strip the `[OH]` prefix so the
+  // user sees the raw description and the Overhead toggle reflects the flag
+  // separately. Re-added on save in the same flow.
+  const seededDescription = (() => {
+    const desc = defaultValues?.description ?? '';
+    return desc.startsWith(OVERHEAD_PREFIX) ? desc.slice(OVERHEAD_PREFIX.length) : desc;
+  })();
+  const seededIsOverhead = (defaultValues?.description ?? '').startsWith(OVERHEAD_PREFIX);
+
+  const [type, setType] = useState<EntryType>(defaultValues?.type ?? defaultType);
+  const [description, setDescription] = useState(seededDescription);
+  const [amount, setAmount] = useState(defaultValues?.amount?.toString() ?? '');
+  const [hours, setHours] = useState(defaultValues?.hours?.toString() ?? '');
+  const [category, setCategory] = useState<ExpenseCategory | ''>(defaultValues?.category ?? '');
+  const [activity, setActivity] = useState<ActivityType | ''>(defaultValues?.activity ?? '');
+  const [jobId, setJobId] = useState(defaultValues?.jobId ?? '');
   // Overhead = no job, deliberately. Distinct from "I forgot to pick one".
   // Stored as `[OH]` description prefix; jobId stays null.
-  const [isOverhead, setIsOverhead] = useState(false);
-  const [supplier, setSupplier] = useState('');
-  const [dueDate, setDueDate] = useState('');
+  const [isOverhead, setIsOverhead] = useState(seededIsOverhead);
+  const [supplier, setSupplier] = useState(defaultValues?.supplier ?? '');
+  const [dueDate, setDueDate] = useState(defaultValues?.dueDate ?? '');
   // Entry date — defaults to today but editable so the user can backdate
   // hours, expenses etc. Critical for the hours-by-month allocation.
-  const [entryDate, setEntryDate] = useState(today);
+  const [entryDate, setEntryDate] = useState(defaultValues?.entryDate ?? today);
+
+  // Bill-specific edit fields. Hidden from the create flow, but surfaced when
+  // editing so a user can fix paid status / payment ref on a bill entry.
+  const [paid, setPaid] = useState(defaultValues?.paid ?? false);
+  const [paidDate, setPaidDate] = useState(defaultValues?.paidDate ?? '');
+  const [paymentRef, setPaymentRef] = useState(defaultValues?.paymentRef ?? '');
+  const [company, setCompany] = useState(defaultValues?.company ?? '');
 
   function handleSave() {
     if (!description.trim()) return;
@@ -63,9 +101,15 @@ export function EntryForm({ defaultType = 'expense', onSave, onCancel }: EntryFo
       supplier: supplier || undefined,
       gstApplies: type === 'expense' || type === 'income' || type === 'bill',
       // Tag overheads in the description so they're greppable later.
-      description: (isOverhead ? '[OH] ' : '') + description.trim(),
+      description: (isOverhead ? OVERHEAD_PREFIX : '') + description.trim(),
       entryDate: entryDate || today,
       dueDate: dueDate || undefined,
+      // Bill-specific — preserved on edit, harmless on create (the save flow
+      // ignores these unless type === 'bill' downstream).
+      paid: type === 'bill' ? paid : undefined,
+      paidDate: type === 'bill' && paid ? (paidDate || undefined) : undefined,
+      paymentRef: type === 'bill' ? (paymentRef || undefined) : undefined,
+      company: type === 'bill' ? (company || undefined) : undefined,
     });
   }
 
@@ -230,7 +274,18 @@ export function EntryForm({ defaultType = 'expense', onSave, onCancel }: EntryFo
               }}
             >
               <SelectTrigger className={cn('h-9 text-sm', isOverhead && 'opacity-50')}>
-                <SelectValue placeholder="No job selected" />
+                {/*
+                  base-ui's SelectValue renders the raw value (a UUID) by
+                  default. Pass a render function so we display the job's
+                  human-readable name instead. Empty/null = "no job".
+                */}
+                <SelectValue placeholder="No job selected">
+                  {(value) => {
+                    if (!value) return 'No job selected';
+                    const match = jobs.find((j) => j.id === value);
+                    return match?.name ?? 'No job selected';
+                  }}
+                </SelectValue>
               </SelectTrigger>
               <SelectContent>
                 <SelectItem value="">No job</SelectItem>
@@ -320,17 +375,83 @@ export function EntryForm({ defaultType = 'expense', onSave, onCancel }: EntryFo
         </div>
       )}
 
-      {/* Actions */}
+      {/* Bill-only edit fields. Surfaced in edit mode so a user can fix
+          paid-state / payment ref / company on an existing bill. Not visible
+          in create flow because bills usually start as "unpaid + due date". */}
+      {type === 'bill' && defaultValues && (
+        <>
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+              Company
+            </label>
+            <input
+              type="text"
+              placeholder="e.g. Genesis Energy"
+              value={company}
+              onChange={(e) => setCompany(e.target.value)}
+              className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+          </div>
+          <label className="flex items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={paid}
+              onChange={(e) => setPaid(e.target.checked)}
+              className="h-4 w-4 rounded border-input"
+            />
+            Paid
+          </label>
+          {paid && (
+            <div className="grid grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                  Paid date
+                </label>
+                <input
+                  type="date"
+                  value={paidDate}
+                  onChange={(e) => setPaidDate(e.target.value)}
+                  className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+              <div>
+                <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                  Payment ref
+                </label>
+                <input
+                  type="text"
+                  placeholder="optional"
+                  value={paymentRef}
+                  onChange={(e) => setPaymentRef(e.target.value)}
+                  className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Actions. In edit mode, an extra Delete button is rendered so the user
+          can remove a misclicked entry without a separate UI. */}
       <div className="flex gap-2 pt-1">
         <Button variant="outline" className="flex-1" onClick={onCancel}>
           Cancel
         </Button>
+        {onDelete && (
+          <Button
+            variant="outline"
+            className="flex-1 text-red-600 border-red-200 hover:bg-red-50 hover:text-red-700"
+            onClick={onDelete}
+          >
+            Delete
+          </Button>
+        )}
         <Button
           className="flex-1 bg-primary"
           onClick={handleSave}
           disabled={!description.trim()}
         >
-          Save Entry
+          {submitLabel ?? (defaultValues ? 'Update' : 'Save Entry')}
         </Button>
       </div>
     </div>

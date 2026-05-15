@@ -216,6 +216,10 @@ export function findMatchingEntry(
   for (const e of entries) {
     if (e.bankTransactionId) continue; // already linked elsewhere
     if (e.amount == null) continue;
+    // Skip drafts — we don't yet trust the amount, so we shouldn't be
+    // matching bank txns to them. The bank reconcile flow only matches
+    // against confirmed entries.
+    if (e.isDraft) continue;
 
     // Type filter — bills can also be matched against negative bank txns
     // because paying a bill IS an expense from the bank's POV.

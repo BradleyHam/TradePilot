@@ -5,7 +5,7 @@ import type {
   Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
   ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
-  BankTransactionStatus, LeadSource,
+  BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
 } from '../types';
 
 type Row = Record<string, unknown>;
@@ -45,6 +45,12 @@ export function rowToJob(r: Row): Job {
     followUpDate: asString(r.follow_up_date),
     notes: asString(r.notes),
     source: (asString(r.source) as LeadSource | undefined),
+    workType: (asString(r.work_type) as WorkType | undefined),
+    surfaceAreaM2: asNumber(r.surface_area_m2),
+    prepLevel: (asString(r.prep_level) as PrepLevel | undefined),
+    lostReason: (asString(r.lost_reason) as LostReason | undefined),
+    wonReason: (asString(r.won_reason) as WonReason | undefined),
+    outcomeNotes: asString(r.outcome_notes),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };
@@ -69,6 +75,12 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.followUpDate !== undefined) out.follow_up_date = j.followUpDate;
   if (j.notes !== undefined) out.notes = j.notes;
   if (j.source !== undefined) out.source = j.source || null;
+  if (j.workType !== undefined) out.work_type = j.workType || null;
+  if (j.surfaceAreaM2 !== undefined) out.surface_area_m2 = j.surfaceAreaM2 ?? null;
+  if (j.prepLevel !== undefined) out.prep_level = j.prepLevel || null;
+  if (j.lostReason !== undefined) out.lost_reason = j.lostReason || null;
+  if (j.wonReason !== undefined) out.won_reason = j.wonReason || null;
+  if (j.outcomeNotes !== undefined) out.outcome_notes = j.outcomeNotes || null;
   return out;
 }
 
@@ -96,6 +108,13 @@ export function rowToEntry(r: Row): Entry {
     paidDate: asString(r.paid_date),
     paymentRef: asString(r.payment_ref),
     bankTransactionId: asString(r.bank_transaction_id),
+    // Draft-bill fields. asBool(_, false) so legacy rows (column nullable
+    // before migration applied locally) read as confirmed.
+    isDraft: asBool(r.is_draft, false),
+    billPdfUrl: asString(r.bill_pdf_url),
+    parserConfidence: asString(r.parser_confidence) as Entry['parserConfidence'],
+    parserRaw: r.parser_raw ?? undefined,
+    sourceMessageId: asString(r.source_message_id),
     createdAt: r.created_at as string,
   };
 }
@@ -122,6 +141,13 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.paidDate !== undefined) out.paid_date = e.paidDate || null;
   if (e.paymentRef !== undefined) out.payment_ref = e.paymentRef || null;
   if (e.bankTransactionId !== undefined) out.bank_transaction_id = e.bankTransactionId || null;
+  // Draft-bill fields. Use the same `!== undefined` guard pattern so
+  // partial updates don't accidentally clear other fields.
+  if (e.isDraft !== undefined) out.is_draft = e.isDraft;
+  if (e.billPdfUrl !== undefined) out.bill_pdf_url = e.billPdfUrl || null;
+  if (e.parserConfidence !== undefined) out.parser_confidence = e.parserConfidence || null;
+  if (e.parserRaw !== undefined) out.parser_raw = e.parserRaw ?? null;
+  if (e.sourceMessageId !== undefined) out.source_message_id = e.sourceMessageId || null;
   return out;
 }
 
@@ -177,6 +203,28 @@ export function rowToMaterial(r: Row): Material {
     notes: asString(r.notes),
     createdAt: r.created_at as string,
   };
+}
+
+export function materialToRow(m: Partial<Material>): Row {
+  const out: Row = {};
+  if (m.businessId !== undefined) out.business_id = m.businessId;
+  if (m.jobId !== undefined) out.job_id = m.jobId || null;
+  if (m.entryId !== undefined) out.entry_id = m.entryId || null;
+  if (m.usedOn !== undefined) out.used_on = m.usedOn || null;
+  // Enum-typed fields: an empty string would violate the column's CHECK.
+  // Coerce empty/undefined back to null so partial updates can clear them.
+  if (m.productType !== undefined) out.product_type = m.productType || null;
+  if (m.brand !== undefined) out.brand = m.brand || null;
+  if (m.productName !== undefined) out.product_name = m.productName || null;
+  if (m.color !== undefined) out.color = m.color || null;
+  if (m.finish !== undefined) out.finish = m.finish || null;
+  if (m.quantity !== undefined) out.quantity = m.quantity ?? null;
+  if (m.unit !== undefined) out.unit = m.unit || null;
+  if (m.cost !== undefined) out.cost = m.cost ?? null;
+  if (m.supplier !== undefined) out.supplier = m.supplier || null;
+  if (m.area !== undefined) out.area = m.area || null;
+  if (m.notes !== undefined) out.notes = m.notes || null;
+  return out;
 }
 
 // ── Quote ───────────────────────────────────────────────────────────────────
