@@ -657,6 +657,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           // so position doesn't matter for visual correctness.
           setEntries((prev) => [prevEntry!, ...prev]);
         }
+        return;
+      }
+      // If the deleted entry was a bill draft with an attached PDF, clean
+      // up the Storage object too. Otherwise we'd accumulate orphan PDFs.
+      // Best-effort: a failure here only leaves a few KB of dead bytes —
+      // not worth rolling back the entry delete.
+      if (prevEntry?.billPdfUrl) {
+        const { error: stoErr } = await supabase.storage
+          .from('bill-pdfs')
+          .remove([prevEntry.billPdfUrl]);
+        if (stoErr) {
+          console.warn('[store] deleteEntry: PDF cleanup failed (orphan left in bucket):',
+            describeError(stoErr));
+        }
       }
     })();
   }, []);

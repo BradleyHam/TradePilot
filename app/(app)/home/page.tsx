@@ -33,7 +33,7 @@ import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material } from '
 type MaterialInit = Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId'>;
 import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
-  Check, Briefcase, FileText, Bell, FilePlus, ExternalLink,
+  Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -79,7 +79,7 @@ const COMING_UP_MAX_ROWS = 6;
 export default function HomePage() {
   const {
     entries, scheduleItems, invoices, jobs, businessId,
-    updateScheduleItem, updateEntry, markInvoicePaid, addEntry,
+    updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry,
     confirmBillDraftWithMaterials,
   } = useStore();
 
@@ -266,6 +266,7 @@ export default function HomePage() {
             onConfirmDraft={(id, { jobId, materials }) =>
               void confirmBillDraftWithMaterials(id, { jobId, materials })
             }
+            onDeleteDraft={(id) => deleteEntry(id)}
           />
         )}
 
@@ -636,7 +637,7 @@ function WeekStatsSection({
 
 function MoneyFlagsCard({
   overdueInvoices, billsDueSoon, billDrafts, jobs, todayISO,
-  onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft,
+  onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onDeleteDraft,
 }: {
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
@@ -646,6 +647,7 @@ function MoneyFlagsCard({
   onMarkInvoicePaid: (invoiceId: string) => void;
   onMarkBillPaid: (entryId: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
+  onDeleteDraft: (entryId: string) => void;
 }) {
   return (
     <section>
@@ -658,6 +660,7 @@ function MoneyFlagsCard({
             drafts={billDrafts}
             jobs={jobs}
             onConfirm={onConfirmDraft}
+            onDelete={onDeleteDraft}
           />
         )}
         {overdueInvoices.length > 0 && (
@@ -853,11 +856,12 @@ function BillsDueFlag({
 // failed GST validation, an unusual layout, or missing key fields.
 
 function BillsToConfirmFlag({
-  drafts, jobs, onConfirm,
+  drafts, jobs, onConfirm, onDelete,
 }: {
   drafts: Entry[];
   jobs: Job[];
   onConfirm: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
+  onDelete: (entryId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   // Total ex-GST across all drafts. Useful as the "if I confirm all of
@@ -899,6 +903,7 @@ function BillsToConfirmFlag({
               draft={d}
               jobs={jobs}
               onConfirm={onConfirm}
+              onDelete={onDelete}
             />
           ))}
         </ul>
@@ -923,11 +928,12 @@ interface ParsedLineItem {
 }
 
 function DraftBillRow({
-  draft, jobs, onConfirm,
+  draft, jobs, onConfirm, onDelete,
 }: {
   draft: Entry;
   jobs: Job[];
   onConfirm: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
+  onDelete: (entryId: string) => void;
 }) {
   // Picker state: starts at whatever the parser pre-filled (jobId from
   // rankJobs match, or undefined for unallocated). Brad can change before
@@ -1030,6 +1036,18 @@ function DraftBillRow({
     }
   }
 
+  function handleDelete() {
+    // window.confirm rather than a bespoke modal — keeps this small and
+    // there's no harm in a native prompt; deletion is rare. Phrase the
+    // prompt around recovery so Brad knows the consequence.
+    const label = draft.company ?? draft.supplier ?? 'this draft';
+    if (typeof window !== 'undefined'
+      && !window.confirm(`Delete ${label}? This can't be undone.`)) {
+      return;
+    }
+    onDelete(draft.id);
+  }
+
   function handleConfirm() {
     const billJobId: string | null = pickedJobId === '' ? null : pickedJobId;
 
@@ -1097,6 +1115,16 @@ function DraftBillRow({
         <span className="text-sm font-semibold text-foreground tabular-nums shrink-0">
           {fmtMoney(billExGst(draft))}
         </span>
+        {/* Delete: small × icon, permanent delete after window.confirm.
+            Also cleans up the linked PDF in Storage via deleteEntry. */}
+        <button
+          type="button"
+          onClick={handleDelete}
+          aria-label={`Delete draft from ${draft.company ?? draft.supplier ?? 'unknown supplier'}`}
+          className="shrink-0 -mt-1 -mr-1 w-7 h-7 rounded-md text-muted-foreground hover:text-red-600 hover:bg-red-50 flex items-center justify-center transition-colors"
+        >
+          <X size={14} strokeWidth={2} />
+        </button>
       </div>
 
       {/* Job picker — best matches float to the top via rankJobs */}
