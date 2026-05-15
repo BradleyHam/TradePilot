@@ -307,8 +307,56 @@ export interface Quote {
   varianceAmount?: number;
   variancePercent?: number;
   notes?: string;
+  // Scope fields populated by the site-capture flow + the project importer
+  // (which extracts what it can from quote PDFs + council plans).
+  // m²-by-zone is a map: { "weatherboards": 120, "soffits": 30, ... } so
+  // we can later analyse $/m² per surface type, not just per whole job.
+  surfaceAreaM2ByZone?: Record<string, number>;
+  prepLevel?: PrepLevel;
+  /** Free-form surface description ("weatherboard", "cedar", "linea", etc). */
+  surfaceType?: string;
+  /**
+   * Qualitative signals captured at the site visit. Kept loose so the
+   * vocabulary can grow without a schema change. Typical shape:
+   *   priceSensitivity: 'cheap' | 'mid' | 'premium'
+   *   urgency: 'low' | 'medium' | 'high'
+   *   decisionMakerPresent: boolean
+   *   leadSource: LeadSource
+   */
+  clientSignals?: Record<string, unknown>;
+  /** Folder path the project importer pulled this row from. */
+  importSourcePath?: string;
   createdAt: string;
   updatedAt: string;
+}
+
+/**
+ * A file attached to a quote — council plan, before/after photo, scope
+ * photo, or the sent quote PDF itself. Storage object lives in the
+ * `quote-attachments` Supabase Storage bucket; we store the path, never
+ * a signed URL (URLs expire, paths don't).
+ */
+export type QuoteAttachmentKind =
+  | 'plan'
+  | 'before_photo'
+  | 'after_photo'
+  | 'scope_photo'
+  | 'quote_pdf'
+  | 'other';
+
+export interface QuoteAttachment {
+  id: string;
+  businessId: string;
+  quoteId: string;
+  kind: QuoteAttachmentKind;
+  /** Object path inside the `quote-attachments` bucket. */
+  storagePath: string;
+  fileName?: string;
+  pageCount?: number;
+  /** Filled in by the council-plan parser once it runs over a `plan` kind. */
+  parsedM2ByZone?: Record<string, number>;
+  parsedConfidence?: 'high' | 'medium' | 'low';
+  createdAt: string;
 }
 
 export interface Setting {

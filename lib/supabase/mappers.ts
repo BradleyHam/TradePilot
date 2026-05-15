@@ -2,7 +2,8 @@
 // Keep all column-name knowledge here so the rest of the app stays clean.
 
 import type {
-  Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
+  Job, Entry, ScheduleItem, Material, Quote, QuoteAttachment, QuoteAttachmentKind,
+  Setting, Invoice, BankTransaction,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
   ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
@@ -248,9 +249,70 @@ export function rowToQuote(r: Row): Quote {
     varianceAmount: asNumber(r.variance_amount),
     variancePercent: asNumber(r.variance_percent),
     notes: asString(r.notes),
+    surfaceAreaM2ByZone: (r.surface_area_m2_by_zone as Record<string, number> | null) ?? undefined,
+    prepLevel: (asString(r.prep_level) as PrepLevel | undefined),
+    surfaceType: asString(r.surface_type),
+    clientSignals: (r.client_signals as Record<string, unknown> | null) ?? undefined,
+    importSourcePath: asString(r.import_source_path),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };
+}
+
+export function quoteToRow(q: Partial<Quote>): Row {
+  const out: Row = {};
+  if (q.businessId !== undefined) out.business_id = q.businessId;
+  if (q.legacyId !== undefined) out.legacy_id = q.legacyId || null;
+  if (q.legacyEnquiryId !== undefined) out.legacy_enquiry_id = q.legacyEnquiryId || null;
+  if (q.jobId !== undefined) out.job_id = q.jobId || null;
+  if (q.dateSent !== undefined) out.date_sent = q.dateSent || null;
+  if (q.clientName !== undefined) out.client_name = q.clientName || null;
+  if (q.jobAddress !== undefined) out.job_address = q.jobAddress || null;
+  if (q.jobType !== undefined) out.job_type = q.jobType || null;
+  if (q.scopeSummary !== undefined) out.scope_summary = q.scopeSummary || null;
+  if (q.baseAmountExGst !== undefined) out.base_amount_ex_gst = q.baseAmountExGst ?? null;
+  if (q.optionAmountExGst !== undefined) out.option_amount_ex_gst = q.optionAmountExGst ?? null;
+  if (q.totalAmountInclGst !== undefined) out.total_amount_incl_gst = q.totalAmountInclGst ?? null;
+  if (q.status !== undefined) out.status = q.status || null;
+  if (q.wonAmountExGst !== undefined) out.won_amount_ex_gst = q.wonAmountExGst ?? null;
+  if (q.varianceAmount !== undefined) out.variance_amount = q.varianceAmount ?? null;
+  if (q.variancePercent !== undefined) out.variance_percent = q.variancePercent ?? null;
+  if (q.notes !== undefined) out.notes = q.notes || null;
+  if (q.surfaceAreaM2ByZone !== undefined) out.surface_area_m2_by_zone = q.surfaceAreaM2ByZone ?? null;
+  if (q.prepLevel !== undefined) out.prep_level = q.prepLevel || null;
+  if (q.surfaceType !== undefined) out.surface_type = q.surfaceType || null;
+  if (q.clientSignals !== undefined) out.client_signals = q.clientSignals ?? null;
+  if (q.importSourcePath !== undefined) out.import_source_path = q.importSourcePath || null;
+  return out;
+}
+
+// ── QuoteAttachment ─────────────────────────────────────────────────────────
+export function rowToQuoteAttachment(r: Row): QuoteAttachment {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    quoteId: r.quote_id as string,
+    kind: r.kind as QuoteAttachmentKind,
+    storagePath: r.storage_path as string,
+    fileName: asString(r.file_name),
+    pageCount: asNumber(r.page_count),
+    parsedM2ByZone: (r.parsed_m2_by_zone as Record<string, number> | null) ?? undefined,
+    parsedConfidence: (asString(r.parsed_confidence) as 'high' | 'medium' | 'low' | undefined),
+    createdAt: r.created_at as string,
+  };
+}
+
+export function quoteAttachmentToRow(a: Partial<QuoteAttachment>): Row {
+  const out: Row = {};
+  if (a.businessId !== undefined) out.business_id = a.businessId;
+  if (a.quoteId !== undefined) out.quote_id = a.quoteId;
+  if (a.kind !== undefined) out.kind = a.kind;
+  if (a.storagePath !== undefined) out.storage_path = a.storagePath;
+  if (a.fileName !== undefined) out.file_name = a.fileName || null;
+  if (a.pageCount !== undefined) out.page_count = a.pageCount ?? null;
+  if (a.parsedM2ByZone !== undefined) out.parsed_m2_by_zone = a.parsedM2ByZone ?? null;
+  if (a.parsedConfidence !== undefined) out.parsed_confidence = a.parsedConfidence || null;
+  return out;
 }
 
 // ── Setting ─────────────────────────────────────────────────────────────────
