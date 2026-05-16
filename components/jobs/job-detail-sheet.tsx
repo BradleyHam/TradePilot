@@ -11,7 +11,7 @@ import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import {
   Phone, Mail, MapPin, Clock, DollarSign, Receipt, FileText, MessageSquare,
-  AlertCircle, StickyNote, TrendingUp, Edit3, Plus, Package, ExternalLink,
+  AlertCircle, StickyNote, TrendingUp, Edit3, Plus, Package, ExternalLink, X,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { JOB_STATUSES } from '@/lib/mock-data';
@@ -43,7 +43,7 @@ const TYPE_COLOR: Record<string, string> = {
 export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const {
     jobs, entries, invoices, scheduleItems, materials, quotes, quoteAttachments,
-    updateJob, reconcileJobSchedule,
+    updateJob, reconcileJobSchedule, deleteJob,
   } = useStore();
   const [reconciling, setReconciling] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
@@ -117,10 +117,50 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
     setOutcomePrompt(null);
   }
 
+  // Delete the job. Blocked if anything's attached; the prompt shows
+  // counts so the user knows what to move/skip first. Hard delete after
+  // a confirm — the block rule means only genuinely empty jobs reach
+  // the confirm step, so there's nothing worth soft-deleting.
+  async function handleDelete() {
+    const res = await deleteJob(liveJob.id);
+    if (res.ok) {
+      onClose();
+      return;
+    }
+    if (res.blockedBy) {
+      const b = res.blockedBy;
+      const items: string[] = [];
+      if (b.entries) items.push(`${b.entries} entr${b.entries === 1 ? 'y' : 'ies'} (hours/expenses/bills)`);
+      if (b.materials) items.push(`${b.materials} material${b.materials === 1 ? '' : 's'}`);
+      if (b.quotes) items.push(`${b.quotes} quote${b.quotes === 1 ? '' : 's'}`);
+      if (b.invoices) items.push(`${b.invoices} invoice${b.invoices === 1 ? '' : 's'}`);
+      if (b.quoteAttachments) items.push(`${b.quoteAttachments} attachment${b.quoteAttachments === 1 ? '' : 's'}`);
+      if (b.scheduleItems) items.push(`${b.scheduleItems} schedule item${b.scheduleItems === 1 ? '' : 's'}`);
+      alert(
+        `Can't delete "${liveJob.name}" — it has:\n\n• ${items.join('\n• ')}\n\n`
+        + `Move these to a different job (or delete them) first, then try again.`,
+      );
+      return;
+    }
+    if (res.error) alert(`Couldn't delete: ${res.error}`);
+  }
+
+  function confirmAndDelete() {
+    if (typeof window === 'undefined') return;
+    if (!window.confirm(
+      `Delete "${liveJob.name}"?\n\nThis can't be undone. The job will only be deleted if nothing's attached to it.`,
+    )) return;
+    void handleDelete();
+  }
+
   return (
     <Sheet open={open} onOpenChange={onClose}>
       <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
-        <div className="h-[92vh] flex flex-col overflow-hidden">
+        {/* h-[92dvh] (dynamic viewport height) instead of vh so the sheet
+            shrinks/grows with Safari's URL bar on iOS — otherwise the top
+            of the sheet (and its sticky header) sits hidden behind the URL
+            bar when it's showing. */}
+        <div className="h-[92dvh] flex flex-col overflow-hidden">
           {/* Fixed header — always visible. Inner wrapper caps width on desktop
               so the title/status row doesn't sprawl across a 27" monitor.
               Top padding uses safe-area-inset-top so the status dropdown
@@ -147,6 +187,20 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                     ))}
                   </SelectContent>
                 </Select>
+                {/* Delete: only succeeds if nothing's attached to the job
+                    (entries / materials / quotes / invoices / attachments
+                    / schedule items). Otherwise alerts with counts so the
+                    user knows what to move first. Hard delete after the
+                    confirm prompt — no soft delete because the block rule
+                    means only empty jobs ever reach this point. */}
+                <button
+                  type="button"
+                  onClick={confirmAndDelete}
+                  aria-label={`Delete job "${liveJob.name}"`}
+                  className="shrink-0 w-9 h-9 rounded-md text-muted-foreground hover:text-red-600 hover:bg-red-50 flex items-center justify-center transition-colors"
+                >
+                  <X size={16} strokeWidth={2} />
+                </button>
               </div>
             </div>
           </div>

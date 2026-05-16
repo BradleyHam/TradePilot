@@ -94,6 +94,30 @@ interface StoreState {
   addJob: (job: Job) => void;
   updateJob: (id: string, updates: Partial<Job>) => void;
   /**
+   * Hard-delete a job — only succeeds if NOTHING is attached. Inspects
+   * entries / materials / quotes / invoices / quote_attachments /
+   * schedule_items for rows referencing the jobId; if any are found,
+   * returns blockedBy with counts so the UI can render a clear "can't
+   * delete, move these first" message. The single legitimate use case
+   * is junk test jobs that were never real (no real data anywhere).
+   *
+   * Note: this is deliberately NOT a soft delete. The block-on-attached
+   * rule means there's nothing worth recovering — anything that survived
+   * the rule was empty by definition.
+   */
+  deleteJob: (id: string) => Promise<{
+    ok: boolean;
+    blockedBy?: {
+      entries: number;
+      materials: number;
+      quotes: number;
+      invoices: number;
+      quoteAttachments: number;
+      scheduleItems: number;
+    };
+    error?: string;
+  }>;
+  /**
    * One-shot cleanup of a job's schedule items against reality. Auto-runs
    * inside updateJob on the first transition into a terminal status; can
    * also be called directly (e.g. from a "Reconcile schedule" button) to
@@ -589,6 +613,67 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       });
     }
   }, [reconcileJobSchedule]);
+
+  /**
+   * Hard-delete a job. Blocked if anything is attached. The block-rule
+   * is the only safety net (no soft delete) so we'd rather refuse than
+   * silently orphan real data.
+   *
+   * Counts are computed from local state (fast, no extra round-trip) —
+   * the load query already pulled everything for this business. This
+   * means if another client added a row right now we might let a delete
+   * through that should've been blocked, but the schema's ON DELETE
+   * SET NULL means even then the worst case is unlinking a few rows,
+   * not actual data loss.
+   */
+  const deleteJob = useCallback(async (id: string) => {
+    if (!businessId) return { ok: false as const, error: 'No business loaded.' };
+
+    const blockedBy = {
+      entries: entriesRef.current.filter((e) => e.jobId === id).length,
+      materials: 0, // computed below — materials lives in materials state, not a ref
+      quotes: 0,
+      invoices: 0,
+      quoteAttachments: 0,
+      scheduleItems: scheduleItemsRef.current.filter((s) => s.jobId === id).length,
+    };
+    // setMaterials/setQuotes etc don't have refs (they're rarely needed
+    // in async closures). Use the setter-callback trick to read latest.
+    setMaterials((cur) => { blockedBy.materials = cur.filter((m) => m.jobId === id).length; return cur; });
+    setQuotes((cur) => { blockedBy.quotes = cur.filter((q) => q.jobId === id).length; return cur; });
+    setInvoices((cur) => { blockedBy.invoices = cur.filter((i) => i.jobId === id).length; return cur; });
+    setQuoteAttachments((cur) => {
+      // Count attachments tied to any of this job's quotes.
+      const quoteIds = new Set<string>();
+      setQuotes((qs) => { qs.filter((q) => q.jobId === id).forEach((q) => quoteIds.add(q.id)); return qs; });
+      blockedBy.quoteAttachments = cur.filter((a) => quoteIds.has(a.quoteId)).length;
+      return cur;
+    });
+
+    const totalAttached =
+      blockedBy.entries + blockedBy.materials + blockedBy.quotes +
+      blockedBy.invoices + blockedBy.quoteAttachments + blockedBy.scheduleItems;
+    if (totalAttached > 0) {
+      return { ok: false as const, blockedBy };
+    }
+
+    // Optimistic remove from local state, then delete from DB. If the
+    // DB delete fails, restore.
+    let prev: Job | undefined;
+    setJobs((js) => {
+      prev = js.find((j) => j.id === id);
+      return js.filter((j) => j.id !== id);
+    });
+
+    const { error: delErr } = await supabase.from('jobs').delete().eq('id', id);
+    if (delErr) {
+      console.error('[store] deleteJob failed:', describeError(delErr));
+      setError(describeError(delErr));
+      if (prev) setJobs((js) => [prev!, ...js]);
+      return { ok: false as const, error: describeError(delErr) };
+    }
+    return { ok: true as const };
+  }, [businessId]);
 
   const addEntry = useCallback((entry: Entry) => {
     if (!businessId) {
@@ -1465,7 +1550,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         jobs, entries, scheduleItems, materials, quotes, settings, invoices, bankTransactions,
         jobImports, quoteAttachments,
         businessId, loading, error,
-        addJob, updateJob, reconcileJobSchedule,
+        addJob, updateJob, deleteJob, reconcileJobSchedule,
         addEntry, updateEntry, deleteEntry,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
