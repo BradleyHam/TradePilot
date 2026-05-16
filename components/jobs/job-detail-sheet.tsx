@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Job, Entry, Material } from '@/lib/types';
+import { Job, Entry, Material, Quote, QuoteAttachment } from '@/lib/types';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -41,7 +41,10 @@ const TYPE_COLOR: Record<string, string> = {
 };
 
 export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
-  const { jobs, entries, invoices, scheduleItems, materials, updateJob, reconcileJobSchedule } = useStore();
+  const {
+    jobs, entries, invoices, scheduleItems, materials, quotes, quoteAttachments,
+    updateJob, reconcileJobSchedule,
+  } = useStore();
   const [reconciling, setReconciling] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
   // When set, the InvoiceAction sheet opens in edit mode for this invoice.
@@ -429,6 +432,20 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               items on the Home "Bills to confirm" flag. Hidden when empty
               so we don't render a "Materials (0)" stub on jobs that
               haven't had any bills attached yet. */}
+          {/* Quotes on this job — surfaces both legacy-imported quotes
+              (from the Finances sheet) AND ones created by the project-
+              archive importer's Link flow. Hidden when empty. */}
+          <JobQuotesList jobId={liveJob.id} quotes={quotes} />
+
+          {/* Plans + photos attached to any of the job's quotes. Tap
+              to open the signed Storage URL in a new tab. Hidden when
+              empty. */}
+          <JobAttachmentsList
+            jobId={liveJob.id}
+            quotes={quotes}
+            attachments={quoteAttachments}
+          />
+
           <JobMaterialsList jobId={liveJob.id} materials={materials} entries={entries} />
 
           {/* Notes — always rendered so the user can add/edit notes on any
@@ -823,4 +840,222 @@ function JobMaterialRow({ material, entries }: { material: Material; entries: En
       </button>
     </li>
   );
+}
+
+// ── Quotes on the job ──────────────────────────────────────────────────────
+//
+// Surfaces both legacy-imported quotes (from the Finances sheet — these
+// typically have legacy_id like "QUO-019" set) AND ones created by the
+// project-archive importer's Link flow (no legacy_id, but populated
+// from parsed_data). One row per quote, sorted by date_sent desc.
+
+function JobQuotesList({ jobId, quotes }: { jobId: string; quotes: Quote[] }) {
+  const jobQuotes = quotes
+    .filter((q) => q.jobId === jobId)
+    .sort((a, b) => {
+      const ad = a.dateSent ?? a.createdAt;
+      const bd = b.dateSent ?? b.createdAt;
+      return bd.localeCompare(ad);
+    });
+  if (jobQuotes.length === 0) return null;
+
+  // Sum of all quote totals on this job. Useful at a glance to compare
+  // against the invoice_amount + drift over time. NZ-style ex-GST since
+  // we generally show take-home everywhere else.
+  const totalExGst = jobQuotes.reduce((s, q) => s + (q.baseAmountExGst ?? 0), 0);
+
+  return (
+    <>
+      <Separator />
+      <div>
+        <div className="mb-2 flex flex-wrap items-baseline gap-x-2 gap-y-0.5">
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+            Quotes ({jobQuotes.length})
+          </p>
+          {totalExGst > 0 && (
+            <p className="text-[11px] text-muted-foreground">
+              ${Math.round(totalExGst).toLocaleString('en-NZ')} ex-GST total
+            </p>
+          )}
+        </div>
+        <ul className="space-y-2">
+          {jobQuotes.map((q) => (
+            <JobQuoteRow key={q.id} quote={q} />
+          ))}
+        </ul>
+      </div>
+    </>
+  );
+}
+
+function JobQuoteRow({ quote }: { quote: Quote }) {
+  // Header line: legacy QUO-id if present, else short uuid prefix; then
+  // total incl GST on the right. Subline: status + scope summary truncated.
+  const idLabel = quote.legacyId ?? `#${quote.id.slice(0, 8)}`;
+  const totalLabel = quote.totalAmountInclGst != null
+    ? `$${Math.round(quote.totalAmountInclGst).toLocaleString('en-NZ')}`
+    : '—';
+  const statusColor = quote.status === 'accepted' ? 'text-green-700 bg-green-50'
+    : quote.status === 'declined' ? 'text-red-700 bg-red-50'
+    : quote.status === 'sent'     ? 'text-blue-700 bg-blue-50'
+    : 'text-muted-foreground bg-muted/40';
+  const statusLabel = quote.status ?? 'draft';
+
+  return (
+    <li className="bg-muted/40 rounded-xl px-3 py-2.5">
+      <div className="flex items-start gap-2 min-w-0">
+        <div className="flex-1 min-w-0">
+          <div className="flex items-center gap-2 min-w-0 flex-wrap">
+            <p className="text-sm font-semibold text-foreground truncate">{idLabel}</p>
+            <span className={cn('text-[10px] font-medium uppercase tracking-wide px-1.5 py-0.5 rounded', statusColor)}>
+              {statusLabel}
+            </span>
+            {quote.dateSent && (
+              <span className="text-[11px] text-muted-foreground">{fmtIsoDate(quote.dateSent)}</span>
+            )}
+          </div>
+          {quote.scopeSummary && (
+            <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{quote.scopeSummary}</p>
+          )}
+          {(quote.jobType || quote.clientName) && (
+            <p className="text-[11px] text-muted-foreground mt-0.5 truncate">
+              {quote.jobType ?? ''}
+              {quote.jobType && quote.clientName ? ' · ' : ''}
+              {quote.clientName ?? ''}
+            </p>
+          )}
+        </div>
+        <span className="text-sm font-semibold text-foreground tabular-nums shrink-0">
+          {totalLabel}
+        </span>
+      </div>
+    </li>
+  );
+}
+
+// ── Plans + photos attached to the job ─────────────────────────────────────
+//
+// Reads quote_attachments via store, filtered to attachments whose
+// quote_id belongs to one of this job's quotes. Tap to open the file
+// via a signed Storage URL (5-min expiry). Grouped by kind so plans
+// (the high-value drawings) come first, before/after photos next,
+// generic scope photos last.
+
+function JobAttachmentsList({
+  jobId, quotes, attachments,
+}: {
+  jobId: string;
+  quotes: Quote[];
+  attachments: QuoteAttachment[];
+}) {
+  // Set of quote ids attached to this job — used to filter attachments.
+  const jobQuoteIds = new Set(quotes.filter((q) => q.jobId === jobId).map((q) => q.id));
+  if (jobQuoteIds.size === 0) return null;
+  const jobAttachments = attachments.filter((a) => jobQuoteIds.has(a.quoteId));
+  if (jobAttachments.length === 0) return null;
+
+  // Group by kind. Order: plans → before_photo → after_photo → scope_photo → other.
+  const order: QuoteAttachment['kind'][] = [
+    'plan', 'before_photo', 'after_photo', 'scope_photo', 'quote_pdf', 'other',
+  ];
+  const grouped: Record<string, QuoteAttachment[]> = {};
+  for (const a of jobAttachments) {
+    (grouped[a.kind] ??= []).push(a);
+  }
+
+  return (
+    <>
+      <Separator />
+      <div>
+        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+          Plans &amp; photos ({jobAttachments.length})
+        </p>
+        <div className="space-y-3">
+          {order.map((kind) => {
+            const items = grouped[kind];
+            if (!items || items.length === 0) return null;
+            return (
+              <div key={kind}>
+                <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">
+                  {kindLabel(kind)} ({items.length})
+                </p>
+                <ul className="space-y-1.5">
+                  {items.map((a) => (
+                    <AttachmentRow key={a.id} attachment={a} />
+                  ))}
+                </ul>
+              </div>
+            );
+          })}
+        </div>
+      </div>
+    </>
+  );
+}
+
+function kindLabel(kind: QuoteAttachment['kind']): string {
+  switch (kind) {
+    case 'plan': return 'Plans';
+    case 'before_photo': return 'Before';
+    case 'after_photo': return 'After';
+    case 'scope_photo': return 'Scope photos';
+    case 'quote_pdf': return 'Quote PDF';
+    case 'other': return 'Other';
+  }
+}
+
+function AttachmentRow({ attachment }: { attachment: QuoteAttachment }) {
+  const [opening, setOpening] = useState(false);
+
+  async function handleOpen() {
+    setOpening(true);
+    try {
+      const { data, error } = await supabase.storage
+        .from('quote-attachments')
+        .createSignedUrl(attachment.storagePath, 300);
+      if (error || !data) {
+        console.error('[job-attachments] Failed to sign URL:', error);
+        alert("Couldn't open the file — please try again.");
+        return;
+      }
+      window.open(data.signedUrl, '_blank', 'noopener');
+    } finally {
+      setOpening(false);
+    }
+  }
+
+  const isPdf = (attachment.fileName ?? '').toLowerCase().endsWith('.pdf');
+  const Icon = isPdf ? FileText : Package;
+  const displayName = attachment.fileName ?? attachment.storagePath.split('/').pop() ?? '(file)';
+
+  return (
+    <li>
+      <button
+        type="button"
+        onClick={handleOpen}
+        disabled={opening}
+        aria-label={`Open ${displayName}`}
+        className="w-full flex items-center gap-2 px-3 py-2 rounded-xl bg-muted/40 hover:bg-muted/70 cursor-pointer active:scale-[0.99] transition-all text-left"
+      >
+        <Icon size={14} className="text-muted-foreground shrink-0" strokeWidth={1.8} />
+        <p className="flex-1 min-w-0 text-sm text-foreground truncate" title={displayName}>
+          {displayName}
+        </p>
+        <ExternalLink
+          size={12}
+          className={cn('text-muted-foreground shrink-0', opening && 'opacity-50')}
+          strokeWidth={2}
+        />
+      </button>
+    </li>
+  );
+}
+
+/** ISO YYYY-MM-DD → "13 May 2026" style. */
+function fmtIsoDate(iso: string): string {
+  // Be defensive: legacy import dates sometimes come through as plain
+  // text rather than ISO. Pass through anything that doesn't parse.
+  const d = new Date(iso);
+  if (!Number.isFinite(d.getTime())) return iso;
+  return d.toLocaleDateString('en-NZ', { day: 'numeric', month: 'short', year: 'numeric' });
 }

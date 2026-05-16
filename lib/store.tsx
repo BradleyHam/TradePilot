@@ -4,7 +4,7 @@ import React, { createContext, useContext, useEffect, useState, useCallback, use
 import { supabase } from './supabase/client';
 import {
   rowToJob, rowToEntry, rowToScheduleItem,
-  rowToMaterial, rowToQuote, rowToSetting, rowToInvoice, rowToBankTransaction,
+  rowToMaterial, rowToQuote, rowToQuoteAttachment, rowToSetting, rowToInvoice, rowToBankTransaction,
   rowToJobImport,
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
@@ -79,6 +79,13 @@ interface StoreState {
    * review" flag where the user commits each as link/create/skip.
    */
   jobImports: JobImport[];
+  /**
+   * Files attached to quotes — plans, before/after photos, scope photos,
+   * the quote PDF itself. Populated by the project importer + the
+   * commit flow. JobDetailSheet's "Plans & photos" panel reads these,
+   * filtered to the quotes tied to that job.
+   */
+  quoteAttachments: QuoteAttachment[];
   businessId: string | null;
   loading: boolean;
   error: string | null;
@@ -236,6 +243,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   /* eslint-disable react-hooks/refs */
   jobImportsRef.current = jobImports;
   /* eslint-enable react-hooks/refs */
+  const [quoteAttachments, setQuoteAttachments] = useState<QuoteAttachment[]>([]);
   const [businessId, setBusinessId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -267,7 +275,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setBusinessId(null);
         setJobs([]); setEntries([]); setScheduleItems([]);
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
-        setBankTransactions([]); setJobImports([]);
+        setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
         setLoading(false);
         return;
       }
@@ -278,7 +286,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // Errors on individual tables (e.g. a missing-table during migration)
       // shouldn't take down the whole page. Each table degrades to an empty
       // array and the error is logged with full detail.
-      const [j, e, s, m, q, st, inv, bnk, ji] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa] = await Promise.all([
         supabase.from('jobs').select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -292,6 +300,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // committed/skipped tail of the table (which only grows).
         supabase.from('job_imports').select('*').eq('business_id', bizId)
           .eq('status', 'pending').order('created_at', { ascending: false }),
+        // Quote attachments — small table, fetch all. JobDetailSheet
+        // filters client-side to the quotes tied to the open job.
+        supabase.from('quote_attachments').select('*').eq('business_id', bizId)
+          .order('created_at', { ascending: false }),
       ]);
 
       // Log per-table errors with detail (Supabase errors don't stringify
@@ -303,7 +315,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       collect('jobs', j); collect('entries', e); collect('schedule_items', s);
       collect('materials', m); collect('quotes', q); collect('settings', st);
       collect('invoices', inv); collect('bank_transactions', bnk);
-      collect('job_imports', ji);
+      collect('job_imports', ji); collect('quote_attachments', qa);
 
       if (tableErrors.length > 0) {
         for (const { table, err: tErr } of tableErrors) {
@@ -334,6 +346,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setSettings((st.data ?? []).map(rowToSetting));
       setInvoices((inv.data ?? []).map(rowToInvoice));
       setJobImports((ji.data ?? []).map(rowToJobImport));
+      setQuoteAttachments((qa.data ?? []).map(rowToQuoteAttachment));
     } catch (err: unknown) {
       // Top-level catch — only fires for the businesses fetch or completely
       // unexpected throws.
@@ -802,11 +815,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             storagePath: toPath,
             fileName: cleanName,
           };
-          const { error: attErr } = await supabase
-            .from('quote_attachments').insert(quoteAttachmentToRow(attachRow));
+          const { data: attData, error: attErr } = await supabase
+            .from('quote_attachments').insert(quoteAttachmentToRow(attachRow))
+            .select('*').single();
           if (attErr) {
             console.warn('[store] commitImport: attachment insert failed —', describeError(attErr));
             continue;
+          }
+          // Mirror into local state so JobDetailSheet's Plans & photos
+          // panel updates without waiting for a refresh.
+          if (attData) {
+            setQuoteAttachments((prev) => [rowToQuoteAttachment(attData), ...prev]);
           }
           attachmentsInserted++;
         }
@@ -1381,7 +1400,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     <StoreContext.Provider
       value={{
         jobs, entries, scheduleItems, materials, quotes, settings, invoices, bankTransactions,
-        jobImports,
+        jobImports, quoteAttachments,
         businessId, loading, error,
         addJob, updateJob, reconcileJobSchedule,
         addEntry, updateEntry, deleteEntry,
