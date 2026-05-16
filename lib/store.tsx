@@ -5,11 +5,13 @@ import { supabase } from './supabase/client';
 import {
   rowToJob, rowToEntry, rowToScheduleItem,
   rowToMaterial, rowToQuote, rowToSetting, rowToInvoice, rowToBankTransaction,
+  rowToJobImport,
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
-  materialToRow,
+  materialToRow, quoteToRow, quoteAttachmentToRow,
 } from './supabase/mappers';
 import type {
   Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
+  JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus,
 } from './types';
 
@@ -22,6 +24,27 @@ import type {
  * "what went wrong" usually lives (e.g. `PGRST116` = no rows, `42501` =
  * RLS denied, `23503` = FK violation).
  */
+/**
+ * Best-guess quote_attachments kind from a filename. Mirrors the
+ * importer's file classifier so attachments land in the same buckets
+ * after commit as the dry-run report predicted.
+ */
+function inferAttachmentKind(name: string): QuoteAttachmentKind {
+  const lower = name.toLowerCase();
+  if (lower.endsWith('.pdf')) {
+    if (lower.includes('plan') || lower.includes('consent') || lower.includes('drawing')) return 'plan';
+    if (lower.startsWith('inv-') || lower.includes('invoice')) return 'other';
+    if (lower.startsWith('q-') || lower.includes('quote')) return 'quote_pdf';
+    return 'other';
+  }
+  if (/\.(jpe?g|png|webp|heic)$/.test(lower)) {
+    if (lower.includes('before') || lower.includes('start')) return 'before_photo';
+    if (lower.includes('after') || lower.includes('final') || lower.includes('done')) return 'after_photo';
+    return 'scope_photo';
+  }
+  return 'other';
+}
+
 function describeError(err: unknown): string {
   if (!err) return 'Unknown error';
   if (typeof err === 'string') return err;
@@ -50,6 +73,12 @@ interface StoreState {
   settings: Setting[];
   invoices: Invoice[];
   bankTransactions: BankTransaction[];
+  /**
+   * Pending project-archive imports staged by scripts/import-projects.ts.
+   * One row per /projects folder. Surfaced on Home as the "Imports to
+   * review" flag where the user commits each as link/create/skip.
+   */
+  jobImports: JobImport[];
   businessId: string | null;
   loading: boolean;
   error: string | null;
@@ -137,6 +166,38 @@ interface StoreState {
     rows: Omit<Material, 'id' | 'businessId' | 'createdAt'>[],
   ) => Promise<{ inserted: number; failed: number }>;
 
+  /**
+   * Commit a pending job_import row by linking it to an EXISTING job.
+   * Creates a `quotes` row tied to that job (populated from
+   * parsed_data when available), moves the staged Storage objects from
+   * `_pending/{importId}/` to `{businessId}/{quoteId}/`, and inserts a
+   * `quote_attachments` row per file. Conservatively merges parsed
+   * scope fields into the job ONLY where the job's fields are empty.
+   * Marks the import as committed on success.
+   */
+  commitImportAsLink: (
+    importId: string,
+    jobId: string,
+  ) => Promise<{ ok: boolean; quoteId?: string; error?: string }>;
+
+  /**
+   * Same as link, but first creates a NEW jobs row from the import's
+   * folder name + parsed_data. Auto-derived defaults: name = folder
+   * name (or parsed jobType if better), client_name from parsed_data,
+   * status = 'completed' if invoice present, else 'in-progress'.
+   */
+  commitImportAsCreate: (
+    importId: string,
+  ) => Promise<{ ok: boolean; jobId?: string; quoteId?: string; error?: string }>;
+
+  /**
+   * Mark a pending import as skipped (won't commit). Storage files are
+   * left in _pending/ for now — a future cleanup pass can purge them.
+   */
+  commitImportAsSkip: (
+    importId: string,
+  ) => Promise<{ ok: boolean; error?: string }>;
+
   // Re-fetch everything from Supabase (useful after a write succeeds).
   refresh: () => Promise<void>;
 }
@@ -168,6 +229,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [settings, setSettings] = useState<Setting[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
   const [bankTransactions, setBankTransactions] = useState<BankTransaction[]>([]);
+  const [jobImports, setJobImports] = useState<JobImport[]>([]);
+  // jobImportsRef so the commit handlers can read the current import row
+  // without depending on closure capture; same pattern as jobsRef above.
+  const jobImportsRef = useRef(jobImports);
+  /* eslint-disable react-hooks/refs */
+  jobImportsRef.current = jobImports;
+  /* eslint-enable react-hooks/refs */
   const [businessId, setBusinessId] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
@@ -199,7 +267,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setBusinessId(null);
         setJobs([]); setEntries([]); setScheduleItems([]);
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
-        setBankTransactions([]);
+        setBankTransactions([]); setJobImports([]);
         setLoading(false);
         return;
       }
@@ -210,7 +278,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // Errors on individual tables (e.g. a missing-table during migration)
       // shouldn't take down the whole page. Each table degrades to an empty
       // array and the error is logged with full detail.
-      const [j, e, s, m, q, st, inv, bnk] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji] = await Promise.all([
         supabase.from('jobs').select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -219,6 +287,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         supabase.from('settings').select('*').eq('business_id', bizId),
         supabase.from('invoices').select('*').eq('business_id', bizId).order('invoice_date', { ascending: false }),
         supabase.from('bank_transactions').select('*').eq('business_id', bizId).order('txn_date', { ascending: false }),
+        // Pending project-archive imports for the "Imports to review" flag.
+        // Filtering at the query level so the client never holds the
+        // committed/skipped tail of the table (which only grows).
+        supabase.from('job_imports').select('*').eq('business_id', bizId)
+          .eq('status', 'pending').order('created_at', { ascending: false }),
       ]);
 
       // Log per-table errors with detail (Supabase errors don't stringify
@@ -230,6 +303,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       collect('jobs', j); collect('entries', e); collect('schedule_items', s);
       collect('materials', m); collect('quotes', q); collect('settings', st);
       collect('invoices', inv); collect('bank_transactions', bnk);
+      collect('job_imports', ji);
 
       if (tableErrors.length > 0) {
         for (const { table, err: tErr } of tableErrors) {
@@ -259,6 +333,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setQuotes((q.data ?? []).map(rowToQuote));
       setSettings((st.data ?? []).map(rowToSetting));
       setInvoices((inv.data ?? []).map(rowToInvoice));
+      setJobImports((ji.data ?? []).map(rowToJobImport));
     } catch (err: unknown) {
       // Top-level catch — only fires for the businesses fetch or completely
       // unexpected throws.
@@ -639,6 +714,230 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // setError already called from addMaterials on a hard failure.
     }
   }, [updateEntry, addMaterials]);
+
+  // ── job_imports commit flow ────────────────────────────────────────────
+  // Three mutators (link / create / skip) for committing an "Imports to
+  // review" row on Home. Shared logic lives in commitImportShared which
+  // both link and create call into; skip is a one-line status flip.
+
+  /**
+   * Given a confirmed jobId and a pending import row, do the heavy lift:
+   *   1. Create a `quotes` row tied to the job, hydrated from parsed_data
+   *      when available (folder name as fallback).
+   *   2. List the staged files in `_pending/{importId}/`, move each to
+   *      `{businessId}/{quoteId}/{uuid}__filename.ext`, create a
+   *      `quote_attachments` row per moved file. Kind is inferred from
+   *      the file extension + name.
+   *   3. Conservative merge: if the linked job has an empty scope field
+   *      (surface_area_m2_by_zone, prep_level, surface_type) AND the
+   *      import's parsed_data has a value, copy it onto the job. Never
+   *      overwrites.
+   *   4. Mark the import row committed.
+   */
+  const commitImportShared = useCallback(async (
+    imp: JobImport,
+    jobId: string,
+    action: 'link' | 'create',
+  ): Promise<{ ok: boolean; quoteId?: string; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business loaded.' };
+    const parsed = imp.parsedData;
+
+    // ── 1. Create the quotes row ─────────────────────────────────────────
+    const quoteRowData = quoteToRow({
+      businessId,
+      jobId,
+      clientName: parsed?.clientName,
+      jobAddress: parsed?.jobAddress ?? imp.folderName,
+      jobType: parsed?.jobType,
+      scopeSummary: parsed?.scopeSummary,
+      baseAmountExGst: parsed?.baseAmountExGst,
+      totalAmountInclGst: parsed?.totalAmountInclGst,
+      dateSent: parsed?.dateSent,
+      status: parsed?.totalAmountInclGst ? 'sent' : 'draft',
+      surfaceAreaM2ByZone: parsed?.surfaceAreaM2ByZone,
+      prepLevel: parsed?.prepLevel,
+      surfaceType: parsed?.surfaceType,
+      importSourcePath: imp.sourcePath,
+    });
+    const { data: quoteInsert, error: quoteErr } = await supabase
+      .from('quotes').insert(quoteRowData).select('id').single();
+    if (quoteErr || !quoteInsert) {
+      const msg = describeError(quoteErr) || 'Failed to create quote';
+      console.error('[store] commitImport: quote insert failed —', msg);
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+    const quoteId = quoteInsert.id as string;
+
+    // ── 2. Move staged files + insert quote_attachments ──────────────────
+    let attachmentsInserted = 0;
+    if (imp.attachmentsStoragePrefix) {
+      const stagedDir = `${businessId}/${imp.attachmentsStoragePrefix}`;
+      const { data: stagedFiles, error: listErr } = await supabase.storage
+        .from('quote-attachments').list(stagedDir, { limit: 100 });
+      if (listErr) {
+        console.warn('[store] commitImport: could not list staged files —', describeError(listErr));
+      } else if (stagedFiles && stagedFiles.length > 0) {
+        for (const f of stagedFiles) {
+          const fromPath = `${stagedDir}/${f.name}`;
+          // Strip the random UUID prefix the importer prepended so the
+          // final canonical filename is the original supplier name.
+          // Filenames look like "{uuid}__{originalName}". Tolerate the
+          // case where there's no separator.
+          const sepIdx = f.name.indexOf('__');
+          const cleanName = sepIdx >= 0 ? f.name.slice(sepIdx + 2) : f.name;
+          const toPath = `${businessId}/${quoteId}/${crypto.randomUUID()}__${cleanName}`;
+          const { error: mvErr } = await supabase.storage
+            .from('quote-attachments').move(fromPath, toPath);
+          if (mvErr) {
+            console.warn('[store] commitImport: move failed for', f.name, '—', describeError(mvErr));
+            continue;
+          }
+          // Best-guess kind from filename (mirrors importer's classifier).
+          const kind = inferAttachmentKind(cleanName);
+          const attachRow: Partial<QuoteAttachment> = {
+            businessId,
+            quoteId,
+            kind,
+            storagePath: toPath,
+            fileName: cleanName,
+          };
+          const { error: attErr } = await supabase
+            .from('quote_attachments').insert(quoteAttachmentToRow(attachRow));
+          if (attErr) {
+            console.warn('[store] commitImport: attachment insert failed —', describeError(attErr));
+            continue;
+          }
+          attachmentsInserted++;
+        }
+      }
+    }
+
+    // ── 3. Conservative scope merge into the job (link path only) ────────
+    // For the create path the job was just made with the parsed fields
+    // already populated, so no merge needed.
+    if (action === 'link' && parsed) {
+      const job = jobsRef.current.find((j) => j.id === jobId);
+      if (job) {
+        const jobPatches: Partial<Job> = {};
+        if (!job.surfaceAreaM2 && parsed.surfaceAreaM2ByZone) {
+          // Sum the m² zones into a single total for the job's flat field.
+          const total = Object.values(parsed.surfaceAreaM2ByZone)
+            .reduce((s, v) => s + v, 0);
+          if (total > 0) jobPatches.surfaceAreaM2 = total;
+        }
+        if (!job.prepLevel && parsed.prepLevel) jobPatches.prepLevel = parsed.prepLevel;
+        if (Object.keys(jobPatches).length > 0) {
+          const { error: jobErr } = await supabase.from('jobs')
+            .update(jobToRow(jobPatches)).eq('id', jobId);
+          if (jobErr) {
+            console.warn('[store] commitImport: job merge failed —', describeError(jobErr));
+            // Don't fail the commit — merge is a nice-to-have.
+          } else {
+            setJobs((prev) => prev.map((j) => j.id === jobId ? { ...j, ...jobPatches } : j));
+          }
+        }
+      }
+    }
+
+    // ── 4. Mark the import committed ─────────────────────────────────────
+    const { error: updErr } = await supabase.from('job_imports').update({
+      status: 'committed',
+      commit_action: action,
+      commit_target_job_id: jobId,
+      commit_target_quote_id: quoteId,
+      committed_at: new Date().toISOString(),
+    }).eq('id', imp.id);
+    if (updErr) {
+      // The real data landed, just couldn't mark the import. Log + continue.
+      console.warn('[store] commitImport: status update failed —', describeError(updErr));
+    }
+    // Refresh local quotes + jobs in case other UI surfaces want them.
+    setQuotes((prev) => [
+      { id: quoteId, businessId, jobId, jobAddress: imp.folderName,
+        createdAt: new Date().toISOString(), updatedAt: new Date().toISOString(),
+        ...parsed,
+        importSourcePath: imp.sourcePath,
+      } as Quote,
+      ...prev,
+    ]);
+    // Remove the import from the pending list — same effect as removing
+    // its row from the active dataset since the load query filters on
+    // status='pending'.
+    setJobImports((prev) => prev.filter((i) => i.id !== imp.id));
+
+    console.info('[store] commitImport:', action, 'jobId=', jobId, 'quoteId=', quoteId,
+      'attachments=', attachmentsInserted);
+    return { ok: true, quoteId };
+  }, [businessId]);
+
+  const commitImportAsLink = useCallback(async (
+    importId: string,
+    jobId: string,
+  ): Promise<{ ok: boolean; quoteId?: string; error?: string }> => {
+    const imp = jobImportsRef.current.find((i) => i.id === importId);
+    if (!imp) return { ok: false, error: 'Import not found' };
+    return commitImportShared(imp, jobId, 'link');
+  }, [commitImportShared]);
+
+  const commitImportAsCreate = useCallback(async (
+    importId: string,
+  ): Promise<{ ok: boolean; jobId?: string; quoteId?: string; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business loaded.' };
+    const imp = jobImportsRef.current.find((i) => i.id === importId);
+    if (!imp) return { ok: false, error: 'Import not found' };
+
+    // Derive new-job defaults from parsed_data + folder name.
+    const parsed = imp.parsedData;
+    const hasInvoice = (imp.filesSummary.invoice_pdf ?? 0) > 0;
+    // Note: Job has prepLevel/surfaceAreaM2 but NOT surfaceType — the
+    // surface type lives on the Quote, where it's per-quote rather than
+    // a per-job constant. That's fine: a single job can span multiple
+    // surfaces (deck + weatherboards + cedar trim), so quote-level is
+    // where the granularity should sit.
+    const newJobInit: Partial<Job> = {
+      businessId,
+      name: parsed?.jobType ?? imp.folderName,
+      clientName: parsed?.clientName ?? '',
+      location: parsed?.jobAddress ?? imp.folderName,
+      status: hasInvoice ? 'paid' : (parsed?.totalAmountInclGst ? 'quoted' : 'lead'),
+      prepLevel: parsed?.prepLevel,
+      surfaceAreaM2: parsed?.surfaceAreaM2ByZone
+        ? Object.values(parsed.surfaceAreaM2ByZone).reduce((s, v) => s + v, 0)
+        : undefined,
+    };
+    const { data: jobInsert, error: jobErr } = await supabase
+      .from('jobs').insert(jobToRow(newJobInit)).select('*').single();
+    if (jobErr || !jobInsert) {
+      const msg = describeError(jobErr) || 'Failed to create job';
+      console.error('[store] commitImportAsCreate: job insert failed —', msg);
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+    const persistedJob = rowToJob(jobInsert);
+    setJobs((prev) => [persistedJob, ...prev]);
+
+    const result = await commitImportShared(imp, persistedJob.id, 'create');
+    return { ...result, jobId: persistedJob.id };
+  }, [businessId, commitImportShared]);
+
+  const commitImportAsSkip = useCallback(async (
+    importId: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const { error: updErr } = await supabase.from('job_imports').update({
+      status: 'skipped',
+      commit_action: 'skip',
+      committed_at: new Date().toISOString(),
+    }).eq('id', importId);
+    if (updErr) {
+      const msg = describeError(updErr);
+      console.error('[store] commitImportAsSkip failed —', msg);
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+    setJobImports((prev) => prev.filter((i) => i.id !== importId));
+    return { ok: true };
+  }, []);
 
   const deleteEntry = useCallback((id: string) => {
     let prevEntry: Entry | undefined;
@@ -1082,6 +1381,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     <StoreContext.Provider
       value={{
         jobs, entries, scheduleItems, materials, quotes, settings, invoices, bankTransactions,
+        jobImports,
         businessId, loading, error,
         addJob, updateJob, reconcileJobSchedule,
         addEntry, updateEntry, deleteEntry,
@@ -1089,6 +1389,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         addInvoice, updateInvoice, markInvoicePaid,
         confirmBillDraft, confirmBillDraftWithMaterials,
         addMaterials,
+        commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
         importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry,
         refresh: load,
       }}

@@ -23,7 +23,7 @@ import { PageHeader } from '@/components/shared/page-header';
 import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
 import { rankJobs } from '@/lib/job-match';
-import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material } from '@/lib/types';
+import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport } from '@/lib/types';
 
 /**
  * Shape we hand to the store mutator for each material — store stamps
@@ -78,9 +78,10 @@ const COMING_UP_MAX_ROWS = 6;
 // ── Page ────────────────────────────────────────────────────────────────────
 export default function HomePage() {
   const {
-    entries, scheduleItems, invoices, jobs, businessId,
+    entries, scheduleItems, invoices, jobs, jobImports, businessId,
     updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry,
     confirmBillDraftWithMaterials,
+    commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
   } = useStore();
 
   // Compute "today" once per render and pin the ISO strings in stable values
@@ -192,7 +193,8 @@ export default function HomePage() {
 
   const showMoneyFlags = overdueInvoices.length > 0
     || billsDueSoon.length > 0
-    || billDrafts.length > 0;
+    || billDrafts.length > 0
+    || jobImports.length > 0;
 
   // ── Coming up (next 7 days, not including today) ───────────────────────
   const comingUp = useMemo(() => {
@@ -259,6 +261,7 @@ export default function HomePage() {
             overdueInvoices={overdueInvoices}
             billsDueSoon={billsDueSoon}
             billDrafts={billDrafts}
+            jobImports={jobImports}
             jobs={jobs}
             todayISO={todayISO}
             onMarkInvoicePaid={(id) => markInvoicePaid(id, todayISO)}
@@ -267,6 +270,9 @@ export default function HomePage() {
               void confirmBillDraftWithMaterials(id, { jobId, materials })
             }
             onDeleteDraft={(id) => deleteEntry(id)}
+            onCommitImportAsLink={(id, jobId) => void commitImportAsLink(id, jobId)}
+            onCommitImportAsCreate={(id) => void commitImportAsCreate(id)}
+            onCommitImportAsSkip={(id) => void commitImportAsSkip(id)}
           />
         )}
 
@@ -636,18 +642,23 @@ function WeekStatsSection({
 // which collapses any open state automatically (correct behaviour).
 
 function MoneyFlagsCard({
-  overdueInvoices, billsDueSoon, billDrafts, jobs, todayISO,
+  overdueInvoices, billsDueSoon, billDrafts, jobImports, jobs, todayISO,
   onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onDeleteDraft,
+  onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip,
 }: {
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
   billDrafts: Entry[];
+  jobImports: JobImport[];
   jobs: Job[];
   todayISO: string;
   onMarkInvoicePaid: (invoiceId: string) => void;
   onMarkBillPaid: (entryId: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
   onDeleteDraft: (entryId: string) => void;
+  onCommitImportAsLink: (importId: string, jobId: string) => void;
+  onCommitImportAsCreate: (importId: string) => void;
+  onCommitImportAsSkip: (importId: string) => void;
 }) {
   return (
     <section>
@@ -661,6 +672,18 @@ function MoneyFlagsCard({
             jobs={jobs}
             onConfirm={onConfirmDraft}
             onDelete={onDeleteDraft}
+          />
+        )}
+        {/* Project archive imports — staged by scripts/import-projects.ts.
+            Sits below bill drafts because these are historical data being
+            backfilled, not "right now" actions. */}
+        {jobImports.length > 0 && (
+          <ImportsToReviewFlag
+            imports={jobImports}
+            jobs={jobs}
+            onLink={onCommitImportAsLink}
+            onCreate={onCommitImportAsCreate}
+            onSkip={onCommitImportAsSkip}
           />
         )}
         {overdueInvoices.length > 0 && (
@@ -1218,6 +1241,256 @@ function DraftBillRow({
           className="h-11 px-4 rounded-full bg-green-600 hover:bg-green-700 text-white text-xs font-semibold transition-colors active:scale-95"
         >
           Confirm
+        </button>
+      </div>
+    </li>
+  );
+}
+
+// ── Flag: Project archive imports awaiting review ──────────────────────────
+//
+// Populated by running `npx tsx scripts/import-projects.ts --apply` against
+// Brad's /projects folder. Each pending row represents a folder that hasn't
+// yet been linked to a job (or created one). Brad expands the flag, eyeballs
+// each row, and taps Link / Create / Skip to commit.
+//
+// The commit handlers live in the store (commitImportAsLink etc.) — they
+// move staged Storage files, create the real quotes row, and conservatively
+// merge parsed scope fields into the existing job. This component is pure
+// UI; all state mutation goes through the parent's callbacks.
+
+function ImportsToReviewFlag({
+  imports, jobs, onLink, onCreate, onSkip,
+}: {
+  imports: JobImport[];
+  jobs: Job[];
+  onLink: (importId: string, jobId: string) => void;
+  onCreate: (importId: string) => void;
+  onSkip: (importId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  // Order rows by confidence so the easy wins come first — Brad can rip
+  // through the J-ID matches in seconds before settling in on the
+  // ambiguous ones.
+  const sorted = useMemo(() => {
+    const rank: Record<string, number> = { high: 0, medium: 1, low: 2, none: 3 };
+    return [...imports].sort((a, b) => (rank[a.matchConfidence] ?? 9) - (rank[b.matchConfidence] ?? 9));
+  }, [imports]);
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-3 px-4 py-3 min-h-[56px] hover:bg-accent transition-colors text-left"
+      >
+        <div className="w-8 h-8 rounded-xl bg-violet-50 flex items-center justify-center shrink-0">
+          <FilePlus size={16} className="text-violet-600" strokeWidth={1.8} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground">
+            {imports.length} import{imports.length === 1 ? '' : 's'} to review
+          </p>
+          <p className="text-xs text-muted-foreground">
+            From project archive · link to a job, create new, or skip
+          </p>
+        </div>
+        <ChevronDown
+          size={16}
+          className={cn(
+            'text-muted-foreground shrink-0 transition-transform',
+            open && 'rotate-180',
+          )}
+        />
+      </button>
+      {open && (
+        <ul className="px-2 pb-2 space-y-2 bg-muted/30">
+          {sorted.map((imp) => (
+            <ImportRow
+              key={imp.id}
+              importRow={imp}
+              jobs={jobs}
+              onLink={onLink}
+              onCreate={onCreate}
+              onSkip={onSkip}
+            />
+          ))}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+function ImportRow({
+  importRow, jobs, onLink, onCreate, onSkip,
+}: {
+  importRow: JobImport;
+  jobs: Job[];
+  onLink: (importId: string, jobId: string) => void;
+  onCreate: (importId: string) => void;
+  onSkip: (importId: string) => void;
+}) {
+  // The picker defaults to whatever the importer suggested. Brad can
+  // override before tapping Link. Empty string ('') means "no specific
+  // job picked yet" — Link is disabled in that state.
+  const [pickedJobId, setPickedJobId] = useState<string>(importRow.suggestedJobId ?? '');
+  const [busy, setBusy] = useState(false);
+
+  // Confidence dot — green/amber/red/grey, matches the bill-draft
+  // confidence dot's vocabulary.
+  const confidenceColor =
+    importRow.matchConfidence === 'high'   ? 'bg-green-500' :
+    importRow.matchConfidence === 'medium' ? 'bg-amber-500' :
+    importRow.matchConfidence === 'low'    ? 'bg-red-500'   :
+                                              'bg-slate-400';
+
+  // Pre-rank jobs against the folder name + parsed jobAddress so the
+  // dropdown's best matches float to the top. Reuses the same logic
+  // bill drafts use; "active-match" jobs get a ★.
+  const matchHint = importRow.parsedData?.jobAddress ?? importRow.folderName;
+  const ranked = useMemo(() => rankJobs(jobs, matchHint), [jobs, matchHint]);
+
+  function filesLabel(): string {
+    const fc = importRow.filesSummary;
+    const parts: string[] = [];
+    if (fc.plan) parts.push(`${fc.plan} plan${fc.plan === 1 ? '' : 's'}`);
+    if (fc.quote_pdf) parts.push(`${fc.quote_pdf} quote`);
+    if (fc.invoice_pdf) parts.push(`${fc.invoice_pdf} invoice`);
+    const photos = (fc.before_photo ?? 0) + (fc.after_photo ?? 0) + (fc.scope_photo ?? 0);
+    if (photos) parts.push(`${photos} photo${photos === 1 ? '' : 's'}`);
+    return parts.join(' · ') || 'no key files';
+  }
+
+  // ── Action handlers (with busy guard so a double-tap can't double-commit) ──
+  async function handleLink() {
+    if (!pickedJobId || busy) return;
+    setBusy(true);
+    try { onLink(importRow.id, pickedJobId); } finally { setBusy(false); }
+  }
+  async function handleCreate() {
+    if (busy) return;
+    if (typeof window !== 'undefined'
+      && !window.confirm(
+        `Create a new job from "${importRow.folderName}"?\n\n` +
+        `This adds a new row to the Jobs tab. You can edit details there afterwards.`,
+      )) return;
+    setBusy(true);
+    try { onCreate(importRow.id); } finally { setBusy(false); }
+  }
+  async function handleSkip() {
+    if (busy) return;
+    if (typeof window !== 'undefined'
+      && !window.confirm(
+        `Skip "${importRow.folderName}"?\n\nThe folder's files stay on your Mac; nothing is imported.`,
+      )) return;
+    setBusy(true);
+    try { onSkip(importRow.id); } finally { setBusy(false); }
+  }
+
+  return (
+    <li className="bg-card border border-border rounded-xl p-3 space-y-2">
+      {/* Top row: confidence dot + folder name + suggested label */}
+      <div className="flex items-start gap-2 min-w-0">
+        <span
+          className={cn('w-2 h-2 rounded-full shrink-0 mt-1.5', confidenceColor)}
+          title={`Match confidence: ${importRow.matchConfidence}`}
+          aria-label={`Match confidence: ${importRow.matchConfidence}`}
+        />
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-semibold text-foreground truncate">
+            {importRow.folderName}
+          </p>
+          {importRow.suggestedLabel && (
+            <p className="text-xs text-muted-foreground truncate">
+              Suggests: {importRow.suggestedLabel}
+            </p>
+          )}
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            {filesLabel()}
+            {importRow.matchSource && <span> · {importRow.matchSource}</span>}
+          </p>
+        </div>
+      </div>
+
+      {/* Parsed quote summary if available — shown so Brad has context
+          before tapping Link. */}
+      {importRow.parsedData && (
+        <div className="text-xs bg-muted/40 rounded-lg px-3 py-2 space-y-0.5">
+          {importRow.parsedData.clientName && (
+            <p><span className="text-muted-foreground">Client:</span> {importRow.parsedData.clientName}</p>
+          )}
+          {importRow.parsedData.jobType && (
+            <p><span className="text-muted-foreground">Type:</span> {importRow.parsedData.jobType}</p>
+          )}
+          {importRow.parsedData.totalAmountInclGst != null && (
+            <p>
+              <span className="text-muted-foreground">Total:</span>{' '}
+              {fmtMoney(importRow.parsedData.totalAmountInclGst)} incl GST
+            </p>
+          )}
+          {importRow.parsedData.scopeSummary && (
+            <p className="text-[11px] text-muted-foreground italic line-clamp-2">
+              &ldquo;{importRow.parsedData.scopeSummary}&rdquo;
+            </p>
+          )}
+        </div>
+      )}
+
+      {/* Job picker — best matches float via rankJobs */}
+      <div>
+        <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
+          Link to job
+        </label>
+        <select
+          value={pickedJobId}
+          onChange={(e) => setPickedJobId(e.target.value)}
+          disabled={busy}
+          className="w-full h-10 px-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring disabled:opacity-50"
+        >
+          <option value="">— pick a job to link, or use Create new —</option>
+          {ranked.map(({ job, tier }) => (
+            <option key={job.id} value={job.id}>
+              {tier === 'active-match' ? '★ ' : ''}
+              {job.name}
+              {job.clientName ? ` — ${job.clientName}` : ''}
+            </option>
+          ))}
+        </select>
+      </div>
+
+      {/* Actions: Link · Create · Skip */}
+      <div className="flex items-center gap-2 pt-1">
+        <button
+          type="button"
+          onClick={handleLink}
+          disabled={!pickedJobId || busy}
+          className={cn(
+            'flex-1 h-11 px-4 rounded-full text-xs font-semibold transition-colors',
+            (!pickedJobId || busy)
+              ? 'bg-muted text-muted-foreground cursor-not-allowed'
+              : 'bg-green-600 hover:bg-green-700 text-white active:scale-95',
+          )}
+        >
+          Link
+        </button>
+        <button
+          type="button"
+          onClick={handleCreate}
+          disabled={busy}
+          className="flex-1 h-11 px-4 rounded-full bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold transition-colors active:scale-95 disabled:opacity-50"
+        >
+          Create new
+        </button>
+        <button
+          type="button"
+          onClick={handleSkip}
+          disabled={busy}
+          aria-label={`Skip ${importRow.folderName}`}
+          className="shrink-0 w-11 h-11 rounded-full text-muted-foreground hover:text-red-600 hover:bg-red-50 flex items-center justify-center transition-colors disabled:opacity-50"
+        >
+          <X size={16} strokeWidth={2} />
         </button>
       </div>
     </li>
