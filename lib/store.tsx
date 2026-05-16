@@ -182,9 +182,22 @@ interface StoreState {
    * scope fields into the job ONLY where the job's fields are empty.
    * Marks the import as committed on success.
    */
+  /**
+   * Outcome tag for a committed quote — drives whether the job's status
+   * flips to 'lost'/'paid'/etc, and seeds the lostReason / wonReason
+   * fields for future quoting-AI signal. 'unknown' = caller couldn't
+   * remember; we don't touch the job's outcome fields in that case.
+   */
   commitImportAsLink: (
     importId: string,
     jobId: string,
+    outcome: {
+      result: 'won' | 'lost' | 'unknown';
+      /** Required when result='lost'. Maps to Job.lostReason. */
+      lostReason?: 'price' | 'no-reply' | 'went-elsewhere' | 'scope-changed' | 'project-cancelled' | 'timing' | 'other';
+      /** Free-form note for outcomeNotes on the job. */
+      notes?: string;
+    },
   ) => Promise<{ ok: boolean; quoteId?: string; error?: string }>;
 
   /**
@@ -751,6 +764,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     imp: JobImport,
     jobId: string,
     action: 'link' | 'create',
+    outcome?: {
+      result: 'won' | 'lost' | 'unknown';
+      lostReason?: Job['lostReason'];
+      notes?: string;
+    },
   ): Promise<{ ok: boolean; quoteId?: string; error?: string }> => {
     if (!businessId) return { ok: false, error: 'No business loaded.' };
     const parsed = imp.parsedData;
@@ -832,20 +850,60 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     }
 
-    // ── 3. Conservative scope merge into the job (link path only) ────────
+    // ── 3. Conservative scope + outcome merge into the job ───────────────
     // For the create path the job was just made with the parsed fields
-    // already populated, so no merge needed.
-    if (action === 'link' && parsed) {
+    // already populated; we still apply the outcome here so a fresh-create
+    // can be marked won/lost in the same commit.
+    if (parsed || outcome) {
       const job = jobsRef.current.find((j) => j.id === jobId);
       if (job) {
         const jobPatches: Partial<Job> = {};
-        if (!job.surfaceAreaM2 && parsed.surfaceAreaM2ByZone) {
-          // Sum the m² zones into a single total for the job's flat field.
-          const total = Object.values(parsed.surfaceAreaM2ByZone)
-            .reduce((s, v) => s + v, 0);
-          if (total > 0) jobPatches.surfaceAreaM2 = total;
+
+        // Scope merge — only fill empty fields, never overwrite.
+        if (action === 'link' && parsed) {
+          if (!job.surfaceAreaM2 && parsed.surfaceAreaM2ByZone) {
+            const total = Object.values(parsed.surfaceAreaM2ByZone)
+              .reduce((s, v) => s + v, 0);
+            if (total > 0) jobPatches.surfaceAreaM2 = total;
+          }
+          if (!job.prepLevel && parsed.prepLevel) jobPatches.prepLevel = parsed.prepLevel;
         }
-        if (!job.prepLevel && parsed.prepLevel) jobPatches.prepLevel = parsed.prepLevel;
+
+        // Outcome merge — drives the future quoting-AI's training signal,
+        // so we're more aggressive than scope: the user explicitly told us
+        // the result, so trust them.
+        // Rules:
+        //   - result='won': set status='completed' (or stronger like 'paid'
+        //     /'invoiced') only if the current status is earlier in the
+        //     pipeline. Never demote a job already at paid/invoiced.
+        //     Also clear any stale lostReason.
+        //   - result='lost': set status='lost' + record lostReason.
+        //     Don't touch a job already marked 'paid'/'invoiced' (those
+        //     are won-by-definition; an outcome contradiction probably
+        //     means the user is linking the wrong job).
+        //   - result='unknown': don't touch outcome fields at all.
+        if (outcome?.result === 'won') {
+          const stronger: Job['status'][] = ['completed', 'invoiced', 'paid'];
+          if (!stronger.includes(job.status)) {
+            jobPatches.status = 'completed';
+          }
+          if (job.lostReason) jobPatches.lostReason = undefined;
+        } else if (outcome?.result === 'lost') {
+          const wonAlready: Job['status'][] = ['paid', 'invoiced'];
+          if (wonAlready.includes(job.status)) {
+            console.warn('[store] commitImport: outcome=lost but job is', job.status,
+              '— likely a wrong job match; leaving status alone.');
+          } else {
+            jobPatches.status = 'lost';
+            if (outcome.lostReason) jobPatches.lostReason = outcome.lostReason;
+          }
+        }
+        // Free-form notes append (never overwrite — keep history).
+        if (outcome?.notes) {
+          const prefix = job.outcomeNotes ? `${job.outcomeNotes}\n\n` : '';
+          jobPatches.outcomeNotes = `${prefix}${outcome.notes}`;
+        }
+
         if (Object.keys(jobPatches).length > 0) {
           const { error: jobErr } = await supabase.from('jobs')
             .update(jobToRow(jobPatches)).eq('id', jobId);
@@ -893,10 +951,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const commitImportAsLink = useCallback(async (
     importId: string,
     jobId: string,
+    outcome: {
+      result: 'won' | 'lost' | 'unknown';
+      lostReason?: Job['lostReason'];
+      notes?: string;
+    },
   ): Promise<{ ok: boolean; quoteId?: string; error?: string }> => {
     const imp = jobImportsRef.current.find((i) => i.id === importId);
     if (!imp) return { ok: false, error: 'Import not found' };
-    return commitImportShared(imp, jobId, 'link');
+    return commitImportShared(imp, jobId, 'link', outcome);
   }, [commitImportShared]);
 
   const commitImportAsCreate = useCallback(async (

@@ -122,9 +122,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
       <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
         <div className="h-[92vh] flex flex-col overflow-hidden">
           {/* Fixed header — always visible. Inner wrapper caps width on desktop
-              so the title/status row doesn't sprawl across a 27" monitor. */}
+              so the title/status row doesn't sprawl across a 27" monitor.
+              Top padding uses safe-area-inset-top so the status dropdown
+              isn't hidden under Safari's URL bar / Dynamic Island when the
+              sheet is at 92vh on iPhone. */}
           <div className="shrink-0 bg-card border-b border-border">
-            <div className="mx-auto w-full max-w-2xl px-4 md:px-6 pt-4 pb-3">
+            <div
+              className="mx-auto w-full max-w-2xl px-4 md:px-6 pb-3"
+              style={{ paddingTop: 'max(env(safe-area-inset-top), 1rem)' }}
+            >
               <div className="flex items-start justify-between gap-3">
                 <SheetTitle className="text-lg font-bold leading-tight text-left flex-1 min-w-0">
                   {liveJob.name}

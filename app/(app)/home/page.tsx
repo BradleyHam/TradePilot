@@ -23,7 +23,18 @@ import { PageHeader } from '@/components/shared/page-header';
 import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
 import { rankJobs } from '@/lib/job-match';
-import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport } from '@/lib/types';
+import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
+
+/**
+ * Outcome of a quote being committed via the imports flow. Captured
+ * inline on each ImportRow so the future quoting-AI sees won-vs-lost
+ * signal directly tied to the parsed quote inputs.
+ */
+type ImportOutcome = {
+  result: 'won' | 'lost' | 'unknown';
+  lostReason?: LostReason;
+  notes?: string;
+};
 
 /**
  * Shape we hand to the store mutator for each material — store stamps
@@ -270,7 +281,7 @@ export default function HomePage() {
               void confirmBillDraftWithMaterials(id, { jobId, materials })
             }
             onDeleteDraft={(id) => deleteEntry(id)}
-            onCommitImportAsLink={(id, jobId) => void commitImportAsLink(id, jobId)}
+            onCommitImportAsLink={(id, jobId, outcome) => void commitImportAsLink(id, jobId, outcome)}
             onCommitImportAsCreate={(id) => void commitImportAsCreate(id)}
             onCommitImportAsSkip={(id) => void commitImportAsSkip(id)}
           />
@@ -656,7 +667,7 @@ function MoneyFlagsCard({
   onMarkBillPaid: (entryId: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
   onDeleteDraft: (entryId: string) => void;
-  onCommitImportAsLink: (importId: string, jobId: string) => void;
+  onCommitImportAsLink: (importId: string, jobId: string, outcome: ImportOutcome) => void;
   onCommitImportAsCreate: (importId: string) => void;
   onCommitImportAsSkip: (importId: string) => void;
 }) {
@@ -1264,7 +1275,7 @@ function ImportsToReviewFlag({
 }: {
   imports: JobImport[];
   jobs: Job[];
-  onLink: (importId: string, jobId: string) => void;
+  onLink: (importId: string, jobId: string, outcome: ImportOutcome) => void;
   onCreate: (importId: string) => void;
   onSkip: (importId: string) => void;
 }) {
@@ -1328,7 +1339,7 @@ function ImportRow({
 }: {
   importRow: JobImport;
   jobs: Job[];
-  onLink: (importId: string, jobId: string) => void;
+  onLink: (importId: string, jobId: string, outcome: ImportOutcome) => void;
   onCreate: (importId: string) => void;
   onSkip: (importId: string) => void;
 }) {
@@ -1337,6 +1348,14 @@ function ImportRow({
   // job picked yet" — Link is disabled in that state.
   const [pickedJobId, setPickedJobId] = useState<string>(importRow.suggestedJobId ?? '');
   const [busy, setBusy] = useState(false);
+
+  // Outcome: did Brad win or lose this quote? Required before Link
+  // enables — capturing this at the moment of decision is gold for
+  // the future quoting-AI's training signal. 'unknown' is allowed for
+  // historical jobs Brad genuinely can't remember; we just don't touch
+  // the job's status/lostReason in that case.
+  const [outcome, setOutcome] = useState<'won' | 'lost' | 'unknown' | null>(null);
+  const [lostReason, setLostReason] = useState<LostReason | null>(null);
 
   // Confidence dot — green/amber/red/grey, matches the bill-draft
   // confidence dot's vocabulary.
@@ -1363,11 +1382,21 @@ function ImportRow({
     return parts.join(' · ') || 'no key files';
   }
 
+  // Link is enabled when: a job is picked AND an outcome is chosen AND
+  // (if lost) a lostReason is picked.
+  const linkReady = pickedJobId && outcome
+    && (outcome !== 'lost' || lostReason !== null);
+
   // ── Action handlers (with busy guard so a double-tap can't double-commit) ──
   async function handleLink() {
-    if (!pickedJobId || busy) return;
+    if (!linkReady || busy || !outcome) return;
     setBusy(true);
-    try { onLink(importRow.id, pickedJobId); } finally { setBusy(false); }
+    try {
+      onLink(importRow.id, pickedJobId, {
+        result: outcome,
+        lostReason: outcome === 'lost' && lostReason ? lostReason : undefined,
+      });
+    } finally { setBusy(false); }
   }
   async function handleCreate() {
     if (busy) return;
@@ -1460,15 +1489,97 @@ function ImportRow({
         </select>
       </div>
 
+      {/* Outcome chips — captured inline, gates the Link button. This is
+          the highest-leverage data for the future quoting-AI: a quote +
+          its inputs without a won/lost label is signal-free. We make it
+          a soft gate by allowing "Don't know" so historical quotes
+          where the outcome's genuinely forgotten can still be linked. */}
+      <div>
+        <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
+          Outcome
+        </label>
+        <div className="flex gap-1.5">
+          {(['won', 'lost', 'unknown'] as const).map((opt) => {
+            const active = outcome === opt;
+            const label = opt === 'won' ? 'Won' : opt === 'lost' ? 'Lost' : "Don't know";
+            const activeClasses = opt === 'won' ? 'bg-green-600 text-white border-green-600'
+              : opt === 'lost' ? 'bg-red-600 text-white border-red-600'
+              : 'bg-slate-600 text-white border-slate-600';
+            return (
+              <button
+                key={opt}
+                type="button"
+                onClick={() => {
+                  setOutcome(opt);
+                  if (opt !== 'lost') setLostReason(null);
+                }}
+                disabled={busy}
+                className={cn(
+                  'flex-1 h-9 px-2 rounded-lg text-xs font-medium border transition-colors',
+                  active
+                    ? activeClasses
+                    : 'bg-background hover:bg-accent border-input text-foreground',
+                )}
+              >
+                {label}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      {/* Lost-reason chips — appear only when Lost is selected. Captures
+          the WHY which is the single most valuable training signal for
+          better-pricing AI later. */}
+      {outcome === 'lost' && (
+        <div>
+          <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
+            Why lost?
+          </label>
+          <div className="flex flex-wrap gap-1.5">
+            {(['price', 'no-reply', 'went-elsewhere', 'scope-changed', 'project-cancelled', 'timing', 'other'] as const).map((opt) => {
+              const active = lostReason === opt;
+              const label = opt === 'no-reply' ? 'No reply'
+                : opt === 'went-elsewhere' ? 'Went elsewhere'
+                : opt === 'scope-changed' ? 'Scope changed'
+                : opt === 'project-cancelled' ? 'Project cancelled'
+                : opt.charAt(0).toUpperCase() + opt.slice(1);
+              return (
+                <button
+                  key={opt}
+                  type="button"
+                  onClick={() => setLostReason(opt)}
+                  disabled={busy}
+                  className={cn(
+                    'h-8 px-3 rounded-full text-xs font-medium border transition-colors',
+                    active
+                      ? 'bg-red-100 text-red-800 border-red-300'
+                      : 'bg-background hover:bg-accent border-input text-foreground',
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
+
       {/* Actions: Link · Create · Skip */}
       <div className="flex items-center gap-2 pt-1">
         <button
           type="button"
           onClick={handleLink}
-          disabled={!pickedJobId || busy}
+          disabled={!linkReady || busy}
+          title={
+            !pickedJobId ? 'Pick a job from the dropdown'
+            : !outcome ? 'Pick an outcome (Won / Lost / Don\'t know)'
+            : outcome === 'lost' && !lostReason ? 'Pick why this quote was lost'
+            : undefined
+          }
           className={cn(
             'flex-1 h-11 px-4 rounded-full text-xs font-semibold transition-colors',
-            (!pickedJobId || busy)
+            (!linkReady || busy)
               ? 'bg-muted text-muted-foreground cursor-not-allowed'
               : 'bg-green-600 hover:bg-green-700 text-white active:scale-95',
           )}
