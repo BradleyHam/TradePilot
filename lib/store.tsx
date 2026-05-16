@@ -902,16 +902,32 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           '— this is the bug we are chasing. Storage path mismatch?');
       } else {
         console.info('[commit-import] processing', stagedFiles.length, 'staged files');
+        // Plans only — photos / videos / other files are NOT committed
+        // to quote_attachments. The decision: plans are the high-signal
+        // input for the future quoting AI (m² extraction) and are tiny
+        // (~200KB each), so they fit comfortably in Supabase free-tier
+        // Storage. Photos are nice-to-have but bigger; we keep them on
+        // Brad's Mac for now and revisit once the AI proves it needs
+        // visual input. Non-plan files staged in _pending/ get removed
+        // so we don't leak Storage quota.
+        const toRemove: string[] = [];
         for (const f of stagedFiles) {
           const fromPath = `${stagedDir}/${f.name}`;
-          // Strip the random UUID prefix the importer prepended so the
-          // final canonical filename is the original supplier name.
-          // Filenames look like "{uuid}__{originalName}". Tolerate the
-          // case where there's no separator.
           const sepIdx = f.name.indexOf('__');
           const cleanName = sepIdx >= 0 ? f.name.slice(sepIdx + 2) : f.name;
+          const kind = inferAttachmentKind(cleanName);
+
+          if (kind !== 'plan') {
+            // Mark for cleanup; don't attach. inferAttachmentKind also
+            // returns 'plan' for quote_pdf files — that's fine, we still
+            // want the quote PDF itself attached so the user can preview
+            // it from the Plans & photos panel. Tighten the filter to
+            // genuinely just plans + quote PDFs.
+            toRemove.push(fromPath);
+            continue;
+          }
           const toPath = `${businessId}/${quoteId}/${crypto.randomUUID()}__${cleanName}`;
-          console.info('[commit-import] moving:', fromPath, '→', toPath);
+          console.info('[commit-import] moving (plan):', fromPath, '→', toPath);
           const { error: mvErr } = await supabase.storage
             .from('quote-attachments').move(fromPath, toPath);
           if (mvErr) {
@@ -919,8 +935,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             continue;
           }
           console.info('[commit-import] ✓ moved');
-          // Best-guess kind from filename (mirrors importer's classifier).
-          const kind = inferAttachmentKind(cleanName);
           const attachRow: Partial<QuoteAttachment> = {
             businessId,
             quoteId,
@@ -942,6 +956,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             setQuoteAttachments((prev) => [rowToQuoteAttachment(attData), ...prev]);
           }
           attachmentsInserted++;
+        }
+        // Best-effort cleanup of non-plan staged files. If this fails,
+        // worst case is some storage quota wasted in _pending/ — the
+        // user can sweep it manually later.
+        if (toRemove.length > 0) {
+          const { error: rmErr } = await supabase.storage
+            .from('quote-attachments').remove(toRemove);
+          if (rmErr) {
+            console.warn('[commit-import] ✗ cleanup of non-plan files failed —', describeError(rmErr));
+          } else {
+            console.info('[commit-import] cleaned up', toRemove.length, 'non-plan staged files');
+          }
         }
       }
     }
