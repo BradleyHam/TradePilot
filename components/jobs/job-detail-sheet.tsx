@@ -187,20 +187,6 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                     ))}
                   </SelectContent>
                 </Select>
-                {/* Delete: only succeeds if nothing's attached to the job
-                    (entries / materials / quotes / invoices / attachments
-                    / schedule items). Otherwise alerts with counts so the
-                    user knows what to move first. Hard delete after the
-                    confirm prompt — no soft delete because the block rule
-                    means only empty jobs ever reach this point. */}
-                <button
-                  type="button"
-                  onClick={confirmAndDelete}
-                  aria-label={`Delete job "${liveJob.name}"`}
-                  className="shrink-0 w-9 h-9 rounded-md text-muted-foreground hover:text-red-600 hover:bg-red-50 flex items-center justify-center transition-colors"
-                >
-                  <X size={16} strokeWidth={2} />
-                </button>
               </div>
             </div>
           </div>
@@ -592,6 +578,31 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               </div>
             </>
           )}
+
+          {/* Danger zone — sits last in the scroll, kept visually distinct
+              from the normal sections so a fat-finger on "close sheet" or
+              "change status" can never delete a job. The delete itself is
+              still guarded server-side: blocked if anything's attached
+              (entries / quotes / materials / etc), so this button only
+              succeeds for genuinely empty test rows. */}
+          <Separator />
+          <div className="rounded-2xl border border-red-200 bg-red-50/40 p-4 mt-2">
+            <p className="text-xs font-semibold text-red-700 uppercase tracking-wide">
+              Danger zone
+            </p>
+            <p className="text-xs text-red-700/80 mt-1 mb-3">
+              Permanently delete this job. Only works if no entries, quotes,
+              materials, invoices, attachments or schedule items are attached.
+            </p>
+            <button
+              type="button"
+              onClick={confirmAndDelete}
+              className="inline-flex items-center gap-2 h-10 px-4 rounded-xl border border-red-300 bg-card hover:bg-red-100 text-red-700 text-sm font-semibold transition-colors active:scale-95"
+            >
+              <X size={14} strokeWidth={2.2} />
+              Delete this job
+            </button>
+          </div>
             </div>
           </div>
         </div>
