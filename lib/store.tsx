@@ -889,11 +889,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     let attachmentsInserted = 0;
     if (imp.attachmentsStoragePrefix) {
       const stagedDir = `${businessId}/${imp.attachmentsStoragePrefix}`;
+      console.info('[commit-import] listing storage at:', stagedDir);
       const { data: stagedFiles, error: listErr } = await supabase.storage
         .from('quote-attachments').list(stagedDir, { limit: 100 });
+      console.info('[commit-import] list result:',
+        listErr ? `ERROR: ${describeError(listErr)}` : `${stagedFiles?.length ?? 0} files`,
+        stagedFiles ? stagedFiles.slice(0, 3).map((f) => f.name) : '');
       if (listErr) {
         console.warn('[store] commitImport: could not list staged files —', describeError(listErr));
-      } else if (stagedFiles && stagedFiles.length > 0) {
+      } else if (!stagedFiles || stagedFiles.length === 0) {
+        console.warn('[store] commitImport: list returned 0 files at', stagedDir,
+          '— this is the bug we are chasing. Storage path mismatch?');
+      } else {
+        console.info('[commit-import] processing', stagedFiles.length, 'staged files');
         for (const f of stagedFiles) {
           const fromPath = `${stagedDir}/${f.name}`;
           // Strip the random UUID prefix the importer prepended so the
@@ -903,12 +911,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           const sepIdx = f.name.indexOf('__');
           const cleanName = sepIdx >= 0 ? f.name.slice(sepIdx + 2) : f.name;
           const toPath = `${businessId}/${quoteId}/${crypto.randomUUID()}__${cleanName}`;
+          console.info('[commit-import] moving:', fromPath, '→', toPath);
           const { error: mvErr } = await supabase.storage
             .from('quote-attachments').move(fromPath, toPath);
           if (mvErr) {
-            console.warn('[store] commitImport: move failed for', f.name, '—', describeError(mvErr));
+            console.warn('[commit-import] ✗ move failed for', f.name, '—', describeError(mvErr));
             continue;
           }
+          console.info('[commit-import] ✓ moved');
           // Best-guess kind from filename (mirrors importer's classifier).
           const kind = inferAttachmentKind(cleanName);
           const attachRow: Partial<QuoteAttachment> = {
@@ -922,9 +932,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
             .from('quote_attachments').insert(quoteAttachmentToRow(attachRow))
             .select('*').single();
           if (attErr) {
-            console.warn('[store] commitImport: attachment insert failed —', describeError(attErr));
+            console.warn('[commit-import] ✗ insert failed —', describeError(attErr), 'row:', attachRow);
             continue;
           }
+          console.info('[commit-import] ✓ inserted attachment row id=', attData?.id);
           // Mirror into local state so JobDetailSheet's Plans & photos
           // panel updates without waiting for a refresh.
           if (attData) {
