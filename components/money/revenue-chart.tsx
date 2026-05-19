@@ -7,12 +7,21 @@ import { MonthlyData } from '@/lib/types';
 
 interface RevenueChartProps {
   data: MonthlyData[];
+  /**
+   * Optional control slot rendered next to the title (e.g. a range
+   * selector). Lets the chart card host its own time-window control
+   * independent of the page's main timeframe filter.
+   */
+  rangeControl?: React.ReactNode;
 }
 
-export function RevenueChart({ data }: RevenueChartProps) {
+export function RevenueChart({ data, rangeControl }: RevenueChartProps) {
   return (
     <div className="bg-card border border-border rounded-2xl p-4">
-      <p className="text-sm font-semibold text-foreground mb-4">Revenue vs Expenses</p>
+      <div className="flex items-center justify-between mb-4 gap-2">
+        <p className="text-sm font-semibold text-foreground">Revenue vs Expenses</p>
+        {rangeControl}
+      </div>
       <ResponsiveContainer width="100%" height={180}>
         <BarChart data={data} barSize={14} barGap={4}>
           <CartesianGrid strokeDasharray="3 3" stroke="var(--border)" vertical={false} />

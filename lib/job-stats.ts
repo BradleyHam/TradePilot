@@ -10,7 +10,7 @@
 // importer; if a hand-entered row only has a gross `amount`, we derive the
 // ex-GST value using the GST rate (default 15%).
 
-import type { Job, Entry } from './types';
+import type { Job, Entry, Material } from './types';
 
 const NZ_GST_RATE = 0.15;
 
@@ -33,7 +33,14 @@ export interface JobStats {
   /** Sum of hours-type entries on this job. */
   totalHours: number;
 
-  /** Ex-GST sum of expense entries + ALL bill entries (paid or not) tied to this job. */
+  /**
+   * Ex-GST sum of expense entries + ALL bill entries (paid or not) tied to
+   * this job, PLUS any source='overhead' material rows linked to this job.
+   * The overhead rows are pure attribution (no cash outflow today — the
+   * original overhead bill already counted in business-wide expenses) but
+   * they SHOULD reduce per-job profit because that material *was* consumed
+   * on this job and would otherwise be invisible in the job's economics.
+   */
   totalExpenses: number;
 
   /** Ex-GST sum of income entries on this job — money actually received, take-home. */
@@ -59,7 +66,7 @@ export interface JobStats {
   expectedHourlyRate: number | null;
 }
 
-export function jobStats(job: Job, entries: Entry[]): JobStats {
+export function jobStats(job: Job, entries: Entry[], materials: Material[] = []): JobStats {
   const own = entries.filter((e) => e.jobId === job.id);
 
   const totalHours = own
@@ -71,9 +78,25 @@ export function jobStats(job: Job, entries: Entry[]): JobStats {
   // Drafts (unconfirmed bills awaiting Brad's review on Home) DO NOT count
   // until confirmed — otherwise an LLM-parsed bill with the wrong amount
   // would silently move the per-job profit numbers.
-  const totalExpenses = own
+  const entryExpenses = own
     .filter((e) => (e.type === 'expense' || e.type === 'bill') && !e.isDraft)
     .reduce((s, e) => s + entryExGst(e), 0);
+
+  // Overhead-sourced materials add to this job's expenses for profit
+  // calc purposes, even though they don't correspond to a new cash
+  // outflow (the original overhead bill already counted in business-
+  // wide expenses). Without this, "I used $300 of paint from the van
+  // on Chirnside" wouldn't show up in Chirnside's profit at all,
+  // which would over-state the job's margin and pollute the quoting
+  // assistant's training data.
+  //
+  // Bill-sourced materials are NOT added here — they're already
+  // captured via the linked bill entry above.
+  const overheadMaterialCost = materials
+    .filter((m) => m.jobId === job.id && m.source === 'overhead')
+    .reduce((s, m) => s + (m.cost ?? 0), 0);
+
+  const totalExpenses = entryExpenses + overheadMaterialCost;
 
   const totalIncome = own
     .filter((e) => e.type === 'income')

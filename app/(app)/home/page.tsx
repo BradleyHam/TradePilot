@@ -275,8 +275,8 @@ export default function HomePage() {
             jobImports={jobImports}
             jobs={jobs}
             todayISO={todayISO}
-            onMarkInvoicePaid={(id) => markInvoicePaid(id, todayISO)}
-            onMarkBillPaid={(id) => updateEntry(id, { paid: true, paidDate: todayISO })}
+            onMarkInvoicePaid={(id, paidDate) => markInvoicePaid(id, paidDate)}
+            onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
             onConfirmDraft={(id, { jobId, materials }) =>
               void confirmBillDraftWithMaterials(id, { jobId, materials })
             }
@@ -663,8 +663,8 @@ function MoneyFlagsCard({
   jobImports: JobImport[];
   jobs: Job[];
   todayISO: string;
-  onMarkInvoicePaid: (invoiceId: string) => void;
-  onMarkBillPaid: (entryId: string) => void;
+  onMarkInvoicePaid: (invoiceId: string, paidDate: string) => void;
+  onMarkBillPaid: (entryId: string, paidDate: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
   onDeleteDraft: (entryId: string) => void;
   onCommitImportAsLink: (importId: string, jobId: string, outcome: ImportOutcome) => void;
@@ -708,11 +708,80 @@ function MoneyFlagsCard({
         {billsDueSoon.length > 0 && (
           <BillsDueFlag
             bills={billsDueSoon}
+            todayISO={todayISO}
             onMarkPaid={onMarkBillPaid}
           />
         )}
       </div>
     </section>
+  );
+}
+
+/**
+ * Two-step Mark paid control. Collapsed = green pill button. Expanded
+ * = date input (default today) + Confirm + cancel X. Used by both
+ * BillsDueFlag rows and OverdueInvoicesFlag rows so the UX is identical
+ * across the two flag types.
+ *
+ * Why two-step instead of one-tap: the paid_date matters for cashflow
+ * reporting AND for the bank reconcile match window (±2 days). Letting
+ * the user backdate by a day or two before confirming prevents a
+ * confirmed-today bill from looking unmatched when the bank txn lands
+ * a day earlier.
+ */
+function MarkPaidControl({
+  todayISO, onConfirm,
+}: {
+  todayISO: string;
+  onConfirm: (paidDate: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+  const [date, setDate] = useState(todayISO);
+
+  if (!open) {
+    return (
+      <button
+        type="button"
+        onClick={(e) => { e.stopPropagation(); setOpen(true); }}
+        className="shrink-0 h-11 px-4 rounded-full bg-green-600 hover:bg-green-700 text-white text-xs font-semibold transition-colors active:scale-95"
+      >
+        Mark paid
+      </button>
+    );
+  }
+
+  return (
+    <div
+      className="shrink-0 flex items-center gap-1.5"
+      onClick={(e) => e.stopPropagation()}
+    >
+      <input
+        type="date"
+        value={date}
+        autoFocus
+        onChange={(e) => setDate(e.target.value)}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter') { e.preventDefault(); onConfirm(date); }
+          if (e.key === 'Escape') setOpen(false);
+        }}
+        className="h-11 px-2 rounded-lg border border-input bg-background text-xs focus:outline-none focus:ring-2 focus:ring-ring"
+      />
+      <button
+        type="button"
+        onClick={() => onConfirm(date)}
+        className="h-11 px-3 rounded-full bg-green-600 hover:bg-green-700 text-white text-xs font-semibold transition-colors active:scale-95"
+      >
+        Confirm
+      </button>
+      <button
+        type="button"
+        onClick={() => setOpen(false)}
+        aria-label="Cancel"
+        className="h-11 w-8 flex items-center justify-center text-muted-foreground hover:text-foreground"
+      >
+        <X size={14} strokeWidth={2} />
+      </button>
+    </div>
   );
 }
 
@@ -723,7 +792,7 @@ function OverdueInvoicesFlag({
   invoices: Invoice[];
   jobs: Job[];
   todayISO: string;
-  onMarkPaid: (id: string) => void;
+  onMarkPaid: (id: string, paidDate: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const total = invoices.reduce((s, i) => s + i.amountExGst, 0);
@@ -786,13 +855,10 @@ function OverdueInvoicesFlag({
                     {daysOverdue} day{daysOverdue === 1 ? '' : 's'} overdue
                   </p>
                 </div>
-                <button
-                  type="button"
-                  onClick={() => onMarkPaid(inv.id)}
-                  className="shrink-0 h-11 px-4 rounded-full bg-green-600 hover:bg-green-700 text-white text-xs font-semibold transition-colors active:scale-95"
-                >
-                  Mark paid
-                </button>
+                <MarkPaidControl
+                  todayISO={todayISO}
+                  onConfirm={(paidDate) => onMarkPaid(inv.id, paidDate)}
+                />
               </li>
             );
           })}
@@ -804,13 +870,33 @@ function OverdueInvoicesFlag({
 
 // ── Flag: Bills due in next 7 days ─────────────────────────────────────────
 function BillsDueFlag({
-  bills, onMarkPaid,
+  bills, todayISO, onMarkPaid,
 }: {
   bills: Entry[];
-  onMarkPaid: (id: string) => void;
+  todayISO: string;
+  onMarkPaid: (id: string, paidDate: string) => void;
 }) {
   const [open, setOpen] = useState(false);
   const total = bills.reduce((s, b) => s + billExGst(b), 0);
+
+  // Build a more honest heading: if every bill shares the same dueDate
+  // (very common with on-the-20th suppliers — every April invoice from
+  // Trademax/Dulux/Resene shares 20 May), say so directly instead of the
+  // generic "in 7 days" window. Falls back to the window phrasing when
+  // dates are actually spread.
+  const heading = (() => {
+    const uniqueDates = new Set(bills.map((b) => b.dueDate).filter(Boolean));
+    if (uniqueDates.size === 1 && bills[0].dueDate) {
+      const labelFor = (iso: string) => {
+        if (iso === todayISO) return 'today';
+        const tomorrowISO = formatISODate(addDays(parseISODate(todayISO), 1));
+        if (iso === tomorrowISO) return 'tomorrow';
+        return `on ${fmtDueDate(iso)}`;
+      };
+      return `${bills.length} bill${bills.length === 1 ? '' : 's'} due ${labelFor(bills[0].dueDate!)}`;
+    }
+    return `${bills.length} bill${bills.length === 1 ? '' : 's'} due in ${BILLS_DUE_LOOKAHEAD_DAYS} days`;
+  })();
 
   return (
     <div>
@@ -825,7 +911,7 @@ function BillsDueFlag({
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-foreground">
-            {bills.length} bill{bills.length === 1 ? '' : 's'} due in {BILLS_DUE_LOOKAHEAD_DAYS} days
+            {heading}
           </p>
           <p className="text-xs text-muted-foreground">
             {fmtMoney(total)} ex-GST
@@ -862,13 +948,10 @@ function BillsDueFlag({
                   Due {b.dueDate ? fmtDueDate(b.dueDate) : '—'}
                 </p>
               </div>
-              <button
-                type="button"
-                onClick={() => onMarkPaid(b.id)}
-                className="shrink-0 h-11 px-4 rounded-full bg-green-600 hover:bg-green-700 text-white text-xs font-semibold transition-colors active:scale-95"
-              >
-                Mark paid
-              </button>
+              <MarkPaidControl
+                todayISO={todayISO}
+                onConfirm={(paidDate) => onMarkPaid(b.id, paidDate)}
+              />
             </li>
           ))}
         </ul>

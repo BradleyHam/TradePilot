@@ -12,6 +12,7 @@ import {
   Search, X, FileSearch,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { formatEntryDate } from '@/lib/format-date';
 
 // ── Type meta ─────────────────────────────────────────────────────────────
 // Same icon/colour mapping used on the Entry tab's Recent Entries section,
@@ -227,7 +228,7 @@ function EntryRow({
           </p>
           <p className="text-xs text-muted-foreground mt-0.5 truncate">
             <span className="capitalize">{entry.type}</span>
-            <span> · {entry.entryDate}</span>
+            <span> · {formatEntryDate(entry.entryDate)}</span>
             {jobName && <span> · {jobName}</span>}
             {entry.supplier && <span> · {entry.supplier}</span>}
             {entry.activity && <span> · {entry.activity}</span>}

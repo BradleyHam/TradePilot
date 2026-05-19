@@ -9,6 +9,7 @@ import {
   CheckCircle2, ChevronRight,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { formatEntryDate } from '@/lib/format-date';
 
 const TYPE_CONFIG: Record<EntryType, { label: string; icon: React.ElementType; color: string; bg: string }> = {
   expense:  { label: 'Expense',  icon: Receipt,       color: 'text-red-600',    bg: 'bg-red-50' },
@@ -81,11 +82,7 @@ export function ParsedPreview({ parsed, onConfirm, onEdit }: ParsedPreviewProps)
           )}
           <DetailRow
             label={parsed.entryDate ? 'Date · from text' : 'Date'}
-            value={
-              parsed.entryDate
-                ? new Date(parsed.entryDate + 'T00:00:00').toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' })
-                : new Date().toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' })
-            }
+            value={formatEntryDate(parsed.entryDate ?? new Date().toISOString().slice(0, 10))}
           />
         </div>
 

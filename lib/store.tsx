@@ -14,6 +14,7 @@ import type {
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus,
 } from './types';
+import { compressImage } from './image-compress';
 
 /**
  * Supabase's `PostgrestError` doesn't enumerate its fields (Chrome devtools
@@ -155,6 +156,25 @@ interface StoreState {
   reconcileToEntry: (bankTxnId: string, entryId: string) => void;
   /** Create a new entry from a bank txn AND link them in the same flow. */
   reconcileAsNewEntry: (bankTxnId: string, entry: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>) => void;
+
+  /**
+   * Split a single bank transaction into N entries (different jobs /
+   * categories / GST settings). All N entries share the same
+   * bank_transaction_id so the bank reconcile audit trail stays intact.
+   *
+   * The caller is responsible for ensuring the entries' gross amounts
+   * sum to the bank txn's amount — the splitter UI enforces this before
+   * calling, so any sub-cent rounding has already been resolved.
+   *
+   * Returns counts. On any failure the bank txn stays unreconciled and
+   * any successfully-inserted entries are NOT rolled back (we accept the
+   * partial state rather than mass-deleting on a single insert error —
+   * easier to fix manually than to recover from a half-rolled-back batch).
+   */
+  reconcileAsSplitEntries: (
+    bankTxnId: string,
+    entries: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>[],
+  ) => Promise<{ inserted: number; failed: number; error?: string }>;
   /**
    * Mark an invoice paid AND auto-create a linked income entry on the
    * payment date. Idempotent: if the invoice is already paid, no-op.
@@ -196,6 +216,74 @@ interface StoreState {
   addMaterials: (
     rows: Omit<Material, 'id' | 'businessId' | 'createdAt'>[],
   ) => Promise<{ inserted: number; failed: number }>;
+
+  /**
+   * Add a single material row marked as source='overhead' — used when
+   * the painter pulled something off the van that was already paid for
+   * under overhead. Hits per-job profit but not business-wide expenses.
+   */
+  addMaterialFromOverhead: (
+    row: Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId' | 'source'>,
+  ) => Promise<{ ok: boolean; id?: string; error?: string }>;
+
+  /**
+   * Upload one or more files as quote_attachments. Each file is
+   * compressed (images only) and uploaded to Storage at
+   * `{businessId}/{quoteId}/{uuid}__{cleanName}`, with a matching
+   * `quote_attachments` row inserted per success.
+   *
+   * Returns counts so the UI can show "3 of 4 uploaded, 1 failed".
+   * Failed files are NOT inserted into quote_attachments and their
+   * Storage objects (if uploaded then errored on insert) are best-effort
+   * removed. Local state is updated optimistically and rolled back on
+   * each individual failure.
+   *
+   * `kind` is per-file so a single batch can mix scope_photo / before /
+   * after when the user has classified them in the UI.
+   */
+  addQuoteAttachments: (
+    quoteId: string,
+    files: { file: File; kind: QuoteAttachmentKind }[],
+  ) => Promise<{ inserted: number; failed: number }>;
+
+  /**
+   * Returns an existing quote on the given job, or creates a minimal
+   * draft quote (status='draft', jobAddress from the job) if none
+   * exists. Used by the photo upload flow on the JobDetailSheet so
+   * jobs without any quote can still accept attachments.
+   *
+   * Returns null if quote creation fails (RLS, network); caller should
+   * surface a clear error and not proceed with upload.
+   */
+  ensureJobHasQuote: (jobId: string) => Promise<string | null>;
+
+  /**
+   * Delete a single quote_attachment. Removes the Storage object and
+   * the row in one go. Optimistic local removal with rollback on
+   * failure. Used by the X button on each attachment row.
+   */
+  deleteQuoteAttachment: (id: string) => Promise<{ ok: boolean; error?: string }>;
+
+  /**
+   * Update fields on a quote — used by the inline edit UI on the
+   * JobDetailSheet's Quotes panel. Optimistic merge into local state
+   * with rollback on DB failure. Server-side: ex-GST + GST component
+   * derivation isn't done here (yet) — caller passes whichever fields
+   * they want to update.
+   */
+  updateQuote: (id: string, updates: Partial<Quote>) => Promise<{ ok: boolean; error?: string }>;
+
+  /**
+   * Delete a quote. Blocks if any quote_attachments reference this
+   * quote — the caller should delete those first (UI shows them as
+   * the Plans & photos panel on the job). Optimistic local remove
+   * with rollback on failure.
+   */
+  deleteQuote: (id: string) => Promise<{
+    ok: boolean;
+    blockedBy?: { quoteAttachments: number };
+    error?: string;
+  }>;
 
   /**
    * Commit a pending job_import row by linking it to an EXISTING job.
@@ -787,6 +875,296 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     });
     return { inserted: persisted.length, failed: rows.length - persisted.length };
   }, [businessId]);
+
+  /**
+   * Add a SINGLE material row sourced from overhead (no bill, no entry).
+   * Used by the "+ Add material → Used from overhead" path on
+   * JobDetailSheet. The row has source='overhead' so per-job profit
+   * counts it but business-wide expense totals (which read from
+   * entries, not materials) correctly DON'T — the original overhead
+   * purchase already counted at the time it was made.
+   *
+   * Optimistic insert with rollback. Returns the persisted row's id so
+   * the UI can do whatever it needs (animate, focus the new row, etc).
+   */
+  const addMaterialFromOverhead = useCallback(async (
+    row: Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId' | 'source'>,
+  ): Promise<{ ok: boolean; id?: string; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business loaded.' };
+
+    const tempId = `mat_${Date.now()}_oh`;
+    const optimistic: Material = {
+      ...row,
+      id: tempId,
+      businessId,
+      source: 'overhead',
+      createdAt: new Date().toISOString(),
+    };
+    setMaterials((prev) => [optimistic, ...prev]);
+
+    const payload = {
+      ...materialToRow({ ...row, source: 'overhead' }),
+      business_id: businessId,
+    };
+
+    const { data, error: insErr } = await supabase
+      .from('materials')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (insErr || !data) {
+      const msg = describeError(insErr) || 'Failed to add material';
+      console.error('[store] addMaterialFromOverhead failed:', msg);
+      setError(msg);
+      setMaterials((prev) => prev.filter((m) => m.id !== tempId));
+      return { ok: false, error: msg };
+    }
+
+    const persisted = rowToMaterial(data);
+    setMaterials((prev) => prev.map((m) => (m.id === tempId ? persisted : m)));
+    return { ok: true, id: persisted.id };
+  }, [businessId]);
+
+  /**
+   * Ensure a job has at least one quote — return the existing first quote's
+   * id, or create a minimal draft quote if none exists. Used by the photo
+   * upload flow on JobDetailSheet so any job can accept attachments
+   * without forcing the user through a "create a quote first" detour.
+   *
+   * Creation is conservative: status='draft', jobAddress copied from the
+   * job, everything else left null. The user can fill it in via the
+   * Quotes panel later.
+   */
+  const ensureJobHasQuote = useCallback(async (jobId: string): Promise<string | null> => {
+    if (!businessId) {
+      setError('No business loaded.');
+      return null;
+    }
+    // Read current quotes via setter-callback so we always see the latest
+    // state (avoids stale-closure issues if a quote was just created).
+    let existingId: string | null = null;
+    setQuotes((cur) => {
+      const match = cur.find((q) => q.jobId === jobId);
+      if (match) existingId = match.id;
+      return cur;
+    });
+    if (existingId) return existingId;
+
+    // Look up the job for its address — fall back to null if not present.
+    let jobAddress: string | undefined;
+    setJobs((cur) => {
+      const j = cur.find((x) => x.id === jobId);
+      if (j) jobAddress = j.location ?? j.name ?? undefined;
+      return cur;
+    });
+
+    const row = quoteToRow({
+      businessId,
+      jobId,
+      jobAddress,
+      status: 'draft',
+    });
+    const { data, error: insErr } = await supabase
+      .from('quotes').insert(row).select('*').single();
+    if (insErr || !data) {
+      const msg = describeError(insErr) || 'Failed to create quote';
+      console.error('[store] ensureJobHasQuote: insert failed —', msg);
+      setError(msg);
+      return null;
+    }
+    const newQuote = rowToQuote(data);
+    setQuotes((prev) => [newQuote, ...prev]);
+    return newQuote.id;
+  }, [businessId]);
+
+  /**
+   * Upload N files as quote_attachments. For each file:
+   *   1. Compress (image files only; PDFs etc pass through).
+   *   2. Upload to Storage at {businessId}/{quoteId}/{uuid}__{cleanName}.
+   *   3. Insert a quote_attachments row.
+   *   4. Mirror into local state.
+   *
+   * Files are processed sequentially so a slow connection doesn't
+   * thrash the network. Each failure is logged but doesn't abort the
+   * batch — the user gets a partial success summary at the end.
+   *
+   * Filenames are sanitised to ASCII-safe characters because Supabase
+   * Storage rejects some Unicode patterns; the original name is
+   * preserved in the file_name column so the UI can still show it.
+   */
+  const addQuoteAttachments = useCallback(async (
+    quoteId: string,
+    files: { file: File; kind: QuoteAttachmentKind }[],
+  ): Promise<{ inserted: number; failed: number }> => {
+    if (!businessId || files.length === 0) return { inserted: 0, failed: 0 };
+
+    let inserted = 0;
+    let failed = 0;
+
+    for (const { file, kind } of files) {
+      try {
+        // Compress images. Non-images pass through unchanged.
+        const { file: prepared, originalSize, compressedSize, skipped } = await compressImage(file);
+        if (!skipped && originalSize > 0) {
+          const savedPct = Math.round((1 - compressedSize / originalSize) * 100);
+          console.info(`[addQuoteAttachments] compressed ${file.name}: ${(originalSize / 1024).toFixed(0)}KB → ${(compressedSize / 1024).toFixed(0)}KB (-${savedPct}%)`);
+        }
+
+        const safeName = prepared.name.replace(/[^a-zA-Z0-9._-]+/g, '_');
+        const storagePath = `${businessId}/${quoteId}/${crypto.randomUUID()}__${safeName}`;
+
+        const { error: upErr } = await supabase.storage
+          .from('quote-attachments')
+          .upload(storagePath, prepared, {
+            contentType: prepared.type || 'application/octet-stream',
+            upsert: false,
+          });
+        if (upErr) {
+          console.error('[addQuoteAttachments] upload failed for', file.name, '—', describeError(upErr));
+          failed++;
+          continue;
+        }
+
+        const { data: insData, error: insErr } = await supabase
+          .from('quote_attachments')
+          .insert(quoteAttachmentToRow({
+            businessId,
+            quoteId,
+            kind,
+            storagePath,
+            // Keep the user-facing name (pre-compress) so the UI still
+            // shows what they uploaded.
+            fileName: file.name,
+          }))
+          .select('*')
+          .single();
+        if (insErr || !insData) {
+          console.error('[addQuoteAttachments] insert failed for', file.name, '—', describeError(insErr));
+          // Best-effort: remove the orphaned Storage object so we don't
+          // leak quota for rows that never got a DB record.
+          await supabase.storage.from('quote-attachments').remove([storagePath]).catch(() => {});
+          failed++;
+          continue;
+        }
+
+        const persisted = rowToQuoteAttachment(insData);
+        setQuoteAttachments((prev) => [persisted, ...prev]);
+        inserted++;
+      } catch (err) {
+        console.error('[addQuoteAttachments] unexpected error for', file.name, err);
+        failed++;
+      }
+    }
+
+    if (failed > 0) {
+      setError(`${failed} of ${files.length} uploads failed — check console for details.`);
+    }
+    return { inserted, failed };
+  }, [businessId]);
+
+  /**
+   * Delete a single quote_attachment row + its Storage object. Optimistic
+   * removal from local state; rolled back if the DB delete fails.
+   */
+  const deleteQuoteAttachment = useCallback(async (
+    id: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    let removed: QuoteAttachment | undefined;
+    setQuoteAttachments((prev) => {
+      removed = prev.find((a) => a.id === id);
+      return prev.filter((a) => a.id !== id);
+    });
+    if (!removed) return { ok: false, error: 'Attachment not found.' };
+
+    const { error: delErr } = await supabase
+      .from('quote_attachments').delete().eq('id', id);
+    if (delErr) {
+      const msg = describeError(delErr);
+      console.error('[deleteQuoteAttachment] delete failed:', msg);
+      setError(msg);
+      // Roll back.
+      setQuoteAttachments((prev) => [removed!, ...prev]);
+      return { ok: false, error: msg };
+    }
+
+    // Best-effort Storage cleanup. If this fails it's quota waste only,
+    // not a correctness issue.
+    await supabase.storage
+      .from('quote-attachments')
+      .remove([removed.storagePath])
+      .catch((err) => console.warn('[deleteQuoteAttachment] storage remove failed:', err));
+
+    return { ok: true };
+  }, []);
+
+  /**
+   * Update fields on a quote. Optimistic merge into local state; rolled
+   * back on DB failure. Used by the inline edit UI on the JobDetailSheet
+   * Quotes panel to fill in totals/scope/status on stub quotes that
+   * came in via the project import without details.
+   */
+  const updateQuote = useCallback(async (
+    id: string,
+    updates: Partial<Quote>,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    let prevQuote: Quote | undefined;
+    setQuotes((prev) => {
+      prevQuote = prev.find((q) => q.id === id);
+      return prev.map((q) => (q.id === id ? { ...q, ...updates } : q));
+    });
+    if (!prevQuote) return { ok: false, error: 'Quote not found.' };
+
+    const row = quoteToRow(updates);
+    const { error: updErr } = await supabase
+      .from('quotes').update(row).eq('id', id);
+    if (updErr) {
+      const msg = describeError(updErr);
+      console.error('[updateQuote] update failed:', msg);
+      setError(msg);
+      // Roll back to previous state.
+      setQuotes((prev) => prev.map((q) => (q.id === id ? prevQuote! : q)));
+      return { ok: false, error: msg };
+    }
+    return { ok: true };
+  }, []);
+
+  /**
+   * Delete a quote — blocks if any attachments reference it (otherwise
+   * we'd orphan storage rows + DB cascade would kill the attachments
+   * silently). Optimistic local remove with rollback on DB failure.
+   */
+  const deleteQuote = useCallback(async (
+    id: string,
+  ): Promise<{ ok: boolean; blockedBy?: { quoteAttachments: number }; error?: string }> => {
+    // Inspect attachments without an extra round trip — read from local state.
+    let attachedCount = 0;
+    setQuoteAttachments((cur) => {
+      attachedCount = cur.filter((a) => a.quoteId === id).length;
+      return cur;
+    });
+    if (attachedCount > 0) {
+      return { ok: false, blockedBy: { quoteAttachments: attachedCount } };
+    }
+
+    let removed: Quote | undefined;
+    setQuotes((prev) => {
+      removed = prev.find((q) => q.id === id);
+      return prev.filter((q) => q.id !== id);
+    });
+    if (!removed) return { ok: false, error: 'Quote not found.' };
+
+    const { error: delErr } = await supabase
+      .from('quotes').delete().eq('id', id);
+    if (delErr) {
+      const msg = describeError(delErr);
+      console.error('[deleteQuote] delete failed:', msg);
+      setError(msg);
+      setQuotes((prev) => [removed!, ...prev]);
+      return { ok: false, error: msg };
+    }
+    return { ok: true };
+  }, []);
 
   /**
    * Confirm a draft bill AND bulk-insert its line items as materials.
@@ -1581,6 +1959,83 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
   }, [businessId]);
 
+  /**
+   * Split-reconcile: create N entries from one bank txn, all sharing the
+   * same bank_transaction_id. Use case: one Mitre 10 receipt covered three
+   * jobs; one direct debit settled three Trademax bills. Bulk insert via
+   * Supabase's array-payload .insert() so we make one round trip not N.
+   */
+  const reconcileAsSplitEntries = useCallback(async (
+    bankTxnId: string,
+    entryInits: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>[],
+  ): Promise<{ inserted: number; failed: number; error?: string }> => {
+    if (!businessId) return { inserted: 0, failed: entryInits.length, error: 'No business loaded.' };
+    if (entryInits.length === 0) return { inserted: 0, failed: 0 };
+
+    // Optimistic prepend with temp ids — keeps the UI responsive while the
+    // bulk insert flies through the network.
+    const tempBase = Date.now();
+    const optimistic: Entry[] = entryInits.map((init, i) => ({
+      ...init,
+      id: `ent_${tempBase}_${i}`,
+      businessId,
+      bankTransactionId: bankTxnId,
+      createdAt: new Date().toISOString(),
+    }));
+    setEntries((prev) => [...optimistic, ...prev]);
+    const tempIds = optimistic.map((e) => e.id);
+
+    // Flip the bank txn to matched immediately too — same optimism. We'll
+    // unwind it below if the insert fails.
+    setBankTransactions((list) => list.map((t) => t.id === bankTxnId
+      ? { ...t, status: 'matched', entryId: tempIds[0] } : t));
+
+    // Bulk insert. One round trip.
+    const payloads = optimistic.map((e) => entryToRow(e));
+    const { data, error: insErr } = await supabase
+      .from('entries')
+      .insert(payloads)
+      .select('*');
+
+    if (insErr || !data) {
+      const msg = describeError(insErr) || 'Failed to insert split entries';
+      console.error('[store] reconcileAsSplitEntries failed:', msg);
+      setError(msg);
+      // Roll back: remove the optimistic entries, unmatch the bank txn.
+      setEntries((prev) => prev.filter((e) => !tempIds.includes(e.id)));
+      setBankTransactions((list) => list.map((t) => t.id === bankTxnId
+        ? { ...t, status: 'unreconciled', entryId: undefined } : t));
+      return { inserted: 0, failed: entryInits.length, error: msg };
+    }
+
+    // Replace temp ids with persisted rows.
+    const persisted = data.map(rowToEntry);
+    setEntries((prev) => {
+      const withoutTemps = prev.filter((e) => !tempIds.includes(e.id));
+      return [...persisted, ...withoutTemps];
+    });
+
+    // Link the bank txn to the first persisted entry (bank_transactions
+    // schema only has a single entry_id column — picking the first is
+    // arbitrary but consistent; the full audit trail lives on each
+    // entry's bank_transaction_id).
+    const firstId = persisted[0]?.id;
+    if (firstId) {
+      const { error: updErr } = await supabase
+        .from('bank_transactions')
+        .update({ status: 'matched', entry_id: firstId })
+        .eq('id', bankTxnId);
+      if (updErr) {
+        console.warn('[store] reconcileAsSplitEntries: bank txn link update failed (entries still inserted):', describeError(updErr));
+      } else {
+        setBankTransactions((list) => list.map((t) => t.id === bankTxnId
+          ? { ...t, status: 'matched', entryId: firstId } : t));
+      }
+    }
+
+    return { inserted: persisted.length, failed: entryInits.length - persisted.length };
+  }, [businessId]);
+
   return (
     <StoreContext.Provider
       value={{
@@ -1592,9 +2047,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
         confirmBillDraft, confirmBillDraftWithMaterials,
-        addMaterials,
+        addMaterials, addMaterialFromOverhead,
+        addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment,
+        updateQuote, deleteQuote,
         commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
-        importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry,
+        importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
         refresh: load,
       }}
     >

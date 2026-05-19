@@ -285,6 +285,22 @@ export interface Material {
   supplier?: string;
   area?: string;
   notes?: string;
+  /**
+   * Where this material row came from:
+   *   - 'bill'     : derived from a confirmed supplier bill line item
+   *                  (linked via entryId). The bill's entry is what
+   *                  drives business-wide expense totals.
+   *   - 'overhead' : user-entered usage of something they already owned
+   *                  (no entryId, no fresh cash outflow). Counts toward
+   *                  the JOB'S material cost in per-job profit, but
+   *                  does NOT count in business-wide expenses (because
+   *                  the original purchase already counted under
+   *                  overhead at the time).
+   *
+   * Older rows that pre-date migration 010 read back as 'bill' by
+   * default (set by the migration's column default).
+   */
+  source?: 'bill' | 'overhead';
   createdAt: string;
 }
 

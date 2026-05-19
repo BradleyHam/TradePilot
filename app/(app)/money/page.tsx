@@ -39,6 +39,14 @@ export default function MoneyPage() {
   // actually have a good month" rather than "what hit the bank account".
   const [basis, setBasis] = useState<'cash' | 'earned'>('earned');
 
+  // Revenue vs Expenses chart range — independent of the main timeframe
+  // filter so the chart can show a wider trend window (12M default)
+  // while the KPIs above stay focused on the active month/quarter.
+  // 'all' walks back to the earliest entry; cap at 36 months for the
+  // chart's readability.
+  type ChartRange = '3M' | '6M' | '12M' | 'all';
+  const [chartRange, setChartRange] = useState<ChartRange>('12M');
+
   // Entries that fall inside the selected window.
   const windowEntries = useMemo(
     () => entries.filter((e) => e.entryDate >= frame.start && e.entryDate <= frame.end),
@@ -85,23 +93,38 @@ export default function MoneyPage() {
     .reduce((s, j) => s + (j.quoteAmount ?? j.estimatedValue ?? 0), 0);
 
   // ── Charts ─────────────────────────────────────────────────────────────────
-  // Revenue vs Expenses chart: one bar per month in the selected window
-  // (capped at 12 to keep it readable).
+  // Revenue vs Expenses chart: one bar per month over the chart range.
+  // Independent of the page's main timeframe so trends across many months
+  // are visible while the KPI cards above stay focused on the active
+  // window. Capped at 36 months even on 'all' for readability.
   const monthlyData: MonthlyData[] = useMemo(() => {
-    const startMonth = startOfMonth(parseISO(frame.start));
-    const endMonth = startOfMonth(parseISO(frame.end));
+    const monthsBack = chartRange === '3M' ? 3
+      : chartRange === '6M' ? 6
+      : chartRange === '12M' ? 12
+      : 36; // 'all' — capped so we don't render a 60-bar wall
+
+    const endMonth = startOfMonth(now);
+    // For 'all', walk back to the earliest entry but never past the cap.
+    let firstMonth = startOfMonth(addMonths(endMonth, -(monthsBack - 1)));
+    if (chartRange === 'all' && entries.length > 0) {
+      const earliestEntry = entries
+        .map((e) => parseISO(e.entryDate))
+        .reduce((min, d) => (d < min ? d : min), parseISO(entries[0].entryDate));
+      const earliestMonth = startOfMonth(earliestEntry);
+      // Pick the later of the two so we don't go beyond the cap.
+      if (earliestMonth > firstMonth) firstMonth = earliestMonth;
+    }
+
     const months: Date[] = [];
-    let cursor = startMonth;
-    while (cursor <= endMonth && months.length < 12) {
+    let cursor = firstMonth;
+    while (cursor <= endMonth) {
       months.push(cursor);
       cursor = addMonths(cursor, 1);
     }
-    // If the window only spans one month, also pull in the previous two so
-    // the chart isn't a lonely bar on its own.
-    if (months.length === 1) {
-      months.unshift(addMonths(months[0], -1));
-      months.unshift(addMonths(months[0], -1));
-    }
+    // Defensive: if the window somehow has zero months (shouldn't happen),
+    // pad to a single bar to avoid an empty chart looking broken.
+    if (months.length === 0) months.push(endMonth);
+
     // For earned basis we need the YYYY-MM keys to ask the allocator.
     const monthKeys = months.map((m) => format(m, 'yyyy-MM'));
     const earnedByMonth = basis === 'earned'
@@ -120,7 +143,7 @@ export default function MoneyPage() {
         expenses: monthEntries.filter((e) => e.type === 'expense').reduce((s, e) => s + (e.amount ?? 0), 0),
       };
     });
-  }, [entries, jobs, frame.start, frame.end, basis]);
+  }, [entries, jobs, chartRange, basis, now]);
 
   // Expense breakdown for the selected window.
   const expenseByCategory: CategoryData[] = useMemo(() => {
@@ -150,44 +173,52 @@ export default function MoneyPage() {
       />
 
       <div className="px-4 md:px-6 pb-6 space-y-3">
-        {/* Timeframe filter */}
-        <TimeframeSelector
-          kind={kind}
-          custom={customFrame}
-          onChange={(k, c) => { setKind(k); setCustomFrame(c); }}
-        />
+        {/* Sticky controls — Timeframe + Cash/Earned basis. Pinned to the
+            top of the viewport so the user can always see which window
+            the KPIs/charts below are scoped to without scrolling back up.
+            Negative horizontal margins + matching padding restore the
+            page's px-4/px-6 gutter while letting the backdrop span edge-
+            to-edge so it doesn't look like a floating chip. */}
+        <div className="sticky top-0 z-20 -mx-4 md:-mx-6 px-4 md:px-6 pt-3 pb-3 bg-background/95 backdrop-blur-sm border-b border-border space-y-3">
+          {/* Timeframe filter */}
+          <TimeframeSelector
+            kind={kind}
+            custom={customFrame}
+            onChange={(k, c) => { setKind(k); setCustomFrame(c); }}
+          />
 
-        {/* Cash vs Earned basis toggle */}
-        <div className="flex items-center gap-2">
-          <div className="inline-flex bg-muted rounded-lg p-0.5">
-            <button
-              onClick={() => setBasis('earned')}
-              className={cn(
-                'px-3 h-8 rounded-md text-xs font-medium transition-colors',
-                basis === 'earned'
-                  ? 'bg-card shadow-sm text-foreground'
-                  : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              Earned
-            </button>
-            <button
-              onClick={() => setBasis('cash')}
-              className={cn(
-                'px-3 h-8 rounded-md text-xs font-medium transition-colors',
-                basis === 'cash'
-                  ? 'bg-card shadow-sm text-foreground'
-                  : 'text-muted-foreground hover:text-foreground',
-              )}
-            >
-              Cash
-            </button>
+          {/* Cash vs Earned basis toggle */}
+          <div className="flex items-center gap-2">
+            <div className="inline-flex bg-muted rounded-lg p-0.5">
+              <button
+                onClick={() => setBasis('earned')}
+                className={cn(
+                  'px-3 h-8 rounded-md text-xs font-medium transition-colors',
+                  basis === 'earned'
+                    ? 'bg-card shadow-sm text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                Earned
+              </button>
+              <button
+                onClick={() => setBasis('cash')}
+                className={cn(
+                  'px-3 h-8 rounded-md text-xs font-medium transition-colors',
+                  basis === 'cash'
+                    ? 'bg-card shadow-sm text-foreground'
+                    : 'text-muted-foreground hover:text-foreground',
+                )}
+              >
+                Cash
+              </button>
+            </div>
+            <p className="text-[10px] text-muted-foreground italic flex-1">
+              {basis === 'earned'
+                ? 'Income split across months by hours worked. Pending jobs excluded.'
+                : 'Income on the date payment hit the bank.'}
+            </p>
           </div>
-          <p className="text-[10px] text-muted-foreground italic flex-1">
-            {basis === 'earned'
-              ? 'Income split across months by hours worked. Pending jobs excluded.'
-              : 'Income on the date payment hit the bank.'}
-          </p>
         </div>
 
         {/* Top stats grid — bound to the selected window */}
@@ -258,8 +289,15 @@ export default function MoneyPage() {
         {/* Reconcile entry point */}
         <ReconcileEntryCard />
 
-        {/* Charts — adapt to the selected window */}
-        <RevenueChart data={monthlyData} />
+        {/* Charts — Revenue vs Expenses has its OWN range (independent of
+            the main timeframe) so trends across a year are visible while
+            the KPI cards above stay focused on this month/quarter. */}
+        <RevenueChart
+          data={monthlyData}
+          rangeControl={
+            <ChartRangeToggle value={chartRange} onChange={setChartRange} />
+          }
+        />
         {expenseByCategory.length > 0 && <ExpenseChart data={expenseByCategory} />}
 
         {/* Pipeline — state of business, not period-bound */}
@@ -268,6 +306,44 @@ export default function MoneyPage() {
         {/* Transactions — has its own internal 30-day window + filters */}
         <TransactionList />
       </div>
+    </div>
+  );
+}
+
+/**
+ * Compact range toggle for the Revenue vs Expenses chart. Sits in the
+ * chart card's header. 3M / 6M / 12M / All — chart-only, doesn't
+ * affect the main page timeframe filter.
+ */
+function ChartRangeToggle({
+  value, onChange,
+}: {
+  value: '3M' | '6M' | '12M' | 'all';
+  onChange: (next: '3M' | '6M' | '12M' | 'all') => void;
+}) {
+  const options: { label: string; value: '3M' | '6M' | '12M' | 'all' }[] = [
+    { label: '3M',  value: '3M' },
+    { label: '6M',  value: '6M' },
+    { label: '12M', value: '12M' },
+    { label: 'All', value: 'all' },
+  ];
+  return (
+    <div className="inline-flex rounded-lg border border-border bg-muted/30 p-0.5">
+      {options.map(({ label, value: v }) => (
+        <button
+          key={v}
+          type="button"
+          onClick={() => onChange(v)}
+          className={cn(
+            'px-2 py-0.5 text-[11px] font-medium rounded-md transition-colors',
+            value === v
+              ? 'bg-card text-foreground shadow-sm'
+              : 'text-muted-foreground hover:text-foreground',
+          )}
+        >
+          {label}
+        </button>
+      ))}
     </div>
   );
 }

@@ -204,6 +204,11 @@ export function rowToMaterial(r: Row): Material {
     supplier: asString(r.supplier),
     area: asString(r.area),
     notes: asString(r.notes),
+    // Default to 'bill' for rows that pre-date migration 010 (they don't
+    // have a source column value yet). Migration 010's DEFAULT will fill
+    // this in at the DB level once applied, but defending in code lets
+    // the app keep working between migrations.
+    source: (asString(r.source) as 'bill' | 'overhead' | undefined) ?? 'bill',
     createdAt: r.created_at as string,
   };
 }
@@ -227,6 +232,7 @@ export function materialToRow(m: Partial<Material>): Row {
   if (m.supplier !== undefined) out.supplier = m.supplier || null;
   if (m.area !== undefined) out.area = m.area || null;
   if (m.notes !== undefined) out.notes = m.notes || null;
+  if (m.source !== undefined) out.source = m.source; // CHECK constrains to 'bill' | 'overhead' — don't coerce to null
   return out;
 }
 

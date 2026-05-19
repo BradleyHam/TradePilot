@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useStore } from '@/lib/store';
-import { Job, JobStatus } from '@/lib/types';
+import { Job, JobStatus, ScheduleItem } from '@/lib/types';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { JobCard } from '@/components/jobs/job-card';
@@ -15,17 +15,15 @@ import { JOB_STATUSES } from '@/lib/mock-data';
 import { jobStats } from '@/lib/job-stats';
 import { cn } from '@/lib/utils';
 
-// Filter values: 'all', a synthetic 'coming-up' group, or a literal JobStatus.
-// 'coming-up' is everything you've got in the pipeline that isn't yet on the
-// brush — i.e. NOT in-progress, NOT done. Splits cleanly with In progress.
-type FilterValue = 'all' | 'coming-up' | JobStatus;
-
-const COMING_UP_STATUSES: JobStatus[] = [
-  'lead', 'quoted', 'accepted', 'booked',
-];
+// Filter values: a synthetic 'coming-up' group, or a literal JobStatus.
+// 'coming-up' is committed work (accepted/booked) plus anything with a
+// future schedule item; sits cleanly alongside In progress. No 'all'
+// chip — search covers the cross-status case better than a giant mixed
+// list does, and the page now defaults to In progress (what am I doing
+// right now) which is far more useful as a first-glance view.
+type FilterValue = 'coming-up' | JobStatus;
 
 const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
-  { label: 'All',         value: 'all' },
   { label: 'In progress', value: 'in-progress' },
   { label: 'Coming up',   value: 'coming-up' },
   { label: 'Completed',   value: 'completed' },
@@ -38,27 +36,177 @@ const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
   { label: 'Lost',        value: 'lost' },
 ];
 
+/**
+ * Earliest future schedule item date for a given job, or null if no
+ * future items. Used by both the Coming up filter and its sort so
+ * jobs whose calendar reality lives in schedule_items (rather than
+ * the Job row's startDate) still surface correctly.
+ */
+function earliestFutureScheduleDate(
+  jobId: string,
+  scheduleItems: ScheduleItem[],
+  todayISO: string,
+): string | null {
+  let earliest: string | null = null;
+  for (const s of scheduleItems) {
+    if (s.jobId !== jobId) continue;
+    if (s.completed) continue;
+    if (s.date < todayISO) continue;
+    if (!earliest || s.date < earliest) earliest = s.date;
+  }
+  return earliest;
+}
+
+/**
+ * Should this job appear in the Coming up tab? Coming up means
+ * "committed work that's coming". Leads and quoted jobs are pipeline,
+ * not coming up — they have their own chips. The only exception is
+ * the schedule reality override: if a job has a future schedule item
+ * attached, treat it as coming up regardless of status (catches the
+ * "I forgot to flip status to booked after scheduling it" case).
+ *
+ *   - accepted / booked  : always in (committed work).
+ *   - anything else      : in only if it has a future schedule item.
+ *   - lead / quoted with no future schedule item : OUT (use Leads /
+ *     Quoted chips to see those).
+ */
+function comingUpQualifies(
+  job: Job,
+  scheduleItems: ScheduleItem[],
+  todayISO: string,
+): boolean {
+  // Committed statuses: always in.
+  if (job.status === 'accepted' || job.status === 'booked') return true;
+
+  // Schedule reality override: a future schedule item means this job
+  // is genuinely coming up, even if its status hasn't caught up yet.
+  // Catches Troy-style cases where the calendar knows about July but
+  // the Job row still says 'quoted'.
+  if (earliestFutureScheduleDate(job.id, scheduleItems, todayISO)) return true;
+
+  return false;
+}
+
+/**
+ * Filter-aware job sort. Different chips want different date axes:
+ *
+ *   - Completed / Invoiced / Paid : endDate desc (most recently finished first).
+ *       Falls back to updatedAt if endDate isn't recorded.
+ *
+ *   - Coming up + Lead + Quoted + Accepted + Booked : startDate asc
+ *       (next thing on the calendar first). Falls back to followUpDate,
+ *       then createdAt desc for fresh leads with no dates set.
+ *
+ *   - In progress : updatedAt desc — the most recently touched live job
+ *       is the most useful one to surface first.
+ *
+ *   - Lost : updatedAt desc (most recently lost first).
+ *
+ *   - All : updatedAt desc (no single right axis when statuses are mixed).
+ *
+ * All comparators are stable on ties: jobs with identical sort keys keep
+ * their existing order so the list doesn't jitter on re-render.
+ */
+function jobComparatorForFilter(
+  filter: FilterValue,
+  scheduleItems: ScheduleItem[] = [],
+  todayISO: string = new Date().toISOString().slice(0, 10),
+): (a: Job, b: Job) => number {
+  // Build a millisecond timestamp from an ISO string, falling back through
+  // an ordered list of optional dates. Missing-everywhere = +/- Infinity
+  // depending on direction, so those jobs collapse to the end of the list.
+  const ts = (s?: string | null) => (s ? new Date(s).getTime() : NaN);
+  const firstTs = (...candidates: (string | undefined | null)[]) => {
+    for (const c of candidates) {
+      const t = ts(c);
+      if (Number.isFinite(t)) return t;
+    }
+    return NaN;
+  };
+
+  const comingUpLike: JobStatus[] = ['lead', 'quoted', 'accepted', 'booked'];
+
+  // Completed bucket — most recently finished first.
+  if (filter === 'completed' || filter === 'invoiced' || filter === 'paid') {
+    return (a, b) => {
+      const at = firstTs(a.endDate, a.updatedAt);
+      const bt = firstTs(b.endDate, b.updatedAt);
+      // Jobs with no usable date sink to the bottom.
+      if (Number.isNaN(at) && Number.isNaN(bt)) return 0;
+      if (Number.isNaN(at)) return 1;
+      if (Number.isNaN(bt)) return -1;
+      return bt - at;
+    };
+  }
+
+  // Coming-up bucket — soonest first. The "soonest" date is the
+  // earliest of: startDate on the Job row, followUpDate, or the
+  // earliest future schedule item tied to this job. This is how
+  // Troy's-ceiling-in-July surfaces correctly even when its Job row
+  // has no startDate set — schedule_items knows about July.
+  if (filter === 'coming-up' || comingUpLike.includes(filter as JobStatus)) {
+    return (a, b) => {
+      const aSched = earliestFutureScheduleDate(a.id, scheduleItems, todayISO);
+      const bSched = earliestFutureScheduleDate(b.id, scheduleItems, todayISO);
+      const at = firstTs(a.startDate, a.followUpDate, aSched);
+      const bt = firstTs(b.startDate, b.followUpDate, bSched);
+      if (Number.isNaN(at) && Number.isNaN(bt)) {
+        // Both date-less — newest lead first so fresh enquiries surface.
+        return new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime();
+      }
+      // Jobs with no scheduled date sink to the bottom of the upcoming list
+      // since they can't be "next".
+      if (Number.isNaN(at)) return 1;
+      if (Number.isNaN(bt)) return -1;
+      return at - bt;
+    };
+  }
+
+  // In progress — most recently touched first.
+  if (filter === 'in-progress') {
+    return (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  }
+
+  // Lost — most recently lost first.
+  if (filter === 'lost') {
+    return (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+  }
+
+  // Fallback — should be unreachable now that every FilterValue has an
+  // explicit branch above. Kept as updatedAt-desc so any future status
+  // added to the enum still gets a sensible default ordering instead of
+  // crashing or returning 0 across the board.
+  return (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
+}
+
 export default function JobsPage() {
-  const { jobs, entries, addJob, businessId } = useStore();
+  const { jobs, entries, materials, scheduleItems, addJob, businessId } = useStore();
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [showAddJob, setShowAddJob] = useState(false);
   const [search, setSearch] = useState('');
-  const [filter, setFilter] = useState<FilterValue>('all');
+  // Default to In progress — most-useful first-glance view (what am I
+  // actively working on right now?). Replaces the old 'All' default
+  // which produced a confusing mixed-status list.
+  const [filter, setFilter] = useState<FilterValue>('in-progress');
 
+  const todayISO = new Date().toISOString().slice(0, 10);
+  const searching = search.trim().length > 0;
   const filteredJobs = jobs.filter((j) => {
-    const matchesFilter =
-      // 'All' hides lost jobs by default — they only appear when explicitly
-      // requested via the 'Lost' chip. Avoids cluttering the default view
-      // with dead leads while still leaving them findable.
-      filter === 'all' ? j.status !== 'lost'
-      : filter === 'coming-up' ? COMING_UP_STATUSES.includes(j.status)
-      : j.status === filter;
-    const matchesSearch =
-      !search ||
-      j.name.toLowerCase().includes(search.toLowerCase()) ||
-      j.clientName.toLowerCase().includes(search.toLowerCase());
-    return matchesFilter && matchesSearch;
-  }).sort((a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime());
+    // When searching, ignore the active chip — the user is looking for
+    // a specific job and probably can't remember which status it's in.
+    // The search bar effectively becomes a cross-status finder.
+    if (searching) {
+      const q = search.toLowerCase();
+      return (
+        j.name.toLowerCase().includes(q) ||
+        j.clientName.toLowerCase().includes(q) ||
+        (j.location ?? '').toLowerCase().includes(q)
+      );
+    }
+    // Coming up uses the smart helper: committed-work + future schedule.
+    if (filter === 'coming-up') return comingUpQualifies(j, scheduleItems, todayISO);
+    return j.status === filter;
+  }).sort(jobComparatorForFilter(filter, scheduleItems, todayISO));
 
   // Stats are derived from entries via the shared util in lib/job-stats.ts so
   // this list view and the detail sheet always agree.
@@ -136,7 +284,7 @@ export default function JobsPage() {
         ) : (
           <div className="space-y-2.5 pb-6">
             {filteredJobs.map((job) => {
-              const stats = jobStats(job, entries);
+              const stats = jobStats(job, entries, materials);
               return (
                 <JobCard
                   key={job.id}
