@@ -95,7 +95,7 @@ export type ScheduleItemType =
  * Where a lead/job originally came from. Free-form (not a check constraint
  * in the DB) so we can add new channels without a migration.
  */
-export type LeadSource = 'website' | 'email' | 'phone' | 'referral' | 'manual';
+export type LeadSource = 'website' | 'email' | 'phone' | 'referral' | 'gmb' | 'manual';
 
 /**
  * Type of work being quoted. `mixed` covers combination scopes
@@ -195,6 +195,13 @@ export interface Entry {
   paymentRef?: string;
   /** Set when reconciled to a bank transaction. */
   bankTransactionId?: string;
+  /**
+   * Where this lead came from. Only meaningful for `type === 'enquiry'`
+   * entries; the entry form only surfaces the picker for enquiries. Null
+   * for other entry types and for legacy enquiries logged before this
+   * field existed.
+   */
+  leadSource?: LeadSource;
   // Draft-bill fields (populated by the PDF upload + LLM extraction flow).
   // A draft is an unconfirmed bill — it doesn't count against expenses or
   // GST until isDraft flips to false (via the Home "Bills to confirm"

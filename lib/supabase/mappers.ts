@@ -111,6 +111,7 @@ export function rowToEntry(r: Row): Entry {
     paidDate: asString(r.paid_date),
     paymentRef: asString(r.payment_ref),
     bankTransactionId: asString(r.bank_transaction_id),
+    leadSource: asString(r.lead_source) as Entry['leadSource'],
     // Draft-bill fields. asBool(_, false) so legacy rows (column nullable
     // before migration applied locally) read as confirmed.
     isDraft: asBool(r.is_draft, false),
@@ -144,6 +145,7 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.paidDate !== undefined) out.paid_date = e.paidDate || null;
   if (e.paymentRef !== undefined) out.payment_ref = e.paymentRef || null;
   if (e.bankTransactionId !== undefined) out.bank_transaction_id = e.bankTransactionId || null;
+  if (e.leadSource !== undefined) out.lead_source = e.leadSource || null;
   // Draft-bill fields. Use the same `!== undefined` guard pattern so
   // partial updates don't accidentally clear other fields.
   if (e.isDraft !== undefined) out.is_draft = e.isDraft;

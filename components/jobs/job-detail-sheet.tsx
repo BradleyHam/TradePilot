@@ -120,6 +120,10 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   }) {
     updateJob(liveJob.id, data);
     setOutcomePrompt(null);
+    // Once the reason is captured, there's nothing else to do on a
+    // lost/accepted job in this sheet — close it so Brad gets back to
+    // the jobs list in one tap instead of two.
+    onClose();
   }
 
   // Delete the job. Blocked if anything's attached; the prompt shows

@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { EntryType, Entry, ExpenseCategory, ActivityType } from '@/lib/types';
+import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource } from '@/lib/types';
 import { EXPENSE_CATEGORIES, ACTIVITY_TYPES } from '@/lib/mock-data';
 import { useStore } from '@/lib/store';
 import { rankJobs } from '@/lib/job-match';
@@ -46,6 +46,20 @@ const ENTRY_TYPES: { value: EntryType; label: string }[] = [
 
 const OVERHEAD_PREFIX = '[OH] ';
 
+// Lead source chip options for the enquiry form. Ordered roughly by how
+// often Brad gets leads from each channel — most-common first so the chip
+// he wants is usually one tap. GMB attribution is fuzzy in practice (people
+// who find him on Google still call rather than click) but worth tracking
+// to spot the rough trend.
+const LEAD_SOURCE_OPTIONS: { value: LeadSource; label: string }[] = [
+  { value: 'referral', label: 'Referral' },
+  { value: 'website',  label: 'Website' },
+  { value: 'gmb',      label: 'Google' },
+  { value: 'phone',    label: 'Phone' },
+  { value: 'email',    label: 'Email' },
+  { value: 'manual',   label: 'Other' },
+];
+
 export function EntryForm({
   defaultType = 'expense',
   defaultValues,
@@ -76,6 +90,10 @@ export function EntryForm({
   // Overhead = no job, deliberately. Distinct from "I forgot to pick one".
   // Stored as `[OH]` description prefix; jobId stays null.
   const [isOverhead, setIsOverhead] = useState(seededIsOverhead);
+  // Lead source — only surfaced for enquiry-type entries. Stored on the
+  // entry row (lead_source column) so we can later report on "where do my
+  // leads come from?" without needing a job to exist yet.
+  const [leadSource, setLeadSource] = useState<LeadSource | ''>(defaultValues?.leadSource ?? '');
   const [supplier, setSupplier] = useState(defaultValues?.supplier ?? '');
   const [dueDate, setDueDate] = useState(defaultValues?.dueDate ?? '');
   // Entry date — defaults to today but editable so the user can backdate
@@ -110,6 +128,9 @@ export function EntryForm({
       paidDate: type === 'bill' && paid ? (paidDate || undefined) : undefined,
       paymentRef: type === 'bill' ? (paymentRef || undefined) : undefined,
       company: type === 'bill' ? (company || undefined) : undefined,
+      // Only attach lead source for enquiries — the picker is hidden for
+      // other types so the state could be stale from a prior chip flip.
+      leadSource: type === 'enquiry' ? (leadSource || undefined) : undefined,
     });
   }
 
@@ -137,6 +158,38 @@ export function EntryForm({
           ))}
         </div>
       </div>
+
+      {/* Lead source — enquiry only. Tap-no-type, optional. Sits between
+          Entry type and Description because "Enquiry → where from?" is the
+          natural next question and Brad will usually know the answer
+          before he's typed the client's name. */}
+      {type === 'enquiry' && (
+        <div>
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+            Lead source (optional)
+          </label>
+          <div className="flex flex-wrap gap-2">
+            {LEAD_SOURCE_OPTIONS.map(({ value, label }) => {
+              const selected = leadSource === value;
+              return (
+                <button
+                  key={value}
+                  type="button"
+                  onClick={() => setLeadSource(selected ? '' : value)}
+                  className={cn(
+                    'px-3 py-2 rounded-lg text-sm font-medium border transition-colors min-h-[44px]',
+                    selected
+                      ? 'bg-primary text-primary-foreground border-primary'
+                      : 'bg-background text-muted-foreground border-border hover:border-primary/40 hover:text-foreground',
+                  )}
+                >
+                  {label}
+                </button>
+              );
+            })}
+          </div>
+        </div>
+      )}
 
       {/* Description */}
       <div>
@@ -259,7 +312,10 @@ export function EntryForm({
         )}
       </div>
 
-      {/* Job + overhead toggle */}
+      {/* Job + overhead toggle. Hidden for enquiries — an enquiry is by
+          definition a fresh lead with no job yet, and overheads don't make
+          sense for them either. Keeps the form tight on the 5:30pm rule. */}
+      {type !== 'enquiry' && (
       <div>
         <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
           Job (optional)
@@ -343,6 +399,7 @@ export function EntryForm({
           </button>
         </div>
       </div>
+      )}
 
       {/* Supplier (expense) */}
       {type === 'expense' && (
