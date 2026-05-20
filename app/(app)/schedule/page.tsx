@@ -1,6 +1,7 @@
 'use client';
 
 import { useMemo, useState } from 'react';
+import { useSearchParams } from 'next/navigation';
 import { useStore } from '@/lib/store';
 import { Job, ScheduleItem, ScheduleItemType, Entry } from '@/lib/types';
 import { rankJobs } from '@/lib/job-match';
@@ -10,6 +11,7 @@ import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { EntryForm } from '@/components/entry/entry-form';
 import { EditScheduleItemSheet, ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
+import { downloadIcs } from '@/lib/ics';
 import {
   Select,
   SelectContent,
@@ -82,6 +84,15 @@ const TYPE_CONFIG: Record<ScheduleItemType, { label: string; icon: React.Element
   invoice_due:  { label: 'Invoice',   icon: Receipt,     color: 'text-amber-600',  bg: 'bg-amber-50',  ring: 'ring-amber-200',  bar: 'bg-amber-500' },
   reminder:     { label: 'Reminder',  icon: Bell,        color: 'text-slate-600',  bg: 'bg-slate-50',  ring: 'ring-slate-200',  bar: 'bg-slate-400' },
 };
+
+/**
+ * Narrow a string from a query param to a valid ScheduleItemType. Used
+ * to validate the ?quickAdd= deep link before pre-selecting it in the
+ * add sheet — protects against junk values in URLs.
+ */
+function isScheduleItemType(s: string): s is ScheduleItemType {
+  return s in TYPE_CONFIG;
+}
 
 // ── Per-job colour palette ───────────────────────────────────────────────────
 // In Month/Week view we want each *job* to be visually distinguishable, not
@@ -344,8 +355,37 @@ export default function SchedulePage() {
     }
     return map;
   }, [hoursEntries]);
-  const [showAdd, setShowAdd] = useState(false);
+  // Deep-link support: ?quickAdd=quote_visit auto-opens the add sheet
+  // with the type pre-selected. Used by the Entry-page "Schedule a site
+  // visit" tile so the user lands here with the form already open.
+  // Lazy initializer (runs once on mount) — we don't want the sheet
+  // to keep reopening on every query-param-touching render.
+  const searchParams = useSearchParams();
+  const [showAdd, setShowAdd] = useState<boolean>(() => searchParams.get('quickAdd') != null);
+  const [initialAddType, setInitialAddType] = useState<ScheduleItemType | undefined>(() => {
+    const q = searchParams.get('quickAdd');
+    return (q && isScheduleItemType(q)) ? q : undefined;
+  });
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
+  // After saving a quote_visit, surface an "Add to calendar" prompt so the
+  // user can hand off reminders to their phone's native calendar app.
+  // Holds enough info to build the .ics — we don't keep the schedule_item
+  // id because the freshly-added items aren't in the store yet at the
+  // moment we render the prompt.
+  const [savedQuoteVisit, setSavedQuoteVisit] = useState<null | {
+    /**
+     * The schedule_item ID we just created. Held so we can flip
+     * icsDownloaded=true on it if the user accepts the download prompt
+     * — without it we'd have no way to identify the right row.
+     */
+    scheduleItemId: string;
+    title: string;
+    date: string;       // YYYY-MM-DD
+    startTime?: string; // HH:mm
+    endTime?: string;
+    location?: string;
+    notes?: string;
+  }>(null);
 
   // View mode: phone-first default (list on narrow viewports, month on desktop).
   // Lazy initializer runs once on mount in this `use client` page. It reads the
@@ -385,16 +425,116 @@ export default function SchedulePage() {
   }
 
   function handleAdd(items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) {
-    const baseTs = Date.now();
+    // Use real UUIDs from the start. schedule_items.id is a `uuid` column
+    // in Supabase — if we generate a "sch_<timestamp>" string here and let
+    // the store insert it, Supabase rejects updates that race ahead of
+    // the insert's id-swap because the temp id isn't valid uuid syntax
+    // (Postgres 22P02). Generating a uuid client-side means the id is
+    // the same locally and remotely, no swap needed, no race window.
+    // Track the ids as we go so we can hand the quote_visit's id to the
+    // post-save prompt for later icsDownloaded flagging.
+    const idsByIndex: string[] = [];
     items.forEach((data, i) => {
+      const id = crypto.randomUUID();
+      idsByIndex[i] = id;
       addScheduleItem({
-        id: `sch_${baseTs}_${i}`,
+        id,
         businessId: businessId ?? '',
         createdAt: new Date().toISOString(),
         ...data,
       });
     });
     setShowAdd(false);
+
+    // Surface the calendar-invite prompt for quote_visit items. We only
+    // offer it for the first matching item — multi-day quote visits are
+    // rare in practice (a site visit is typically a one-hour drop-in),
+    // and bombarding the user with N download prompts would be worse
+    // than slightly under-serving the edge case.
+    const firstVisitIndex = items.findIndex((it) => it.type === 'quote_visit');
+    if (firstVisitIndex >= 0) {
+      const firstVisit = items[firstVisitIndex];
+      // Try to fill location from the linked job if the user didn't type one.
+      // Most site visits ARE the job's location, so this is a sensible default.
+      const linkedJob = firstVisit.jobId
+        ? jobs.find((j) => j.id === firstVisit.jobId)
+        : undefined;
+      setSavedQuoteVisit({
+        scheduleItemId: idsByIndex[firstVisitIndex],
+        title: firstVisit.title || 'Site visit',
+        date: firstVisit.date,
+        startTime: firstVisit.startTime,
+        endTime: firstVisit.endTime,
+        location: linkedJob?.location ?? undefined,
+        notes: firstVisit.notes,
+      });
+    }
+  }
+
+  /**
+   * Build the .ics for the just-saved quote_visit and trigger a download.
+   * Falls back to a sensible default start time (9am) if the user didn't
+   * enter one — better than refusing to generate the file at all.
+   */
+  function handleDownloadVisitIcs() {
+    if (!savedQuoteVisit) return;
+    const [hh, mm] = (savedQuoteVisit.startTime ?? '09:00').split(':').map(Number);
+    const [eh, em] = (savedQuoteVisit.endTime ?? '').split(':').map(Number);
+    const [y, m, d] = savedQuoteVisit.date.split('-').map(Number);
+    const start = new Date(y, m - 1, d, hh, mm);
+    const end = Number.isFinite(eh) && Number.isFinite(em)
+      ? new Date(y, m - 1, d, eh, em)
+      : undefined;
+    downloadIcs({
+      // Pass the schedule_item id as the .ics UID so re-downloading later
+      // updates the existing calendar event rather than spawning a copy —
+      // matters if the user re-imports after a time change.
+      uid: `${savedQuoteVisit.scheduleItemId}@tradepilot`,
+      title: savedQuoteVisit.title,
+      start,
+      end,
+      location: savedQuoteVisit.location,
+      description: savedQuoteVisit.notes,
+    });
+    // Flag the row so the schedule list can render the "Reminders set"
+    // badge. Optimistic — the store mutator rolls back on Supabase failure,
+    // so on the rare network error the badge would just snap back to
+    // "Add to calendar" on next render. That's the right behaviour.
+    updateScheduleItem(savedQuoteVisit.scheduleItemId, { icsDownloaded: true });
+    setSavedQuoteVisit(null);
+  }
+
+  /**
+   * Re-download the .ics for an *existing* quote_visit row. Hooked up to
+   * the "Add to calendar" badge on schedule rows whose icsDownloaded
+   * flag is false (or who lost their downloaded file). Sets the flag
+   * after a successful download so the badge flips to "Reminders set".
+   *
+   * Pulled out into a callback so it can be passed cleanly down through
+   * ListView / WeekView / MonthView without each of them needing to
+   * know about the .ics shape.
+   */
+  function handleAddItemToCalendar(item: ScheduleItem) {
+    const [y, m, d] = item.date.split('-').map(Number);
+    const [hh, mm] = (item.startTime ?? '09:00').split(':').map(Number);
+    const start = new Date(y, m - 1, d, hh, mm);
+    let end: Date | undefined;
+    if (item.endTime) {
+      const [eh, em] = item.endTime.split(':').map(Number);
+      end = new Date(y, m - 1, d, eh, em);
+    }
+    // Prefer the linked job's location if the schedule item didn't
+    // capture one of its own — same fallback as the post-save flow.
+    const linkedJob = item.jobId ? jobs.find((j) => j.id === item.jobId) : undefined;
+    downloadIcs({
+      uid: `${item.id}@tradepilot`,
+      title: item.title || 'Site visit',
+      start,
+      end,
+      location: linkedJob?.location,
+      description: item.notes,
+    });
+    updateScheduleItem(item.id, { icsDownloaded: true });
   }
 
   const totalUpcoming = upcomingItems.length;
@@ -474,6 +614,7 @@ export default function SchedulePage() {
             jobs={jobs}
             onComplete={handleComplete}
             onEdit={openEdit}
+            onAddToCalendar={handleAddItemToCalendar}
           />
         ) : view === 'week' ? (
           <WeekView
@@ -502,7 +643,73 @@ export default function SchedulePage() {
           <SheetHeader className="pb-4">
             <SheetTitle>Add schedule item</SheetTitle>
           </SheetHeader>
-          <AddScheduleForm jobs={jobs} onSave={handleAdd} onCancel={() => setShowAdd(false)} />
+          <AddScheduleForm
+            jobs={jobs}
+            initialType={initialAddType}
+            onSave={(items) => {
+              // Clear the deep-link state after first use so closing+reopening
+              // the sheet doesn't keep re-applying the same pre-selection.
+              setInitialAddType(undefined);
+              handleAdd(items);
+            }}
+            onCancel={() => {
+              setInitialAddType(undefined);
+              setShowAdd(false);
+            }}
+          />
+        </SheetContent>
+      </Sheet>
+
+      {/* Post-save calendar-invite prompt. Only shows for quote_visit items
+          so we don't pester the user about every reminder/booking they add.
+          The two-button row (Skip / Add to calendar) is deliberate — the
+          calendar invite is the better default but not the only option,
+          and we want Skip to be one tap away if the user's already on top
+          of their reminders some other way. */}
+      <Sheet
+        open={savedQuoteVisit !== null}
+        onOpenChange={(open) => { if (!open) setSavedQuoteVisit(null); }}
+      >
+        <SheetContent side="bottom" className="rounded-t-2xl">
+          <SheetHeader className="pb-2">
+            <SheetTitle>Site visit added</SheetTitle>
+          </SheetHeader>
+          <div className="space-y-4 pb-4">
+            <p className="text-sm text-muted-foreground">
+              Add this to your phone's calendar to get a reminder
+              <span className="font-medium text-foreground"> the night before </span>
+              and
+              <span className="font-medium text-foreground"> 1 hour before</span>.
+            </p>
+            {savedQuoteVisit && (
+              <div className="rounded-xl bg-muted/40 border border-border px-3 py-2.5 text-sm space-y-0.5">
+                <p className="font-medium text-foreground">{savedQuoteVisit.title}</p>
+                <p className="text-muted-foreground text-xs">
+                  {savedQuoteVisit.date}
+                  {savedQuoteVisit.startTime && ` · ${savedQuoteVisit.startTime}`}
+                  {savedQuoteVisit.endTime && `–${savedQuoteVisit.endTime}`}
+                </p>
+                {savedQuoteVisit.location && (
+                  <p className="text-muted-foreground text-xs">{savedQuoteVisit.location}</p>
+                )}
+              </div>
+            )}
+            <div className="flex gap-2">
+              <Button
+                variant="outline"
+                className="flex-1"
+                onClick={() => setSavedQuoteVisit(null)}
+              >
+                Skip
+              </Button>
+              <Button
+                className="flex-1 bg-primary"
+                onClick={handleDownloadVisitIcs}
+              >
+                <CalendarDays size={16} className="mr-1.5" /> Add to calendar
+              </Button>
+            </div>
+          </div>
         </SheetContent>
       </Sheet>
 
@@ -555,12 +762,16 @@ function ListView({
   jobs,
   onComplete,
   onEdit,
+  onAddToCalendar,
 }: {
   runs: ItemRun[];
   completedRuns: ItemRun[];
   jobs: Job[];
   onComplete: (run: ItemRun) => void;
   onEdit: (items: ScheduleItem[]) => void;
+  /** Re-trigger the .ics download for a single schedule item. Optional;
+   * when omitted the badge on quote_visit rows still renders but is inert. */
+  onAddToCalendar?: (item: ScheduleItem) => void;
 }) {
   // Group runs by their start-date label (Today / Tomorrow / weekday / date).
   const grouped: Record<string, ItemRun[]> = {};
@@ -599,6 +810,7 @@ function ListView({
                 job={run.head.jobId ? jobs.find((j) => j.id === run.head.jobId) : undefined}
                 onComplete={() => onComplete(run)}
                 onEdit={() => onEdit(run.items)}
+                onAddToCalendar={onAddToCalendar ? () => onAddToCalendar(run.head) : undefined}
               />
             ))}
           </div>
@@ -616,6 +828,8 @@ function ListView({
                 job={run.head.jobId ? jobs.find((j) => j.id === run.head.jobId) : undefined}
                 onComplete={() => {}}
                 onEdit={() => onEdit(run.items)}
+                // No onAddToCalendar for completed items — no point setting
+                // a reminder for something that's already happened.
               />
             ))}
           </div>
@@ -630,11 +844,20 @@ function RunCard({
   job,
   onComplete,
   onEdit,
+  onAddToCalendar,
 }: {
   run: ItemRun;
   job?: { name: string } | undefined;
   onComplete: () => void;
   onEdit?: () => void;
+  /**
+   * Triggered when the user taps "Add to calendar" on a quote_visit row
+   * that hasn't had its .ics downloaded yet. Optional — the badge only
+   * renders for quote_visit items, and only as a tappable chip when this
+   * prop is provided AND the row's icsDownloaded is false. Otherwise
+   * (or when icsDownloaded is true) the badge is read-only.
+   */
+  onAddToCalendar?: () => void;
 }) {
   const config = TYPE_CONFIG[run.head.type];
   const Icon = config.icon;
@@ -694,6 +917,40 @@ function RunCard({
           {job && <span className="text-xs text-muted-foreground truncate">{job.name}</span>}
           {overdue && <span className="text-xs font-medium text-red-500">Overdue</span>}
         </div>
+
+        {/* Reminders badge — only for quote_visit rows. Two states:
+            (a) icsDownloaded=true → muted "Reminders set" badge, read-only.
+            (b) icsDownloaded=false → primary-tinted chip, tappable to
+                re-trigger download. Stop propagation so the tap doesn't
+                also open the edit sheet (whole card is clickable). */}
+        {run.head.type === 'quote_visit' && (
+          run.head.icsDownloaded ? (
+            <div className="mt-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-emerald-50 text-[10px] font-medium text-emerald-700">
+              <Bell size={10} strokeWidth={2.2} />
+              Reminders: night before · 1hr before
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onAddToCalendar?.();
+              }}
+              disabled={!onAddToCalendar}
+              className={cn(
+                'mt-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium',
+                onAddToCalendar
+                  ? 'bg-blue-50 text-blue-700 hover:bg-blue-100'
+                  : 'bg-muted text-muted-foreground',
+              )}
+              title="Download a calendar invite so your phone reminds you the night before and 1 hour before"
+            >
+              <CalendarDays size={10} strokeWidth={2.2} />
+              Add to calendar
+            </button>
+          )
+        )}
+
         {run.head.notes && (
           <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{run.head.notes}</p>
         )}
@@ -1442,14 +1699,21 @@ const SCHEDULE_TYPES: { value: ScheduleItemType; label: string }[] = [
 
 function AddScheduleForm({
   jobs,
+  initialType,
   onSave,
   onCancel,
 }: {
   jobs: Job[];
+  /**
+   * Optional pre-selected schedule type. When set, the form opens with
+   * this type already selected. Used by the ?quickAdd= deep link from
+   * the Entry page's "Schedule a site visit" tile.
+   */
+  initialType?: ScheduleItemType;
   onSave: (items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) => void;
   onCancel: () => void;
 }) {
-  const [type, setType] = useState<ScheduleItemType>('job_booking');
+  const [type, setType] = useState<ScheduleItemType>(initialType ?? 'job_booking');
   const [title, setTitle] = useState('');
   const today = new Date().toISOString().split('T')[0];
   const [date, setDate] = useState(today);

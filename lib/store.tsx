@@ -1590,7 +1590,17 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const row = scheduleItemToRow(updates);
       const { error: updErr } = await supabase.from('schedule_items').update(row).eq('id', id);
       if (updErr) {
-        console.error('[store] updateScheduleItem failed:', updErr);
+        // Supabase/PostgREST error objects have non-enumerable properties,
+        // so logging `updErr` directly prints "{}". Spread the useful fields
+        // so the dev console shows something diagnosable (typically "column
+        // X does not exist" when a migration hasn't been applied).
+        console.error('[store] updateScheduleItem failed:', {
+          message: updErr.message,
+          code: updErr.code,
+          details: updErr.details,
+          hint: updErr.hint,
+          payload: row,
+        });
         setError(updErr.message);
         if (prevItem) {
           setScheduleItems((prev) => prev.map((s) => (s.id === id ? prevItem! : s)));

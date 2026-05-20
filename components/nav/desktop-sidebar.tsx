@@ -2,13 +2,18 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Settings, Hammer, ListChecks } from 'lucide-react';
+import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Settings, Hammer, ListChecks, Sparkles } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
+// Leads sits between Entry and Jobs — the natural flow is Entry (log
+// an enquiry) → Leads (chase the open ones) → Jobs (work the booked
+// ones). Sparkles icon reads as "opportunity" without competing with
+// Briefcase (Jobs) or PenLine (Entry).
 const NAV_ITEMS = [
   { href: '/home', label: 'Home', icon: Home },
   { href: '/entry', label: 'Entry', icon: PenLine },
   { href: '/entries', label: 'All entries', icon: ListChecks },
+  { href: '/leads', label: 'Leads', icon: Sparkles },
   { href: '/jobs', label: 'Jobs', icon: Briefcase },
   { href: '/money', label: 'Money', icon: DollarSign },
   { href: '/schedule', label: 'Schedule', icon: CalendarDays },

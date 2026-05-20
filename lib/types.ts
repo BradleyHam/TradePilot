@@ -152,6 +152,16 @@ export interface Job {
   startDate?: string;
   endDate?: string;
   followUpDate?: string;
+  /**
+   * Last time Brad actively touched this lead/client — sent a message,
+   * picked up the phone, sent the quote, replied to a question. Used by
+   * the Leads chase-list to surface stale leads ("9 days since you last
+   * heard from Sarah"). Bumped by the "Mark contacted" button on the
+   * leads page and auto-set when a quote is sent. Null on legacy rows
+   * and on rows that have never been touched since creation — the UI
+   * falls back to createdAt in that case so the badge still reads sensibly.
+   */
+  lastContactedDate?: string;
   notes?: string;
   /** How the lead came in. Null for legacy/imported rows. */
   source?: LeadSource;
@@ -500,6 +510,20 @@ export interface ScheduleItem {
   endTime?: string;
   notes?: string;
   completed: boolean;
+  /**
+   * True once the user has downloaded the .ics calendar invite for this
+   * item. Only meaningful for type='quote_visit' rows today — drives the
+   * "Reminders set" vs "Add to calendar" badge on the Schedule page so
+   * Brad can see at a glance which site visits actually have phone
+   * reminders attached vs which were skipped.
+   *
+   * Note: this is a "best guess" signal — it tells us the file was
+   * downloaded, NOT that the user actually imported it into their
+   * calendar app. There's no way to confirm the latter from a browser.
+   * The badge wording reflects this honestly ("Reminders set" assumes
+   * the obvious next step happened; we don't claim "Reminders active").
+   */
+  icsDownloaded?: boolean;
   createdAt: string;
 }
 

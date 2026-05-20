@@ -314,10 +314,13 @@ function EditForm({
     for (const it of sorted) deleteScheduleItem(it.id);
 
     const dates = supportsRange ? previewDates : [startDate];
-    const baseTs = Date.now();
     dates.forEach((d, i) => {
       addScheduleItem({
-        id: `sch_${baseTs}_${i}`,
+        // Real uuid client-side — schedule_items.id is a uuid column in
+        // Supabase. Using "sch_<ts>" string ids would race against the
+        // post-insert id-swap if any code tries to update the row before
+        // the insert response lands. See schedule/page.tsx handleAdd.
+        id: crypto.randomUUID(),
         businessId,
         createdAt: new Date().toISOString(),
         type: first.type,

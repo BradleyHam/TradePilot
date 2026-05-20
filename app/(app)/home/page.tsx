@@ -343,13 +343,17 @@ function TodaySection({
   );
 }
 
-const SCHEDULE_TYPE_META: Record<string, { color: string; bg: string; icon: React.ElementType }> = {
-  job_booking: { color: 'text-orange-600', bg: 'bg-orange-50', icon: Briefcase },
-  quote_visit: { color: 'text-blue-600',   bg: 'bg-blue-50',   icon: FileText },
-  follow_up:   { color: 'text-violet-600', bg: 'bg-violet-50', icon: Bell },
-  bill_due:    { color: 'text-red-600',    bg: 'bg-red-50',    icon: AlertCircle },
-  invoice_due: { color: 'text-amber-600',  bg: 'bg-amber-50',  icon: Receipt },
-  reminder:    { color: 'text-slate-600',  bg: 'bg-slate-50',  icon: Bell },
+const SCHEDULE_TYPE_META: Record<string, { color: string; bg: string; icon: React.ElementType; label: string }> = {
+  // `label` is the short human-readable name surfaced as a chip on Home
+  // rows. The icon alone isn't enough on a phone — "what kind of thing
+  // is this?" should be readable at a glance without squinting. Keep
+  // each label ≤14 chars so a chip never wraps on narrow viewports.
+  job_booking: { color: 'text-orange-600', bg: 'bg-orange-50', icon: Briefcase,   label: 'Job day' },
+  quote_visit: { color: 'text-blue-600',   bg: 'bg-blue-50',   icon: FileText,    label: 'Quote visit' },
+  follow_up:   { color: 'text-violet-600', bg: 'bg-violet-50', icon: Bell,        label: 'Follow-up' },
+  bill_due:    { color: 'text-red-600',    bg: 'bg-red-50',    icon: AlertCircle, label: 'Bill due' },
+  invoice_due: { color: 'text-amber-600',  bg: 'bg-amber-50',  icon: Receipt,     label: 'Invoice due' },
+  reminder:    { color: 'text-slate-600',  bg: 'bg-slate-50',  icon: Bell,        label: 'Reminder' },
 };
 
 function TodayRow({
@@ -413,9 +417,18 @@ function TodayRow({
             )}>
               {item.title}
             </p>
-            <p className="text-xs text-muted-foreground mt-0.5 truncate">
-              {overdue && <span className="text-red-600 font-medium">Overdue · </span>}
-              {item.startTime && <span>{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
+            <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5 flex-wrap">
+              {/* Type chip — leads the meta row so "what is this?" lands
+                  before time/overdue context. Colour matches the icon so
+                  the row reads as a single coherent unit. */}
+              <span className={cn(
+                'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide',
+                meta.bg, meta.color,
+              )}>
+                {meta.label}
+              </span>
+              {overdue && <span className="text-red-600 font-medium">Overdue</span>}
+              {item.startTime && <span className="truncate">{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
               {!item.startTime && !overdue && <span>Today</span>}
             </p>
           </div>
@@ -1765,9 +1778,18 @@ function ComingUpRow({ item, todayISO }: { item: ScheduleItem; todayISO: string 
       </div>
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium text-foreground truncate">{item.title}</p>
-        <p className="text-xs text-muted-foreground mt-0.5 truncate">
-          {dateLabel}
-          {item.startTime && <span> · {item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
+        <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5 flex-wrap">
+          {/* Same type chip as TodayRow — keeps the two sections visually
+              consistent so the eye learns the labels once, then reads
+              the rest of the row faster. */}
+          <span className={cn(
+            'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide',
+            meta.bg, meta.color,
+          )}>
+            {meta.label}
+          </span>
+          <span>{dateLabel}</span>
+          {item.startTime && <span>· {item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
         </p>
       </div>
     </li>

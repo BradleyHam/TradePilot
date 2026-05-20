@@ -142,10 +142,12 @@ export function BookedDates({ job }: BookedDatesProps) {
 
               // Create one schedule_item per day in the new range.
               const days = datesBetween(form.startDate, form.endDate || form.startDate);
-              const baseTs = Date.now();
               days.forEach((d, i) => {
                 addScheduleItem({
-                  id: `sch_${baseTs}_${i}`,
+                  // uuid from the start — schedule_items.id is a uuid
+                  // column in Supabase. See schedule/page.tsx handleAdd
+                  // for the longer rationale.
+                  id: crypto.randomUUID(),
                   businessId,
                   createdAt: new Date().toISOString(),
                   type: 'job_booking',

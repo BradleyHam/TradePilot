@@ -24,6 +24,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   Receipt, DollarSign, Clock, MessageSquare, FileText, AlertCircle, StickyNote,
   Sparkles, ChevronDown, CheckCircle2, Hammer, ChevronRight, Landmark,
+  CalendarPlus,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -131,6 +132,27 @@ export default function EntryPage() {
                 </button>
               ))}
             </div>
+
+            {/* Site visit tile — separate row because it's structurally
+                different from the other tiles (it creates a schedule
+                item, not an entry). The deep-link uses a query param so
+                the schedule page can auto-open its add form pre-set to
+                quote_visit, sparing the user an extra tap. */}
+            <Link
+              href="/schedule?quickAdd=quote_visit"
+              className="flex items-center gap-3 p-4 rounded-2xl bg-card border border-border hover:border-primary/40 hover:bg-accent transition-colors min-h-[64px] active:scale-[0.98]"
+            >
+              <div className="w-9 h-9 rounded-xl bg-blue-50 flex items-center justify-center shrink-0">
+                <CalendarPlus size={18} className="text-blue-600" strokeWidth={1.8} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-medium text-foreground">Schedule a site visit</p>
+                <p className="text-xs text-muted-foreground">
+                  Get reminders the night before and 1 hour before
+                </p>
+              </div>
+              <ChevronRight size={16} className="text-muted-foreground shrink-0" />
+            </Link>
           </div>
         )}
 

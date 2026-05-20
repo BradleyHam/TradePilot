@@ -46,6 +46,7 @@ export function rowToJob(r: Row): Job {
     startDate: asString(r.start_date),
     endDate: asString(r.end_date),
     followUpDate: asString(r.follow_up_date),
+    lastContactedDate: asString(r.last_contacted_date),
     notes: asString(r.notes),
     source: (asString(r.source) as LeadSource | undefined),
     workType: (asString(r.work_type) as WorkType | undefined),
@@ -76,6 +77,7 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.startDate !== undefined) out.start_date = j.startDate;
   if (j.endDate !== undefined) out.end_date = j.endDate;
   if (j.followUpDate !== undefined) out.follow_up_date = j.followUpDate;
+  if (j.lastContactedDate !== undefined) out.last_contacted_date = j.lastContactedDate || null;
   if (j.notes !== undefined) out.notes = j.notes;
   if (j.source !== undefined) out.source = j.source || null;
   if (j.workType !== undefined) out.work_type = j.workType || null;
@@ -169,6 +171,7 @@ export function rowToScheduleItem(r: Row): ScheduleItem {
     endTime: asString(r.end_time),
     notes: asString(r.notes),
     completed: asBool(r.completed, false),
+    icsDownloaded: asBool(r.ics_downloaded, false),
     createdAt: r.created_at as string,
   };
 }
@@ -184,6 +187,7 @@ export function scheduleItemToRow(s: Partial<ScheduleItem>): Row {
   if (s.endTime !== undefined) out.end_time = s.endTime || null;
   if (s.notes !== undefined) out.notes = s.notes || null;
   if (s.completed !== undefined) out.completed = s.completed;
+  if (s.icsDownloaded !== undefined) out.ics_downloaded = s.icsDownloaded;
   return out;
 }
 
