@@ -689,9 +689,9 @@ function SplitForm({
                 <option value="__OH__">Overhead (no job)</option>
                 {rankedJobs.length > 0 && (
                   <optgroup label="Jobs">
-                    {rankedJobs.map((j) => (
-                      <option key={j.id} value={j.id}>
-                        {j.name} {j.clientName ? `· ${j.clientName}` : ''}
+                    {rankedJobs.map((r) => (
+                      <option key={r.job.id} value={r.job.id}>
+                        {r.job.name} {r.job.clientName ? `· ${r.job.clientName}` : ''}
                       </option>
                     ))}
                   </optgroup>

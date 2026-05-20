@@ -193,7 +193,7 @@ export default function EntryPage() {
 function BankReconcileSection() {
   const {
     bankTransactions, entries, jobs,
-    updateBankTransaction, reconcileToEntry, reconcileAsNewEntry,
+    updateBankTransaction, reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
   } = useStore();
 
   const pending = useMemo(
@@ -246,6 +246,7 @@ function BankReconcileSection() {
               jobs={jobs}
               onLinkToEntry={(entryId) => reconcileToEntry(txn.id, entryId)}
               onCreateEntry={(entry) => reconcileAsNewEntry(txn.id, entry)}
+              onSplitEntries={(rows) => reconcileAsSplitEntries(txn.id, rows)}
               onIgnore={() => updateBankTransaction(txn.id, { status: 'ignored' })}
               onMarkPersonal={() => updateBankTransaction(txn.id, { status: 'personal' })}
             />
