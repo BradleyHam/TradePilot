@@ -2,7 +2,7 @@
 
 import { Job, LeadSource } from '@/lib/types';
 import { StatusBadge } from './status-badge';
-import { MapPin, User, Globe, Mail, Phone, UserPlus } from 'lucide-react';
+import { MapPin, User, Globe, Mail, Phone, UserPlus, Search } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 interface JobCardProps {
@@ -96,6 +96,7 @@ function SourcePill({ source }: { source: LeadSource }) {
     email:    { label: 'Email',    Icon: Mail     },
     phone:    { label: 'Phone',    Icon: Phone    },
     referral: { label: 'Referral', Icon: UserPlus },
+    gmb:      { label: 'Google',   Icon: Search   },
     manual:   null,
   };
   const cfg = config[source];

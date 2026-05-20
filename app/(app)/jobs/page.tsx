@@ -65,22 +65,38 @@ function earliestFutureScheduleDate(
  * attached, treat it as coming up regardless of status (catches the
  * "I forgot to flip status to booked after scheduling it" case).
  *
+ *   - in-progress        : never (it's on the job already — In progress
+ *     chip is the right home). Coming up and In progress are meant to be
+ *     mutually exclusive per AGENTS.md.
+ *   - completed/invoiced/paid/lost : never (terminal — own chips).
  *   - accepted / booked  : always in (committed work).
- *   - anything else      : in only if it has a future schedule item.
- *   - lead / quoted with no future schedule item : OUT (use Leads /
- *     Quoted chips to see those).
+ *   - lead / quoted      : in only if a future schedule item exists.
  */
 function comingUpQualifies(
   job: Job,
   scheduleItems: ScheduleItem[],
   todayISO: string,
 ): boolean {
+  // Hard excludes: in-progress lives on the In progress chip; terminal
+  // statuses live on their own chips. Letting any of these leak in via
+  // the schedule override breaks the mutual-exclusivity rule and shows
+  // jobs in two places at once.
+  if (
+    job.status === 'in-progress'
+    || job.status === 'completed'
+    || job.status === 'invoiced'
+    || job.status === 'paid'
+    || job.status === 'lost'
+  ) {
+    return false;
+  }
+
   // Committed statuses: always in.
   if (job.status === 'accepted' || job.status === 'booked') return true;
 
-  // Schedule reality override: a future schedule item means this job
-  // is genuinely coming up, even if its status hasn't caught up yet.
-  // Catches Troy-style cases where the calendar knows about July but
+  // Schedule reality override (lead/quoted only): a future schedule item
+  // means this job is genuinely coming up, even if its status hasn't caught
+  // up yet. Catches Troy-style cases where the calendar knows about July but
   // the Job row still says 'quoted'.
   if (earliestFutureScheduleDate(job.id, scheduleItems, todayISO)) return true;
 

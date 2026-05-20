@@ -112,16 +112,10 @@ export default function EntryPage() {
           </div>
         )}
 
-        {/* Bank reconcile — drop a CSV anywhere on this card to import.
-            Same flow as the dedicated /reconcile page but inline so Brad
-            doesn't have to navigate away from Entry to clear the queue. */}
-        <BankReconcileSection />
-
-        {/* Supplier bill PDF upload — text-extract + LLM parse, lands as
-            a draft on Home for confirmation. See components/entry/bill-pdf-upload. */}
-        <BillPdfUploadCard />
-
-        {/* Quick type grid */}
+        {/* Quick type grid — kept at the top so logging a thing (the primary
+            reason Brad is on this page) is the first thing in reach. The
+            reconcile + bill-PDF sections sit below since they're optional
+            housekeeping, not the main action. */}
         {!showForm && (
           <div className="space-y-3">
             <p className="text-sm text-muted-foreground">What do you want to log?</p>
@@ -150,6 +144,15 @@ export default function EntryPage() {
             />
           </div>
         )}
+
+        {/* Bank reconcile — drop a CSV anywhere on this card to import.
+            Same flow as the dedicated /reconcile page but inline so Brad
+            doesn't have to navigate away from Entry to clear the queue. */}
+        <BankReconcileSection />
+
+        {/* Supplier bill PDF upload — text-extract + LLM parse, lands as
+            a draft on Home for confirmation. See components/entry/bill-pdf-upload. */}
+        <BillPdfUploadCard />
 
         {/* Recent entries */}
         <RecentEntries />
