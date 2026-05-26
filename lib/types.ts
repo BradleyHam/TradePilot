@@ -44,6 +44,42 @@ export type ActivityType =
   | 'quoting'
   | 'admin';
 
+/**
+ * Who did the work for a logged-hours entry. Drives the blended-target
+ * hourly rate on the job's gauge — each tier has its own target rate
+ * pulled from the per-business settings table (worker_rate_owner,
+ * worker_rate_helper, etc).
+ *
+ * - `owner`        — Brad himself. Default for all logged hours. The
+ *                    fully-loaded PD rate sits here (~$90/hr 2026).
+ * - `experienced`  — Trade-qualified second pair of hands. Subbie or
+ *                    casual painter at full rate.
+ * - `apprentice`   — 2nd-year+ with some skill, supervised. Lower target
+ *                    because productivity is lower while learning.
+ * - `helper`       — Inexperienced labourer. Prep, sanding, masking,
+ *                    cleanup. Brad's partner Sophie sits here.
+ * - `subcontractor`— Paid per-job, not per-hour, but we still log time
+ *                    so the job's hours math is honest. Charge-out rate
+ *                    typically 60-70% of owner rate.
+ */
+export type WorkerKind =
+  | 'owner'
+  | 'experienced'
+  | 'apprentice'
+  | 'helper'
+  | 'subcontractor';
+
+/** Settings keys for the per-tier target hourly rates. Stored as strings
+ *  in `settings.value`, parsed at read-time. PD-anchored defaults live
+ *  in `lib/worker-rates.ts`. */
+export const WORKER_RATE_SETTING_KEYS: Record<WorkerKind, string> = {
+  owner:         'worker_rate_owner',
+  experienced:   'worker_rate_experienced',
+  apprentice:    'worker_rate_apprentice',
+  helper:        'worker_rate_helper',
+  subcontractor: 'worker_rate_subcontractor',
+};
+
 export type QuoteStatus =
   | 'draft'
   | 'sent'
@@ -180,6 +216,24 @@ export interface Entry {
   amount?: number;
   hours?: number;
   activity?: ActivityType;
+  /**
+   * Who did the work. Only meaningful for `type === 'hours'`. Defaults
+   * to 'owner' (Brad solo) on the entry form. Drives the blended-target
+   * gauge on the job's hourly-rate chart.
+   */
+  workerKind?: WorkerKind;
+  /**
+   * Additional hours from a HELPER on this same shift, captured as a
+   * convenience when Brad logs his own hours. Saves logging two
+   * separate entries when he + Sophie do the same 6h together (he logs
+   * `hours: 6, workerKind: 'owner', helperHours: 6`). The helper-hours
+   * portion is priced at the `worker_rate_helper` target rate.
+   *
+   * For more complex multi-worker setups (apprentice + helper + Brad
+   * all different hours), log each as a separate entry with its own
+   * workerKind.
+   */
+  helperHours?: number;
   supplier?: string;
   paymentMethod?: string;
   gstApplies: boolean;
@@ -349,6 +403,23 @@ export interface Quote {
   clientSignals?: Record<string, unknown>;
   /** Folder path the project importer pulled this row from. */
   importSourcePath?: string;
+  /**
+   * Per-zone structured scope used by the cost engine. Richer than the
+   * legacy `surfaceAreaM2ByZone` map (which only knows m² per labelled
+   * zone) — each entry here also carries surface type, work kind,
+   * prep level, and the measurement unit (m² / LM / count).
+   *
+   * Shape mirrors `ScopeZone` in `lib/pricing/cost-engine.ts`. Kept as
+   * `unknown[]` here to avoid a circular import between types and the
+   * pricing module; cost-engine.ts re-exports the typed shape.
+   */
+  scopeZones?: unknown[];
+  /** What a competing painter quoted for the same job, if known. ex-GST. */
+  competitorPriceExGst?: number;
+  /** When the outcome (won/lost/ghosted) was decided. */
+  outcomeDate?: string;
+  /** Free-form reason text — supersedes the legacy enums. */
+  outcomeReason?: string;
   createdAt: string;
   updatedAt: string;
 }

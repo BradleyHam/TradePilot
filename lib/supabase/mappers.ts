@@ -98,6 +98,8 @@ export function rowToEntry(r: Row): Entry {
     amount: asNumber(r.amount),
     hours: asNumber(r.hours),
     activity: (asString(r.activity) as ActivityType | undefined),
+    workerKind: asString(r.worker_kind) as Entry['workerKind'],
+    helperHours: asNumber(r.helper_hours),
     supplier: asString(r.supplier),
     paymentMethod: asString(r.payment_method),
     gstApplies: asBool(r.gst_applies, true),
@@ -132,6 +134,8 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.amount !== undefined) out.amount = e.amount ?? null;
   if (e.hours !== undefined) out.hours = e.hours ?? null;
   if (e.activity !== undefined) out.activity = e.activity || null;
+  if (e.workerKind !== undefined) out.worker_kind = e.workerKind || null;
+  if (e.helperHours !== undefined) out.helper_hours = e.helperHours ?? null;
   if (e.supplier !== undefined) out.supplier = e.supplier || null;
   if (e.paymentMethod !== undefined) out.payment_method = e.paymentMethod || null;
   if (e.gstApplies !== undefined) out.gst_applies = e.gstApplies;
@@ -264,6 +268,10 @@ export function rowToQuote(r: Row): Quote {
     surfaceType: asString(r.surface_type),
     clientSignals: (r.client_signals as Record<string, unknown> | null) ?? undefined,
     importSourcePath: asString(r.import_source_path),
+    scopeZones: (r.scope_zones as unknown[] | null) ?? undefined,
+    competitorPriceExGst: asNumber(r.competitor_price_ex_gst),
+    outcomeDate: asString(r.outcome_date),
+    outcomeReason: asString(r.outcome_reason),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };
@@ -293,6 +301,10 @@ export function quoteToRow(q: Partial<Quote>): Row {
   if (q.surfaceType !== undefined) out.surface_type = q.surfaceType || null;
   if (q.clientSignals !== undefined) out.client_signals = q.clientSignals ?? null;
   if (q.importSourcePath !== undefined) out.import_source_path = q.importSourcePath || null;
+  if (q.scopeZones !== undefined) out.scope_zones = q.scopeZones ?? null;
+  if (q.competitorPriceExGst !== undefined) out.competitor_price_ex_gst = q.competitorPriceExGst ?? null;
+  if (q.outcomeDate !== undefined) out.outcome_date = q.outcomeDate || null;
+  if (q.outcomeReason !== undefined) out.outcome_reason = q.outcomeReason || null;
   return out;
 }
 

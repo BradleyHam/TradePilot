@@ -414,9 +414,13 @@ function TodayRow({
               {item.title}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5 truncate">
-              {overdue && <span className="text-red-600 font-medium">Overdue · </span>}
-              {item.startTime && <span>{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
-              {!item.startTime && !overdue && <span>Today</span>}
+              {overdue && (
+                <span className="text-red-600 font-medium">
+                  Overdue · {fmtDueDate(item.date)}
+                </span>
+              )}
+              {!overdue && item.startTime && <span>{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
+              {!overdue && !item.startTime && <span>Today</span>}
             </p>
           </div>
         </div>

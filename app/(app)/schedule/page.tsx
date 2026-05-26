@@ -1,6 +1,6 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useEffect, useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import { Job, ScheduleItem, ScheduleItemType, Entry } from '@/lib/types';
 import { rankJobs } from '@/lib/job-match';
@@ -299,7 +299,7 @@ function dateGroup(dateStr: string): string {
 export default function SchedulePage() {
   const {
     scheduleItems, jobs, entries,
-    addScheduleItem, updateScheduleItem, updateEntry, deleteEntry,
+    addScheduleItem, updateScheduleItem, addEntry, updateEntry, deleteEntry,
     businessId,
   } = useStore();
 
@@ -397,6 +397,33 @@ export default function SchedulePage() {
     setShowAdd(false);
   }
 
+  // Used by the month view's day-detail sheet when the user logs hours
+  // directly against a tapped past/today date. Mirrors the entry page's
+  // handleFormSave so the entry shape stays consistent across the app.
+  function handleAddEntry(data: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) {
+    addEntry({
+      id: `ent_${Date.now()}`,
+      businessId: businessId ?? '',
+      createdAt: new Date().toISOString(),
+      ...data,
+    });
+  }
+
+  // Used by the month view's day-detail sheet when the user schedules work
+  // directly from a tapped future/today date. Wraps the same handleAdd
+  // logic but doesn't close the parent's "Add" sheet (it was never opened).
+  function handleScheduleFromDay(items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) {
+    const baseTs = Date.now();
+    items.forEach((data, i) => {
+      addScheduleItem({
+        id: `sch_${baseTs}_${i}`,
+        businessId: businessId ?? '',
+        createdAt: new Date().toISOString(),
+        ...data,
+      });
+    });
+  }
+
   const totalUpcoming = upcomingItems.length;
 
   return (
@@ -492,6 +519,8 @@ export default function SchedulePage() {
             onComplete={handleComplete}
             onEditHours={(id) => setEditingHoursId(id)}
             onEdit={openEdit}
+            onLogHours={handleAddEntry}
+            onScheduleItems={handleScheduleFromDay}
           />
         )}
       </div>
@@ -1036,6 +1065,8 @@ function MonthView({
   onComplete,
   onEditHours,
   onEdit,
+  onLogHours,
+  onScheduleItems,
 }: {
   items: ScheduleItem[];
   jobs: Job[];
@@ -1043,6 +1074,12 @@ function MonthView({
   onComplete: (run: ItemRun) => void;
   onEditHours: (entryId: string) => void;
   onEdit: (items: ScheduleItem[]) => void;
+  /** Called when the user logs hours inline from the day-detail sheet
+   *  (only offered for past/today dates). */
+  onLogHours: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) => void;
+  /** Called when the user schedules work inline from the day-detail sheet
+   *  (only offered for today/future dates). */
+  onScheduleItems: (items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) => void;
 }) {
   // Same item→run lookup as WeekView: when the user taps an item in the
   // day-detail sheet we open the *whole run* in the editor, not just the
@@ -1055,6 +1092,10 @@ function MonthView({
   }, [allRuns]);
   const [anchor, setAnchor] = useState(() => new Date());
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
+  // Which inline action panel is open in the day-detail sheet. Reset whenever
+  // the sheet opens on a different day so each day starts collapsed.
+  const [inlineAction, setInlineAction] = useState<'log' | 'schedule' | null>(null);
+  useEffect(() => { setInlineAction(null); }, [selectedDay]);
 
   const monthStart = startOfMonth(anchor);
   const monthEnd = endOfMonth(anchor);
@@ -1254,80 +1295,157 @@ function MonthView({
 
       {/* Day detail sheet — opens when a day is tapped. */}
       <Sheet open={!!selectedDay} onOpenChange={(open) => !open && setSelectedDay(null)}>
-        <SheetContent side="bottom" className="h-[60vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
+        <SheetContent side="bottom" className="h-[80vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
           <SheetHeader className="pb-4">
             <SheetTitle>
               {selectedDay && format(parseISODate(selectedDay), 'EEEE, d MMMM yyyy')}
             </SheetTitle>
           </SheetHeader>
-          {dayItems.length === 0 && dayHours.length === 0 ? (
-            <div className="text-sm text-muted-foreground text-center py-8">
-              Nothing scheduled on this day.
-            </div>
-          ) : (
-            <div className="space-y-4">
-              {dayItems.length > 0 && (
-                <div>
-                  <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
-                    Scheduled
-                  </h4>
-                  <div className="space-y-2">
-                    {dayItems.map((it) => {
-                      const job = it.jobId ? jobs.find((j) => j.id === it.jobId) : undefined;
-                      // Render as a single-day RunCard for consistency.
-                      return (
-                        <RunCard
-                          key={it.id}
-                          run={{
-                            head: it, items: [it], startDate: it.date, endDate: it.date,
-                            days: 1, allCompleted: it.completed,
-                          }}
-                          job={job}
-                          onComplete={() => onComplete({
-                            head: it, items: [it], startDate: it.date, endDate: it.date,
-                            days: 1, allCompleted: it.completed,
-                          })}
-                          onEdit={() => {
-                            // Close the day-detail sheet before opening the
-                            // editor so we never have two sheets stacked.
-                            const run = runByItemId.get(it.id);
-                            setSelectedDay(null);
-                            onEdit(run ? run.items : [it]);
-                          }}
-                        />
-                      );
-                    })}
+          {(() => {
+            if (!selectedDay) return null;
+            // Past = log hours; future = schedule; today = both. We compare
+            // ISO strings (YYYY-MM-DD) so timezone never enters the picture.
+            const todayISO = formatISODate(new Date());
+            const isPastOrToday = selectedDay <= todayISO;
+            const isTodayOrFuture = selectedDay >= todayISO;
+            const isEmpty = dayItems.length === 0 && dayHours.length === 0;
+
+            return (
+              <div className="space-y-4">
+                {/* ── Inline actions ─────────────────────────────────────── */}
+                {/* Past/today → Log hours. Today/future → Schedule a job.
+                    On 'today' both render so the user can flip between
+                    planning the afternoon and logging the morning. */}
+                {inlineAction === null && (
+                  <div className="flex flex-wrap gap-2">
+                    {isPastOrToday && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setInlineAction('log')}
+                        className="h-9"
+                      >
+                        <Clock size={14} className="mr-1.5" />
+                        Log hours
+                      </Button>
+                    )}
+                    {isTodayOrFuture && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setInlineAction('schedule')}
+                        className="h-9"
+                      >
+                        <Plus size={14} className="mr-1.5" />
+                        Schedule a job
+                      </Button>
+                    )}
                   </div>
-                </div>
-              )}
-              {dayHours.length > 0 && (
-                <div>
-                  <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2 flex items-center gap-1.5">
-                    <Clock size={12} className="text-emerald-600" strokeWidth={2.5} />
-                    Hours logged · {dayHoursTotal}h total
-                  </h4>
-                  <div className="space-y-2">
-                    {dayHours.map((e) => {
-                      const job = e.jobId ? jobs.find((j) => j.id === e.jobId) : undefined;
-                      // Close the day-detail sheet before opening the edit
-                      // sheet so we never have two modal sheets stacked.
-                      return (
-                        <HoursLogCard
-                          key={e.id}
-                          entry={e}
-                          job={job}
-                          onClick={() => {
-                            setSelectedDay(null);
-                            onEditHours(e.id);
-                          }}
-                        />
-                      );
-                    })}
+                )}
+
+                {inlineAction === 'log' && (
+                  <div className="bg-muted/30 border border-border rounded-2xl p-3">
+                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                      Log hours
+                    </div>
+                    <EntryForm
+                      defaultType="hours"
+                      defaultValues={{ entryDate: selectedDay }}
+                      onSave={(data) => {
+                        onLogHours(data);
+                        setInlineAction(null);
+                      }}
+                      onCancel={() => setInlineAction(null)}
+                    />
                   </div>
-                </div>
-              )}
-            </div>
-          )}
+                )}
+
+                {inlineAction === 'schedule' && (
+                  <div className="bg-muted/30 border border-border rounded-2xl p-3">
+                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                      Schedule
+                    </div>
+                    <AddScheduleForm
+                      jobs={jobs}
+                      defaultDate={selectedDay}
+                      onSave={(scheduleItems) => {
+                        onScheduleItems(scheduleItems);
+                        setInlineAction(null);
+                      }}
+                      onCancel={() => setInlineAction(null)}
+                    />
+                  </div>
+                )}
+
+                {/* ── Existing day contents ──────────────────────────────── */}
+                {isEmpty && inlineAction === null && (
+                  <div className="text-sm text-muted-foreground text-center py-6">
+                    Nothing scheduled on this day.
+                  </div>
+                )}
+                {dayItems.length > 0 && (
+                  <div>
+                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                      Scheduled
+                    </h4>
+                    <div className="space-y-2">
+                      {dayItems.map((it) => {
+                        const job = it.jobId ? jobs.find((j) => j.id === it.jobId) : undefined;
+                        // Render as a single-day RunCard for consistency.
+                        return (
+                          <RunCard
+                            key={it.id}
+                            run={{
+                              head: it, items: [it], startDate: it.date, endDate: it.date,
+                              days: 1, allCompleted: it.completed,
+                            }}
+                            job={job}
+                            onComplete={() => onComplete({
+                              head: it, items: [it], startDate: it.date, endDate: it.date,
+                              days: 1, allCompleted: it.completed,
+                            })}
+                            onEdit={() => {
+                              // Close the day-detail sheet before opening the
+                              // editor so we never have two sheets stacked.
+                              const run = runByItemId.get(it.id);
+                              setSelectedDay(null);
+                              onEdit(run ? run.items : [it]);
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+                {dayHours.length > 0 && (
+                  <div>
+                    <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2 flex items-center gap-1.5">
+                      <Clock size={12} className="text-emerald-600" strokeWidth={2.5} />
+                      Hours logged · {dayHoursTotal}h total
+                    </h4>
+                    <div className="space-y-2">
+                      {dayHours.map((e) => {
+                        const job = e.jobId ? jobs.find((j) => j.id === e.jobId) : undefined;
+                        // Close the day-detail sheet before opening the edit
+                        // sheet so we never have two modal sheets stacked.
+                        return (
+                          <HoursLogCard
+                            key={e.id}
+                            entry={e}
+                            job={job}
+                            onClick={() => {
+                              setSelectedDay(null);
+                              onEditHours(e.id);
+                            }}
+                          />
+                        );
+                      })}
+                    </div>
+                  </div>
+                )}
+              </div>
+            );
+          })()}
         </SheetContent>
       </Sheet>
     </div>
@@ -1444,15 +1562,19 @@ function AddScheduleForm({
   jobs,
   onSave,
   onCancel,
+  defaultDate,
 }: {
   jobs: Job[];
   onSave: (items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) => void;
   onCancel: () => void;
+  /** Pre-fill the date field. Used when the form is opened from a tapped
+   *  calendar day in the day-detail sheet. */
+  defaultDate?: string;
 }) {
   const [type, setType] = useState<ScheduleItemType>('job_booking');
   const [title, setTitle] = useState('');
   const today = new Date().toISOString().split('T')[0];
-  const [date, setDate] = useState(today);
+  const [date, setDate] = useState(defaultDate ?? today);
   const [endDate, setEndDate] = useState('');
   const [multiDay, setMultiDay] = useState(false);
   const [startTime, setStartTime] = useState('');

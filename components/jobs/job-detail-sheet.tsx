@@ -19,12 +19,14 @@ import { formatEntryDate } from '@/lib/format-date';
 import { JOB_STATUSES } from '@/lib/mock-data';
 import { JobStatus } from '@/lib/types';
 import { jobStats, entryExGst } from '@/lib/job-stats';
+import { hoursByWorker, blendedTargetRate, allWorkerRates, describeMix } from '@/lib/worker-rates';
 import { HourlyRateGauge, IncomeVsExpenses, HoursByActivity } from './job-charts';
 import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
 import { BookedDates } from './booked-dates';
 import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
+import { CostEnginePreview } from './cost-engine-preview';
 
 interface JobDetailSheetProps {
   job: Job | null;
@@ -46,6 +48,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const {
     jobs, entries, invoices, scheduleItems, materials, quotes, quoteAttachments,
     businessId, updateJob, reconcileJobSchedule, deleteJob, addEntry,
+    settings,
   } = useStore();
   const [reconciling, setReconciling] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
@@ -463,17 +466,32 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             <>
               <Separator />
               <div className="space-y-3">
-                <HourlyRateGauge
-                  hourlyRate={expectedHourlyRate}
-                  // "Expected" means the income hasn't fully landed yet —
-                  // either no income at all, or the job is invoiced but
-                  // payments are partial (e.g. deposit only).
-                  isExpected={
-                    totalIncome === 0
-                    || ((liveJob.status === 'invoiced' || liveJob.status === 'completed')
-                        && expectedIncome > totalIncome + 0.01)
-                  }
-                />
+                {(() => {
+                  // Blended-target gauge: weight the per-tier rates by
+                  // the actual hours mix on this job. Falls back to the
+                  // static $85–100 default when no hours have been
+                  // logged yet (gauge keeps the global target).
+                  const hoursEntries = jobEntries.filter((e) => e.type === 'hours');
+                  const mix = hoursByWorker(hoursEntries);
+                  const rates = allWorkerRates(settings);
+                  const blendedTarget = blendedTargetRate(mix, rates);
+                  const mixDesc = describeMix(mix);
+                  return (
+                    <HourlyRateGauge
+                      hourlyRate={expectedHourlyRate}
+                      // "Expected" means the income hasn't fully landed yet —
+                      // either no income at all, or the job is invoiced but
+                      // payments are partial (e.g. deposit only).
+                      isExpected={
+                        totalIncome === 0
+                        || ((liveJob.status === 'invoiced' || liveJob.status === 'completed')
+                            && expectedIncome > totalIncome + 0.01)
+                      }
+                      blendedTarget={blendedTarget}
+                      mixDescription={mix.totalLabourHours > 0 ? mixDesc : undefined}
+                    />
+                  );
+                })()}
                 <IncomeVsExpenses stats={stats} />
                 <HoursByActivity entries={jobEntries} />
               </div>
@@ -499,6 +517,17 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               items on the Home "Bills to confirm" flag. Hidden when empty
               so we don't render a "Materials (0)" stub on jobs that
               haven't had any bills attached yet. */}
+          {/* Cost engine preview — shows the Resene PD-anchored cost
+              estimate for any quote on this job with structured
+              scope_zones data. Hidden when no quote has scope_zones,
+              so legacy jobs stay clean. */}
+          <CostEnginePreview
+            job={liveJob}
+            quotes={quotes}
+            entries={entries}
+            invoices={invoices}
+          />
+
           {/* Quotes on this job — surfaces both legacy-imported quotes
               (from the Finances sheet) AND ones created by the project-
               archive importer's Link flow. Hidden when empty. */}
