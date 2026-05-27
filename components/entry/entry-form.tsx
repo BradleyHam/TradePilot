@@ -1,8 +1,9 @@
 'use client';
 
 import { useState } from 'react';
-import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource } from '@/lib/types';
+import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource, WorkerKind } from '@/lib/types';
 import { EXPENSE_CATEGORIES, ACTIVITY_TYPES } from '@/lib/mock-data';
+import { WORKER_KIND_LABELS } from '@/lib/worker-rates';
 import { useStore } from '@/lib/store';
 import { rankJobs } from '@/lib/job-match';
 import { Button } from '@/components/ui/button';
@@ -86,6 +87,12 @@ export function EntryForm({
   const [hours, setHours] = useState(defaultValues?.hours?.toString() ?? '');
   const [category, setCategory] = useState<ExpenseCategory | ''>(defaultValues?.category ?? '');
   const [activity, setActivity] = useState<ActivityType | ''>(defaultValues?.activity ?? '');
+  // Hours-entry worker tier — defaults to 'owner' (Brad solo) for new
+  // entries, preserves whatever was saved when editing. The optional
+  // helperHours field captures "Sophie was there for X of these hours"
+  // without forcing a second entry — most common multi-worker case.
+  const [workerKind, setWorkerKind] = useState<WorkerKind>(defaultValues?.workerKind ?? 'owner');
+  const [helperHours, setHelperHours] = useState(defaultValues?.helperHours?.toString() ?? '');
   const [jobId, setJobId] = useState(defaultValues?.jobId ?? '');
   // Overhead = no job, deliberately. Distinct from "I forgot to pick one".
   // Stored as `[OH]` description prefix; jobId stays null.
@@ -118,8 +125,11 @@ export function EntryForm({
       activity: (activity as ActivityType) || undefined,
       supplier: supplier || undefined,
       gstApplies: type === 'expense' || type === 'income' || type === 'bill',
-      // Tag overheads in the description so they're greppable later.
-      description: (isOverhead ? OVERHEAD_PREFIX : '') + description.trim(),
+      // Tag overheads in the description so they're greppable later. Only
+      // money-out types (expense, bill) can be overhead — guard here so a
+      // lingering `isOverhead = true` from a previous type can't leak the
+      // `[OH]` prefix onto a non-money entry (hours, note, etc.).
+      description: (isOverhead && (type === 'expense' || type === 'bill') ? OVERHEAD_PREFIX : '') + description.trim(),
       entryDate: entryDate || today,
       dueDate: dueDate || undefined,
       // Bill-specific — preserved on edit, harmless on create (the save flow
@@ -131,6 +141,11 @@ export function EntryForm({
       // Only attach lead source for enquiries — the picker is hidden for
       // other types so the state could be stale from a prior chip flip.
       leadSource: type === 'enquiry' ? (leadSource || undefined) : undefined,
+      // Worker tier + helper hours — only meaningful for hours-type
+      // entries. The picker is hidden for other types so stale state
+      // from a chip flip doesn't leak through.
+      workerKind: type === 'hours' ? workerKind : undefined,
+      helperHours: type === 'hours' && helperHours ? parseFloat(helperHours) : undefined,
     });
   }
 
@@ -312,6 +327,45 @@ export function EntryForm({
         )}
       </div>
 
+      {/* Who did the work — only for hours entries. Defaults to "Me",
+          plus an optional "+ helper hours" capture so Brad doesn't need
+          to make two entries when he + Sophie did the same shift. */}
+      {type === 'hours' && (
+        <div className="grid grid-cols-2 gap-3">
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+              Who
+            </label>
+            <Select value={workerKind} onValueChange={(v) => setWorkerKind(v as WorkerKind)}>
+              <SelectTrigger className="h-9 text-sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {(Object.keys(WORKER_KIND_LABELS) as WorkerKind[]).map((k) => (
+                  <SelectItem key={k} value={k}>{WORKER_KIND_LABELS[k]}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </div>
+          {workerKind === 'owner' && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                + Helper hrs
+              </label>
+              <input
+                type="number"
+                inputMode="decimal"
+                step="0.5"
+                placeholder="0"
+                value={helperHours}
+                onChange={(e) => setHelperHours(e.target.value)}
+                className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
+          )}
+        </div>
+      )}
+
       {/* Job + overhead toggle. Hidden for enquiries — an enquiry is by
           definition a fresh lead with no job yet, and overheads don't make
           sense for them either. Keeps the form tight on the 5:30pm rule. */}
@@ -343,7 +397,11 @@ export function EntryForm({
                   }}
                 </SelectValue>
               </SelectTrigger>
-              <SelectContent>
+              {/* Override the default w-(--anchor-width) so long job names
+                  ("Cedar Restain and gate — Nicoles house") don't get
+                  truncated. Cap at the viewport so we still behave sensibly
+                  on narrow phones. */}
+              <SelectContent className="w-auto min-w-[var(--anchor-width)] max-w-[calc(100vw-2rem)]">
                 <SelectItem value="">No job</SelectItem>
                 {(() => {
                   // Tier-grouped: active first, then recently completed, then
@@ -381,22 +439,28 @@ export function EntryForm({
               </SelectContent>
             </Select>
           </div>
-          <button
-            type="button"
-            onClick={() => {
-              setIsOverhead((v) => !v);
-              if (!isOverhead) setJobId('');
-            }}
-            className={cn(
-              'shrink-0 h-9 px-3 rounded-lg text-xs font-semibold border transition-colors',
-              isOverhead
-                ? 'bg-blue-100 text-blue-700 border-blue-200'
-                : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
-            )}
-            title="Mark as overhead — a business expense not tied to a specific job"
-          >
-            Overhead
-          </button>
+          {/* Overhead is a money-side concept (a business cost not tied to a
+              specific job), so it only makes sense for Expense and Bill Due.
+              Hours are labour — you can't have "overhead hours". Hiding the
+              button for non-money types keeps the form honest. */}
+          {(type === 'expense' || type === 'bill') && (
+            <button
+              type="button"
+              onClick={() => {
+                setIsOverhead((v) => !v);
+                if (!isOverhead) setJobId('');
+              }}
+              className={cn(
+                'shrink-0 h-9 px-3 rounded-lg text-xs font-semibold border transition-colors',
+                isOverhead
+                  ? 'bg-blue-100 text-blue-700 border-blue-200'
+                  : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
+              )}
+              title="Mark as overhead — a business expense not tied to a specific job"
+            >
+              Overhead
+            </button>
+          )}
         </div>
       </div>
       )}

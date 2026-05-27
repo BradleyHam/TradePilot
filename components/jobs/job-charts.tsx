@@ -20,20 +20,48 @@ import { cn } from '@/lib/utils';
 // $85+ = green. We render a 180° arc with three coloured zones and a needle
 // pointing at the actual rate.
 
-const TARGET_LOW = 85;
-const TARGET_HIGH = 100;
-const ZONE_RED = 70;
+const DEFAULT_TARGET_LOW = 85;
+const DEFAULT_TARGET_HIGH = 100;
+const DEFAULT_ZONE_RED = 70;
 const GAUGE_MIN = 0;
-const GAUGE_MAX = 150;
 
 interface HourlyRateGaugeProps {
   hourlyRate: number | null;
   /** When true, label says "Expected $/h" instead of "Hourly rate". */
   isExpected?: boolean;
+  /**
+   * Per-job BLENDED target $/hr — computed from the actual worker mix
+   * on this job (owner + helper + etc, weighted by each tier's target
+   * rate). When supplied, the gauge's zones shift around this number
+   * instead of the static $85–100 default, so a two-person day is
+   * judged against the right benchmark for the labour deployed.
+   * Null/undefined = use defaults.
+   */
+  blendedTarget?: number | null;
+  /**
+   * Plain-English description of the labour mix to show in the subtitle
+   * (e.g. "8h you + 6h helper"). Only meaningful when blendedTarget is set.
+   */
+  mixDescription?: string;
 }
 
-export function HourlyRateGauge({ hourlyRate, isExpected = false }: HourlyRateGaugeProps) {
+export function HourlyRateGauge({
+  hourlyRate, isExpected = false, blendedTarget, mixDescription,
+}: HourlyRateGaugeProps) {
   if (hourlyRate == null) return null;
+
+  // Zone thresholds: when a blendedTarget is supplied, centre the
+  // amber→green boundary on it (-/+ 8% for the amber band) so the
+  // gauge tells the right story for the actual labour mix on this
+  // job. Otherwise fall back to the static $85–100 defaults.
+  const TARGET_LOW  = blendedTarget != null ? Math.round(blendedTarget * 0.92) : DEFAULT_TARGET_LOW;
+  const TARGET_HIGH = blendedTarget != null ? Math.round(blendedTarget * 1.08) : DEFAULT_TARGET_HIGH;
+  const ZONE_RED    = blendedTarget != null ? Math.round(blendedTarget * 0.75) : DEFAULT_ZONE_RED;
+  // Cap the gauge max at the higher of $150 or 1.6× the target so very
+  // high rates still appear on the dial without pinning the needle.
+  const GAUGE_MAX   = blendedTarget != null
+    ? Math.max(150, Math.round(blendedTarget * 1.6))
+    : 150;
 
   // Gauge geometry: a 180° arc from (10,80) to (190,80) with radius 80, centred at (100,80).
   const W = 200;
@@ -142,7 +170,14 @@ export function HourlyRateGauge({ hourlyRate, isExpected = false }: HourlyRateGa
       </div>
 
       <p className="mt-2 text-[11px] text-muted-foreground text-center">
-        Target $85–100/h · zones $0 – $70 – $85 – $150
+        {blendedTarget != null ? (
+          <>
+            Target ${TARGET_LOW}–{TARGET_HIGH}/h
+            {mixDescription ? ` · ${mixDescription}` : null}
+          </>
+        ) : (
+          <>Target $85–100/h · zones $0 – $70 – $85 – $150</>
+        )}
       </p>
     </div>
   );
