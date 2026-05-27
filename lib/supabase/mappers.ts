@@ -52,6 +52,16 @@ export function rowToJob(r: Row): Job {
     workType: (asString(r.work_type) as WorkType | undefined),
     surfaceAreaM2: asNumber(r.surface_area_m2),
     prepLevel: (asString(r.prep_level) as PrepLevel | undefined),
+    scopeNotes: asString(r.scope_notes),
+    accessNotes: Array.isArray(r.access_notes) ? (r.access_notes as string[]) : undefined,
+    quoteReadyBy: asString(r.quote_ready_by),
+    coatsCount: asNumber(r.coats_count),
+    stainProduct: asString(r.stain_product),
+    windowDoorCount: asNumber(r.window_door_count),
+    addonItems: Array.isArray(r.addon_items) ? (r.addon_items as string[]) : undefined,
+    siteLogistics: Array.isArray(r.site_logistics) ? (r.site_logistics as string[]) : undefined,
+    daysEstimate: asNumber(r.days_estimate),
+    commercialSignals: Array.isArray(r.commercial_signals) ? (r.commercial_signals as string[]) : undefined,
     lostReason: (asString(r.lost_reason) as LostReason | undefined),
     wonReason: (asString(r.won_reason) as WonReason | undefined),
     outcomeNotes: asString(r.outcome_notes),
@@ -63,6 +73,15 @@ export function rowToJob(r: Row): Job {
 export function jobToRow(j: Partial<Job>): Row {
   // Only include defined fields so partial updates don't clobber columns.
   const out: Row = {};
+  // `id` is normally Supabase-generated, but callers like the
+  // SiteVisitWrapUpSheet pass a client-generated uuid because they
+  // need a stable id to reference downstream BEFORE the insert
+  // resolves (photo uploads, schedule_item FK link). When provided,
+  // we honour it; otherwise we leave it out and Supabase fills the
+  // default (gen_random_uuid()). Without this, the wrap-up was hitting
+  // 23503 FK violations because the local tempId never matched the
+  // server-assigned id.
+  if (j.id !== undefined) out.id = j.id;
   if (j.businessId !== undefined) out.business_id = j.businessId;
   if (j.legacyId !== undefined) out.legacy_id = j.legacyId;
   if (j.name !== undefined) out.name = j.name;
@@ -83,6 +102,29 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.workType !== undefined) out.work_type = j.workType || null;
   if (j.surfaceAreaM2 !== undefined) out.surface_area_m2 = j.surfaceAreaM2 ?? null;
   if (j.prepLevel !== undefined) out.prep_level = j.prepLevel || null;
+  if (j.scopeNotes !== undefined) out.scope_notes = j.scopeNotes || null;
+  // Postgres text[] — pass an empty array as null so it round-trips cleanly
+  // (an empty array would otherwise look distinct from "unset" downstream).
+  if (j.accessNotes !== undefined) {
+    out.access_notes = j.accessNotes && j.accessNotes.length > 0 ? j.accessNotes : null;
+  }
+  if (j.quoteReadyBy !== undefined) out.quote_ready_by = j.quoteReadyBy || null;
+  if (j.coatsCount !== undefined) out.coats_count = j.coatsCount ?? null;
+  if (j.stainProduct !== undefined) out.stain_product = j.stainProduct || null;
+  if (j.windowDoorCount !== undefined) out.window_door_count = j.windowDoorCount ?? null;
+  // text[] columns: empty array round-trips as null so "unset" and
+  // "set to empty" don't get confused downstream. Same pattern as
+  // accessNotes above.
+  if (j.addonItems !== undefined) {
+    out.addon_items = j.addonItems && j.addonItems.length > 0 ? j.addonItems : null;
+  }
+  if (j.siteLogistics !== undefined) {
+    out.site_logistics = j.siteLogistics && j.siteLogistics.length > 0 ? j.siteLogistics : null;
+  }
+  if (j.daysEstimate !== undefined) out.days_estimate = j.daysEstimate ?? null;
+  if (j.commercialSignals !== undefined) {
+    out.commercial_signals = j.commercialSignals && j.commercialSignals.length > 0 ? j.commercialSignals : null;
+  }
   if (j.lostReason !== undefined) out.lost_reason = j.lostReason || null;
   if (j.wonReason !== undefined) out.won_reason = j.wonReason || null;
   if (j.outcomeNotes !== undefined) out.outcome_notes = j.outcomeNotes || null;

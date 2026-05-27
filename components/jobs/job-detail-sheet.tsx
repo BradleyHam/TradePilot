@@ -12,18 +12,20 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   Phone, Mail, MapPin, Clock, DollarSign, Receipt, FileText, MessageSquare,
   AlertCircle, StickyNote, TrendingUp, Edit3, Plus, Package, ExternalLink, X,
-  Camera, Trash2, Loader2, CalendarDays,
+  Camera, Trash2, Loader2, CalendarDays, Sparkles, Send,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { formatEntryDate } from '@/lib/format-date';
 import { JOB_STATUSES } from '@/lib/mock-data';
-import { JobStatus } from '@/lib/types';
+import { JobStatus, LostReason, WonReason } from '@/lib/types';
 import { jobStats, entryExGst } from '@/lib/job-stats';
 import { HourlyRateGauge, IncomeVsExpenses, HoursByActivity } from './job-charts';
 import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
 import { BookedDates } from './booked-dates';
 import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
+import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
+import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
 
 interface JobDetailSheetProps {
@@ -42,6 +44,45 @@ const TYPE_COLOR: Record<string, string> = {
   enquiry: 'text-violet-500', quote: 'text-amber-500', bill: 'text-orange-500', note: 'text-slate-500',
 };
 
+// Human-readable labels for the outcome reasons stored on a job. Keep these
+// in sync with the chip options in `outcome-sheet.tsx` — same wording so the
+// captured-then-displayed text feels stable.
+const LOST_REASON_LABEL: Record<LostReason, string> = {
+  'price':             'Price too high',
+  'no-reply':          'No reply',
+  'went-elsewhere':    'Went with another painter',
+  'scope-changed':     'Scope changed',
+  'project-cancelled': 'Project cancelled',
+  'timing':            'Timing didn’t work',
+  'other':             'Other',
+};
+
+const WON_REASON_LABEL: Record<WonReason, string> = {
+  'referral':          'Referral',
+  'returning-client':  'Returning client',
+  'price':             'Best price',
+  'trust-rapport':     'Trust / rapport',
+  'speed-of-response': 'Speed of response',
+  'unique-fit':        'Right fit for the job',
+  'other':             'Other',
+};
+
+/**
+ * Has a site-visit wrap-up been completed for this job? Used to gate
+ * the 'Prep with AI' CTA on the lead-stage action strip. Mirrors the
+ * same rule the Leads page's "To quote" filter uses — any wrap-up
+ * field being set counts.
+ */
+function hasWrapUpData(job: Job): boolean {
+  return Boolean(
+    job.scopeNotes
+    || job.surfaceAreaM2
+    || job.prepLevel
+    || job.quoteReadyBy
+    || (job.accessNotes && job.accessNotes.length > 0),
+  );
+}
+
 export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const {
     jobs, entries, invoices, scheduleItems, materials, quotes, quoteAttachments,
@@ -53,9 +94,25 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const [editingInvoice, setEditingInvoice] = useState<import('@/lib/types').Invoice | null>(null);
   // When set, the OutcomeSheet opens to capture why we won/lost a job.
   const [outcomePrompt, setOutcomePrompt] = useState<OutcomeKind | null>(null);
+  // True when the OutcomeSheet was opened via the "Edit" button on the
+  // outcome panel (as opposed to being auto-prompted by a status change).
+  // We use this to decide whether to auto-close the whole job sheet after
+  // save — closing makes sense after a status flip, but is jarring when
+  // Brad just tweaked the reason on an already-lost job.
+  const [outcomeEditing, setOutcomeEditing] = useState(false);
   // When true, the CompletionDateSheet opens to capture the actual finish
   // date so we can reconcile the calendar accurately.
   const [askCompletionDate, setAskCompletionDate] = useState(false);
+  // When true, the MarkAsQuotedSheet opens — collects total $, date
+  // sent, and follow-up date, then flips the lead to status='quoted'.
+  const [markAsQuotedOpen, setMarkAsQuotedOpen] = useState(false);
+  // When the user goes Prep-with-AI → Download PDF → Mark as quoted,
+  // we pre-fill the total with whatever Claude suggested. Carried in
+  // this state so the flow doesn't have to thread it through props.
+  // Null = no AI suggestion, MarkAsQuotedSheet uses the job's quoteAmount.
+  const [aiSuggestedTotal, setAiSuggestedTotal] = useState<number | null>(null);
+  // When true, the live AI quote drafter sheet opens.
+  const [prepWithAIOpen, setPrepWithAIOpen] = useState(false);
 
   if (!job) return null;
 
@@ -120,10 +177,16 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   }) {
     updateJob(liveJob.id, data);
     setOutcomePrompt(null);
-    // Once the reason is captured, there's nothing else to do on a
-    // lost/accepted job in this sheet — close it so Brad gets back to
-    // the jobs list in one tap instead of two.
-    onClose();
+    // After a status flip there's nothing else to do on a lost/accepted
+    // job in this sheet, so close it and return Brad to the jobs list.
+    // But if he opened the outcome sheet via the "Edit" affordance on an
+    // already-set outcome panel, keep the job sheet open so he can carry
+    // on browsing the job.
+    if (outcomeEditing) {
+      setOutcomeEditing(false);
+    } else {
+      onClose();
+    }
   }
 
   // Delete the job. Blocked if anything's attached; the prompt shows
@@ -205,28 +268,112 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               is wider than any phone viewport). */}
           <div className="flex-1 min-h-0 overflow-y-auto">
             <div className="mx-auto w-full max-w-2xl px-4 md:px-6 pt-4 pb-10 space-y-5">
-          {/* Client info */}
-          <div className="space-y-1.5">
-            <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Client</p>
-            <p className="font-medium text-foreground">{liveJob.clientName}</p>
-            <div className="flex flex-wrap gap-3">
-              {liveJob.clientPhone && (
-                <a href={`tel:${liveJob.clientPhone}`} className="flex items-center gap-1.5 text-sm text-primary">
-                  <Phone size={14} /> {liveJob.clientPhone}
-                </a>
+          {/* Client info — read-only block + inline editor toggle.
+              The wrap-up auto-creates jobs with clientName='New lead'
+              as a placeholder; before the quote PDF can go out, Brad
+              needs to fix that. Inline editing is faster than a
+              separate sheet and the fields are short. */}
+          <ClientInfoBlock
+            job={liveJob}
+            onSave={(patch) => updateJob(liveJob.id, patch)}
+          />
+
+          {/* Lead-stage action strip — only on leads. The two CTAs are
+              the entire user-facing API for the quote flow today:
+                'Prep with AI' for jobs with wrap-up data; and
+                'Mark as quoted' for jobs you've handled outside the
+                app. Both flip the funnel forward. */}
+
+          {/* Lead-stage action strip — only on leads. The two CTAs are
+              the entire user-facing API for the quote flow today:
+                'Prep with AI' (placeholder until Session 3) for jobs
+                with wrap-up data; and 'Mark as quoted' for jobs you've
+                handled outside the app. Both flip the funnel forward. */}
+          {liveJob.status === 'lead' && (
+            <div className="flex flex-col sm:flex-row gap-2">
+              {hasWrapUpData(liveJob) && (
+                <button
+                  type="button"
+                  onClick={() => setPrepWithAIOpen(true)}
+                  className="flex-1 inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
+                >
+                  <Sparkles size={15} strokeWidth={2} />
+                  Prep quote with AI
+                </button>
               )}
-              {liveJob.clientEmail && (
-                <a href={`mailto:${liveJob.clientEmail}`} className="flex items-center gap-1.5 text-sm text-primary">
-                  <Mail size={14} /> {liveJob.clientEmail}
-                </a>
-              )}
+              <button
+                type="button"
+                onClick={() => setMarkAsQuotedOpen(true)}
+                className="flex-1 inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl border border-border bg-background text-foreground text-sm font-semibold hover:bg-accent transition-colors"
+              >
+                <Send size={15} strokeWidth={2} />
+                Mark as quoted
+              </button>
             </div>
-            {liveJob.location && (
-              <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
-                <MapPin size={14} /> {liveJob.location}
+          )}
+
+          {/* Outcome panel — shows the captured win/loss reason and any
+              freeform notes once Brad has answered the OutcomeSheet prompt.
+              This is where the data we collect when a status flips to
+              lost/accepted actually surfaces — without this block the
+              answers vanish into the database. Tap to edit re-opens the
+              same OutcomeSheet in edit mode (initial values come from the
+              live job). Hidden if no reason has been recorded yet. */}
+          {(() => {
+            const isLost = liveJob.status === 'lost';
+            const isWon = (['accepted','booked','in-progress','completed','invoiced','paid'] as JobStatus[])
+              .includes(liveJob.status);
+            const reasonLabel = isLost && liveJob.lostReason
+              ? LOST_REASON_LABEL[liveJob.lostReason]
+              : isWon && liveJob.wonReason
+                ? WON_REASON_LABEL[liveJob.wonReason]
+                : null;
+            const notes = liveJob.outcomeNotes;
+            // Don't render if there's nothing captured yet — keeps the
+            // pre-quote stages of the sheet uncluttered.
+            if (!reasonLabel && !notes) return null;
+
+            const heading = isLost ? 'Why we lost it' : 'Why we won it';
+            const accent = isLost
+              ? 'border-rose-200 bg-rose-50/60'
+              : 'border-emerald-200 bg-emerald-50/60';
+            const chip = isLost
+              ? 'bg-rose-100 text-rose-900 border-rose-200'
+              : 'bg-emerald-100 text-emerald-900 border-emerald-200';
+
+            return (
+              <div className={cn('rounded-xl border p-3', accent)}>
+                <div className="flex items-baseline justify-between gap-2">
+                  <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                    {heading}
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => {
+                      setOutcomeEditing(true);
+                      setOutcomePrompt(isLost ? 'lost' : 'won');
+                    }}
+                    className="text-xs text-primary font-medium hover:underline min-h-[28px] px-1 -mr-1"
+                  >
+                    Edit
+                  </button>
+                </div>
+                {reasonLabel && (
+                  <span className={cn(
+                    'inline-block mt-2 px-2 py-1 rounded-md text-xs font-medium border',
+                    chip,
+                  )}>
+                    {reasonLabel}
+                  </span>
+                )}
+                {notes && (
+                  <p className="mt-2 text-sm text-foreground whitespace-pre-wrap leading-snug">
+                    {notes}
+                  </p>
+                )}
               </div>
-            )}
-          </div>
+            );
+          })()}
 
           {/* Completed on — only meaningful for terminal-status jobs. Shows
               the recorded endDate (formatted) or 'Unknown — tap to set' so
@@ -634,8 +781,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               Hidden for jobs that are done-and-dusted: 'lost' (never
               happened), 'paid' (closed out), 'invoiced' / 'completed'
               (work is finished — rare touch-ups can still be logged via
-              /entry). Keeps the bar visible only when it's actually useful. */}
-          {!(['lost','paid','invoiced','completed'] as JobStatus[]).includes(liveJob.status) && (
+              /entry). Also hidden on lead/quoted because you don't log
+              hours against a job that hasn't even been accepted yet —
+              keeps the lead-stage CTAs (Prep with AI / Mark as quoted)
+              as the only action buttons. */}
+          {!(['lost','paid','invoiced','completed','lead','quoted'] as JobStatus[]).includes(liveJob.status) && (
             <LogHoursBar
               lastActivity={lastActivityForJob(liveJob.id, entries)}
               onSave={(fields) => {
@@ -677,7 +827,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         initialReason={outcomePrompt === 'lost' ? liveJob.lostReason : liveJob.wonReason}
         initialNotes={liveJob.outcomeNotes}
         onSave={handleOutcomeSave}
-        onCancel={() => setOutcomePrompt(null)}
+        onCancel={() => { setOutcomePrompt(null); setOutcomeEditing(false); }}
       />
 
       {/* Finish-date prompt — opens after a status flip to completed/
@@ -690,7 +840,179 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         onSave={handleCompletionDateSave}
         onCancel={() => setAskCompletionDate(false)}
       />
+
+      {/* Mark-as-quoted — flips the lead's status to 'quoted' after
+          capturing total + date sent + follow-up date. The AI flow
+          can pre-fill `initialTotal` with Claude's suggested total
+          via the aiSuggestedTotal state. */}
+      <MarkAsQuotedSheet
+        open={markAsQuotedOpen}
+        job={markAsQuotedOpen ? liveJob : null}
+        initialTotal={aiSuggestedTotal ?? undefined}
+        onSaved={() => {
+          setMarkAsQuotedOpen(false);
+          setAiSuggestedTotal(null);
+        }}
+        onCancel={() => {
+          setMarkAsQuotedOpen(false);
+          setAiSuggestedTotal(null);
+        }}
+      />
+
+      {/* Real AI quote drafter — calls /api/draft-quote with the job
+          context, shows the structured draft, lets the user
+          regenerate with a hint, then renders a branded PDF via
+          react-pdf and triggers a browser download. */}
+      <PrepWithAISheet
+        open={prepWithAIOpen}
+        job={prepWithAIOpen ? liveJob : null}
+        onMarkAsQuoted={(suggestedTotal) => {
+          setAiSuggestedTotal(suggestedTotal);
+          setPrepWithAIOpen(false);
+          setMarkAsQuotedOpen(true);
+        }}
+        onClose={() => setPrepWithAIOpen(false)}
+      />
     </Sheet>
+  );
+}
+
+/**
+ * Client info block — read-only by default, expands to an inline
+ * editor when Brad taps Edit (or auto-expands when clientName is
+ * still the 'New lead' placeholder, nudging him to fix it before
+ * a quote PDF goes out with that text as the customer's name).
+ *
+ * Edits four fields: clientName, clientPhone, clientEmail, location.
+ * Saves via the parent's updateJob callback — optimistic store
+ * update handles the persistence + rollback.
+ */
+function ClientInfoBlock({
+  job, onSave,
+}: {
+  job: Job;
+  onSave: (patch: Partial<Job>) => void;
+}) {
+  // The wrap-up flow seeds new jobs with 'New lead' as a placeholder
+  // because the wrap-up form doesn't capture a client name. Auto-
+  // expanding the editor for that exact string means Brad sees a
+  // form he can fill in straight away rather than a misleading
+  // read-only display.
+  const isPlaceholder = job.clientName === 'New lead';
+  const [editing, setEditing] = useState(isPlaceholder);
+
+  const [name, setName] = useState(job.clientName);
+  const [phone, setPhone] = useState(job.clientPhone ?? '');
+  const [email, setEmail] = useState(job.clientEmail ?? '');
+  const [location, setLocation] = useState(job.location ?? '');
+
+  function handleSave() {
+    onSave({
+      clientName: name.trim() || 'New lead',
+      clientPhone: phone.trim() || undefined,
+      clientEmail: email.trim() || undefined,
+      location: location.trim() || undefined,
+    });
+    setEditing(false);
+  }
+
+  function handleCancel() {
+    setName(job.clientName);
+    setPhone(job.clientPhone ?? '');
+    setEmail(job.clientEmail ?? '');
+    setLocation(job.location ?? '');
+    setEditing(false);
+  }
+
+  if (!editing) {
+    return (
+      <div className="space-y-1.5">
+        <div className="flex items-center justify-between">
+          <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Client</p>
+          <button
+            type="button"
+            onClick={() => setEditing(true)}
+            className="text-xs font-medium text-primary hover:underline inline-flex items-center gap-1"
+          >
+            <Edit3 size={11} strokeWidth={2} />
+            Edit
+          </button>
+        </div>
+        <p className={cn(
+          'font-medium',
+          isPlaceholder ? 'text-muted-foreground italic' : 'text-foreground',
+        )}>
+          {isPlaceholder ? 'Set client name…' : job.clientName}
+        </p>
+        <div className="flex flex-wrap gap-3">
+          {job.clientPhone && (
+            <a href={`tel:${job.clientPhone}`} className="flex items-center gap-1.5 text-sm text-primary">
+              <Phone size={14} /> {job.clientPhone}
+            </a>
+          )}
+          {job.clientEmail && (
+            <a href={`mailto:${job.clientEmail}`} className="flex items-center gap-1.5 text-sm text-primary">
+              <Mail size={14} /> {job.clientEmail}
+            </a>
+          )}
+        </div>
+        {job.location && (
+          <div className="flex items-center gap-1.5 text-sm text-muted-foreground">
+            <MapPin size={14} /> {job.location}
+          </div>
+        )}
+      </div>
+    );
+  }
+
+  // Edit mode
+  return (
+    <div className="space-y-2.5 rounded-xl border border-border bg-muted/30 p-3">
+      <div className="flex items-center justify-between">
+        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Client</p>
+      </div>
+      <div className="space-y-2">
+        <input
+          type="text"
+          placeholder="Client name (e.g. Catherine Smith)"
+          value={name}
+          onChange={(e) => setName(e.target.value)}
+          className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm"
+          autoFocus={isPlaceholder}
+        />
+        <div className="grid grid-cols-1 sm:grid-cols-2 gap-2">
+          <input
+            type="tel"
+            placeholder="Phone"
+            value={phone}
+            onChange={(e) => setPhone(e.target.value)}
+            className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm"
+          />
+          <input
+            type="email"
+            placeholder="Email"
+            value={email}
+            onChange={(e) => setEmail(e.target.value)}
+            className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm"
+          />
+        </div>
+        <input
+          type="text"
+          placeholder="Address / location"
+          value={location}
+          onChange={(e) => setLocation(e.target.value)}
+          className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm"
+        />
+      </div>
+      <div className="flex gap-2 pt-1">
+        <Button variant="outline" size="sm" className="flex-1" onClick={handleCancel}>
+          Cancel
+        </Button>
+        <Button size="sm" className="flex-1 bg-primary" onClick={handleSave}>
+          Save
+        </Button>
+      </div>
+    </div>
   );
 }
 

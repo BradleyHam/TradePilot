@@ -24,6 +24,7 @@ import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
 import { rankJobs } from '@/lib/job-match';
 import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
+import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
 
 /**
  * Outcome of a quote being committed via the imports flow. Captured
@@ -94,6 +95,34 @@ export default function HomePage() {
     confirmBillDraftWithMaterials,
     commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
   } = useStore();
+
+  // Wrap-up sheet state. We hold the schedule_item id (not just a
+  // jobId) because a quote_visit can be wrapped up even when it has
+  // no linked job — in which case the wrap-up creates one. Computed
+  // WrapUpTarget below decides which mode the sheet opens in.
+  const [wrapUpScheduleItemId, setWrapUpScheduleItemId] = useState<string | null>(null);
+  const wrapUpItem = wrapUpScheduleItemId
+    ? scheduleItems.find((s) => s.id === wrapUpScheduleItemId) ?? null
+    : null;
+  // Memoised so the WrapUpTarget object identity is stable across
+  // unrelated re-renders. Without this, every store update on the
+  // parent (which is chatty) would create a brand-new target object,
+  // tripping the wrap-up sheet's hydration effect and resetting any
+  // staged photos/plans the user had queued. Bit me in production.
+  const wrapUpTarget = useMemo<WrapUpTarget | null>(() => {
+    if (!wrapUpItem) return null;
+    if (wrapUpItem.jobId) {
+      const linkedJob = jobs.find((j) => j.id === wrapUpItem.jobId);
+      // Linked job missing — shouldn't happen but fall through to
+      // create-from-visit rather than render a broken sheet.
+      if (linkedJob) return { mode: 'existing-job', job: linkedJob };
+    }
+    return {
+      mode: 'create-from-visit',
+      visitTitle: wrapUpItem.title,
+      visitNotes: wrapUpItem.notes,
+    };
+  }, [wrapUpItem, jobs]);
 
   // Compute "today" once per render and pin the ISO strings in stable values
   // so the memo dependency arrays compare by value, not by Date identity.
@@ -218,6 +247,33 @@ export default function HomePage() {
       });
   }, [scheduleItems, todayISO]);
 
+  // Jobs that need a quote written. Mirrors the rule used by the
+  // Leads page's "To quote" section: status=lead AND has wrap-up
+  // data (scopeNotes, paint area, prep level, quoteReadyBy, or
+  // access notes). Sorted by quoteReadyBy ascending so the most
+  // urgent promise to the customer shows up first.
+  const toQuoteJobs = useMemo(() => {
+    return jobs
+      .filter((j) => {
+        if (j.status !== 'lead') return false;
+        return Boolean(
+          j.scopeNotes
+          || j.surfaceAreaM2
+          || j.prepLevel
+          || j.quoteReadyBy
+          || (j.accessNotes && j.accessNotes.length > 0),
+        );
+      })
+      .sort((a, b) => {
+        const aDue = a.quoteReadyBy ?? '';
+        const bDue = b.quoteReadyBy ?? '';
+        if (aDue && bDue) return aDue.localeCompare(bDue);
+        if (aDue) return -1;
+        if (bDue) return 1;
+        return 0;
+      });
+  }, [jobs]);
+
   // ── Render ──────────────────────────────────────────────────────────────
   const subtitle = parseISODate(todayISO).toLocaleDateString('en-NZ', {
     weekday: 'long', day: 'numeric', month: 'long',
@@ -238,6 +294,15 @@ export default function HomePage() {
           items={todayItems}
           todayISO={todayISO}
           onMarkDone={(id) => updateScheduleItem(id, { completed: true })}
+          onOpenWrapUp={(item) => {
+            // Ticking a quote_visit opens the wrap-up regardless of
+            // whether it has a linked job — the sheet will create one
+            // on save if needed. We DON'T complete the schedule item
+            // yet — the wrap-up's onSaved callback does that, so a
+            // cancelled wrap-up leaves the row in Today (still owed
+            // a write-up).
+            setWrapUpScheduleItemId(item.id);
+          }}
           onLogHours={(item, fields) => {
             // Build a hours-type Entry attached to the schedule item's job.
             // Mirrors the shape used in app/(app)/entry/page.tsx — hours
@@ -258,6 +323,13 @@ export default function HomePage() {
             });
           }}
         />
+
+        {/* Quotes-to-prep — surfaces jobs where the site visit's
+            done but the quote hasn't been sent yet. Hides when
+            empty per the "no empty visualisations" rule. */}
+        {toQuoteJobs.length > 0 && (
+          <QuotesToPrepSection items={toQuoteJobs} />
+        )}
 
         <WeekStatsSection
           hours={hoursThisWeek}
@@ -291,6 +363,30 @@ export default function HomePage() {
           <ComingUpSection items={comingUp} todayISO={todayISO} />
         )}
       </div>
+
+      {/* Site-visit wrap-up — appears when Brad ticks a quote_visit
+          with a linked job. Captures photos + scope + structured fields
+          and patches the job. On save, completes the schedule_item so
+          the row leaves the Today list. On cancel, the row stays so
+          Brad knows he still owes a write-up. */}
+      <SiteVisitWrapUpSheet
+        open={wrapUpTarget !== null}
+        target={wrapUpTarget}
+        onSaved={(resolvedJobId) => {
+          if (wrapUpItem) {
+            // Complete the schedule item AND link it to the resolved job.
+            // If the wrap-up created a new job, this is the moment the
+            // schedule_item gets its jobId. Existing-job wrap-ups patch
+            // the same id back, which is a harmless no-op.
+            updateScheduleItem(wrapUpItem.id, {
+              completed: true,
+              jobId: resolvedJobId,
+            });
+          }
+          setWrapUpScheduleItemId(null);
+        }}
+        onCancel={() => setWrapUpScheduleItemId(null)}
+      />
     </div>
   );
 }
@@ -306,12 +402,14 @@ export interface LoggedHoursFields {
 }
 
 function TodaySection({
-  items, todayISO, onMarkDone, onLogHours,
+  items, todayISO, onMarkDone, onLogHours, onOpenWrapUp,
 }: {
   items: ScheduleItem[];
   todayISO: string;
   onMarkDone: (id: string) => void;
   onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => void;
+  /** Tick handler for quote_visit rows with a linked job — opens the wrap-up. */
+  onOpenWrapUp: (item: ScheduleItem) => void;
 }) {
   return (
     <section>
@@ -335,6 +433,7 @@ function TodaySection({
               todayISO={todayISO}
               onMarkDone={onMarkDone}
               onLogHours={onLogHours}
+              onOpenWrapUp={onOpenWrapUp}
             />
           ))}
         </ul>
@@ -357,12 +456,14 @@ const SCHEDULE_TYPE_META: Record<string, { color: string; bg: string; icon: Reac
 };
 
 function TodayRow({
-  item, todayISO, onMarkDone, onLogHours,
+  item, todayISO, onMarkDone, onLogHours, onOpenWrapUp,
 }: {
   item: ScheduleItem;
   todayISO: string;
   onMarkDone: (id: string) => void;
   onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => void;
+  /** Tick handler for quote_visit rows. Falls back to onMarkDone if not provided. */
+  onOpenWrapUp?: (item: ScheduleItem) => void;
 }) {
   const meta = SCHEDULE_TYPE_META[item.type] ?? SCHEDULE_TYPE_META.reminder;
   const Icon = meta.icon;
@@ -376,13 +477,27 @@ function TodayRow({
   // items). On dismiss, the form unmounts the row by flipping completed.
   const [formOpen, setFormOpen] = useState(false);
 
-  // Tick semantics fork on whether there's a linked job to log hours against.
-  // Plain reminders / bill_due / invoice_due rows keep the original one-tap
-  // behaviour.
-  const tickOpensForm = item.jobId != null;
+  // Tick semantics fork by type:
+  //
+  //   quote_visit + linked job → opens the site-visit wrap-up sheet
+  //     (parent handles state + completes the item on save).
+  //   any other type + linked job → opens the inline hours form to
+  //     log work done against the job (existing behaviour for
+  //     job_booking, follow_up).
+  //   no linked job (reminder / bill_due / invoice_due) → one-tap mark
+  //     done, no extra UI.
+  //
+  // The wrap-up fork only triggers when the parent provided
+  // onOpenWrapUp — falling back to the hours form preserves the old
+  // behaviour for any future caller that hasn't wired it up yet.
+  const isWrapUpVisit =
+    item.type === 'quote_visit' && item.jobId != null && onOpenWrapUp != null;
+  const tickOpensHoursForm = !isWrapUpVisit && item.jobId != null;
 
   function handleTickClick() {
-    if (tickOpensForm) {
+    if (isWrapUpVisit) {
+      onOpenWrapUp!(item);
+    } else if (tickOpensHoursForm) {
       setFormOpen(true);
     } else {
       onMarkDone(item.id);
@@ -1731,6 +1846,110 @@ function fmtDueDate(iso: string): string {
 }
 
 // ── Section: Coming up ──────────────────────────────────────────────────────
+/**
+ * Quotes-to-prep — the "you owe these customers a quote" rail. Shows
+ * up to 4 jobs whose site visit's been wrapped up but no quote sent
+ * yet, sorted by quote-ready-by date (sooner = more urgent).
+ *
+ * Each row: job name + customer + a small "due by" pill on the right.
+ * Tapping a row goes to /leads (which has the full To-quote section)
+ * rather than directly to the job, because Brad's "I owe quotes"
+ * mental loop usually involves looking at the full list before
+ * picking which to start with. Cheaper than opening one and bailing.
+ */
+const QUOTES_TO_PREP_MAX_ROWS = 4;
+
+function QuotesToPrepSection({ items }: { items: Job[] }) {
+  const shown = items.slice(0, QUOTES_TO_PREP_MAX_ROWS);
+  const overflow = items.length - shown.length;
+
+  return (
+    <section>
+      <div className="flex items-baseline justify-between mb-2">
+        <SectionLabel className="mb-0">Quotes to prep</SectionLabel>
+        <Link href="/leads" className="text-xs font-medium text-primary hover:underline">
+          See all
+        </Link>
+      </div>
+      <ul className="space-y-2">
+        {shown.map((job) => (
+          <QuotesToPrepRow key={job.id} job={job} />
+        ))}
+      </ul>
+      {overflow > 0 && (
+        <Link
+          href="/leads"
+          className="mt-2 flex items-center justify-center gap-1 h-10 rounded-xl border border-dashed border-border text-xs font-medium text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
+        >
+          {overflow} more to quote — open leads
+          <ChevronRight size={12} />
+        </Link>
+      )}
+    </section>
+  );
+}
+
+function QuotesToPrepRow({ job }: { job: Job }) {
+  // Due-date label uses the same logic as the Leads page's chip so
+  // the two surfaces feel consistent. Overdue / Today / Tomorrow /
+  // weekday / date — short, scan-friendly.
+  const dueLabel = job.quoteReadyBy ? friendlyQuoteDueLabel(job.quoteReadyBy) : null;
+  const overdue = dueLabel?.startsWith('Overdue');
+
+  return (
+    <li>
+      <Link
+        href="/leads"
+        className="bg-card border border-border rounded-2xl flex items-center gap-3 px-4 py-3 min-h-[48px] hover:border-primary/30 transition-colors"
+      >
+        <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 bg-amber-50">
+          <FileText size={14} className="text-amber-600" strokeWidth={1.8} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground truncate">{job.name}</p>
+          <p className="text-xs text-muted-foreground mt-0.5 truncate">
+            {job.clientName}
+          </p>
+        </div>
+        {dueLabel && (
+          <span
+            className={cn(
+              'shrink-0 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide',
+              overdue
+                ? 'bg-red-50 text-red-700'
+                : 'bg-amber-50 text-amber-700',
+            )}
+            title={`Quote-ready-by: ${job.quoteReadyBy}`}
+          >
+            {dueLabel}
+          </span>
+        )}
+        <ChevronRight size={14} className="text-muted-foreground shrink-0" />
+      </Link>
+    </li>
+  );
+}
+
+/**
+ * Same date-formatting logic as the Leads page's formatDueDate. Kept
+ * inline here so we don't have to thread a shared helper through —
+ * the duplication is tiny (~10 lines) and the two formatters can
+ * diverge later if Home wants a different style.
+ */
+function friendlyQuoteDueLabel(iso: string): string {
+  const [y, m, d] = iso.split('-').map(Number);
+  if (!y || !m || !d) return iso;
+  const date = new Date(y, m - 1, d);
+  const today = new Date();
+  today.setHours(0, 0, 0, 0);
+  const diffDays = Math.round((date.getTime() - today.getTime()) / (1000 * 60 * 60 * 24));
+  if (diffDays < 0) return `Overdue ${Math.abs(diffDays)}d`;
+  if (diffDays === 0) return 'Today';
+  if (diffDays === 1) return 'Tomorrow';
+  if (diffDays < 7) return date.toLocaleDateString('en-NZ', { weekday: 'short' });
+  return date.toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' });
+}
+
 function ComingUpSection({
   items, todayISO,
 }: {

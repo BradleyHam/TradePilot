@@ -12,7 +12,7 @@ import {
 import type {
   Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
-  JobStatus,
+  JobStatus, QuoteTemplate,
 } from './types';
 import { compressImage } from './image-compress';
 
@@ -92,7 +92,14 @@ interface StoreState {
   error: string | null;
 
   // Mutators — optimistic local update + Supabase write-behind.
-  addJob: (job: Job) => void;
+  // addJob returns a Promise so callers that need to chain operations
+  // on the persisted job (e.g. the wrap-up sheet which then attaches
+  // photos via a FK relationship) can await the insert before
+  // continuing. Existing fire-and-forget callers are unaffected —
+  // they just ignore the returned Promise. Resolves to the persisted
+  // Job on success, or null if the insert was rejected (in which
+  // case the optimistic local row has already been rolled back).
+  addJob: (job: Job) => Promise<Job | null>;
   updateJob: (id: string, updates: Partial<Job>) => void;
   /**
    * Hard-delete a job — only succeeds if NOTHING is attached. Inspects
@@ -330,6 +337,36 @@ interface StoreState {
     importId: string,
   ) => Promise<{ ok: boolean; error?: string }>;
 
+  /**
+   * Read the current business's quote template (from the settings
+   * row keyed 'quote_template'). Returns null if no row exists —
+   * the settings UI will then show defaults to start filling. Migration
+   * 014 seeds a row for every existing business so this normally
+   * returns something even for brand-new accounts.
+   */
+  getQuoteTemplate: () => QuoteTemplate | null;
+  /**
+   * Save the template. Upserts the settings row. Returns ok=true on
+   * success; on failure surfaces the message so the UI can show it.
+   */
+  saveQuoteTemplate: (
+    template: QuoteTemplate,
+  ) => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Upload a logo file to the business-logos Storage bucket. Returns
+   * the storage path on success (which the caller should write to
+   * template.header.logoStoragePath via saveQuoteTemplate). Returns
+   * null on failure with the error surfaced to the store's `error`
+   * field. Replaces any existing logo at the same path.
+   */
+  uploadBusinessLogo: (file: File) => Promise<string | null>;
+  /**
+   * Resolve a storage path to a public URL for display + PDF embed.
+   * Returns null if no path provided. Synchronous because the bucket
+   * is public — no signing required.
+   */
+  resolveLogoUrl: (storagePath: string | undefined | null) => string | null;
+
   // Re-fetch everything from Supabase (useful after a write succeeds).
   refresh: () => Promise<void>;
 }
@@ -499,30 +536,38 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // instant, then writes to Supabase. On failure we roll back local state and
   // surface the error so it's not silently lost.
 
-  const addJob = useCallback((job: Job) => {
+  const addJob = useCallback(async (job: Job): Promise<Job | null> => {
     if (!businessId) {
       console.warn('[store] addJob called with no businessId; ignoring');
-      return;
+      return null;
     }
     // Optimistic insert with the temporary id from the caller.
     setJobs((prev) => [job, ...prev]);
     const tempId = job.id;
 
-    (async () => {
-      const row = jobToRow({ ...job, businessId });
-      const { data, error: insertErr } = await supabase
-        .from('jobs').insert(row).select('*').single();
-      if (insertErr || !data) {
-        console.error('[store] addJob failed:', insertErr);
-        setError(insertErr?.message ?? 'Failed to save job');
-        // Roll back the optimistic insert
-        setJobs((prev) => prev.filter((j) => j.id !== tempId));
-        return;
-      }
-      // Replace the temporary row with the persisted one (real id, etc).
-      const persisted = rowToJob(data);
-      setJobs((prev) => prev.map((j) => (j.id === tempId ? persisted : j)));
-    })();
+    const row = jobToRow({ ...job, businessId });
+    const { data, error: insertErr } = await supabase
+      .from('jobs').insert(row).select('*').single();
+    if (insertErr || !data) {
+      // Spread the useful Supabase error fields — without this, the
+      // log was rendering as `{}` and migrations / FK violations were
+      // impossible to diagnose. Same pattern as updateScheduleItem.
+      console.error('[store] addJob failed:', {
+        message: insertErr?.message,
+        code: insertErr?.code,
+        details: insertErr?.details,
+        hint: insertErr?.hint,
+        payload: row,
+      });
+      setError(insertErr?.message ?? 'Failed to save job');
+      // Roll back the optimistic insert
+      setJobs((prev) => prev.filter((j) => j.id !== tempId));
+      return null;
+    }
+    // Replace the temporary row with the persisted one (real id, etc).
+    const persisted = rowToJob(data);
+    setJobs((prev) => prev.map((j) => (j.id === tempId ? persisted : j)));
+    return persisted;
   }, [businessId]);
 
   /**
@@ -1108,24 +1153,38 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     id: string,
     updates: Partial<Quote>,
   ): Promise<{ ok: boolean; error?: string }> => {
-    let prevQuote: Quote | undefined;
-    setQuotes((prev) => {
-      prevQuote = prev.find((q) => q.id === id);
-      return prev.map((q) => (q.id === id ? { ...q, ...updates } : q));
-    });
-    if (!prevQuote) return { ok: false, error: 'Quote not found.' };
-
+    // Write to Supabase FIRST so we don't depend on local state to
+    // find the row. Previously we checked the local quotes array
+    // before doing the update — which broke when ensureJobHasQuote
+    // had just created a row that hadn't propagated into local
+    // state yet (React 19 batches setQuotes more aggressively than
+    // React 18). Supabase is the source of truth; if the row exists
+    // there, the update goes through. If not, we get a clean 404
+    // back rather than a stale-local-state false negative.
     const row = quoteToRow(updates);
-    const { error: updErr } = await supabase
-      .from('quotes').update(row).eq('id', id);
+    const { data, error: updErr } = await supabase
+      .from('quotes').update(row).eq('id', id).select('*').maybeSingle();
     if (updErr) {
       const msg = describeError(updErr);
       console.error('[updateQuote] update failed:', msg);
       setError(msg);
-      // Roll back to previous state.
-      setQuotes((prev) => prev.map((q) => (q.id === id ? prevQuote! : q)));
       return { ok: false, error: msg };
     }
+    if (!data) {
+      // Row genuinely doesn't exist in Supabase (RLS hid it or it
+      // was deleted between create and update).
+      return { ok: false, error: 'Quote not found in database.' };
+    }
+    // Reconcile local state with whatever Supabase returned. Insert
+    // if missing (race-recovery), otherwise merge in the updates.
+    const persisted = rowToQuote(data);
+    setQuotes((prev) => {
+      const idx = prev.findIndex((q) => q.id === id);
+      if (idx === -1) return [persisted, ...prev];
+      const next = [...prev];
+      next[idx] = persisted;
+      return next;
+    });
     return { ok: true };
   }, []);
 
@@ -2046,6 +2105,128 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { inserted: persisted.length, failed: entryInits.length - persisted.length };
   }, [businessId]);
 
+  // ── Quote template ─────────────────────────────────────────────────
+  // The settings row keyed 'quote_template' holds a JSON blob; we
+  // parse it on read and stringify on write. Migration 014 seeded a
+  // default row for every business so there's normally something to
+  // return — but we defend against null in case a future business is
+  // somehow created without a seed.
+  const getQuoteTemplate = useCallback((): QuoteTemplate | null => {
+    const row = settings.find((s) => s.key === 'quote_template');
+    if (!row || !row.value) return null;
+    try {
+      return JSON.parse(row.value) as QuoteTemplate;
+    } catch (e) {
+      console.error('[store] getQuoteTemplate: invalid JSON in settings row', e);
+      return null;
+    }
+  }, [settings]);
+
+  const saveQuoteTemplate = useCallback(async (
+    template: QuoteTemplate,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!businessId) {
+      return { ok: false, error: 'No business loaded — try refreshing.' };
+    }
+    const valueJson = JSON.stringify(template);
+    // Optimistic local update first so the UI reflects the new
+    // values immediately. Rollback-on-failure mirrors the other
+    // mutators in this file.
+    const prev = settings.find((s) => s.key === 'quote_template');
+    const now = new Date().toISOString();
+    setSettings((list) => {
+      const others = list.filter((s) => s.key !== 'quote_template');
+      return [...others, {
+        businessId,
+        key: 'quote_template',
+        value: valueJson,
+        notes: prev?.notes,
+        updatedAt: now,
+      }];
+    });
+
+    const { error: upsertErr } = await supabase
+      .from('settings')
+      .upsert(
+        { business_id: businessId, key: 'quote_template', value: valueJson },
+        { onConflict: 'business_id,key' },
+      );
+    if (upsertErr) {
+      console.error('[store] saveQuoteTemplate failed:', {
+        message: upsertErr.message,
+        code: upsertErr.code,
+        details: upsertErr.details,
+        hint: upsertErr.hint,
+      });
+      // Roll back to whatever was there before (or remove if we
+      // just created it).
+      setSettings((list) => {
+        const others = list.filter((s) => s.key !== 'quote_template');
+        return prev ? [...others, prev] : others;
+      });
+      return { ok: false, error: upsertErr.message };
+    }
+    return { ok: true };
+  }, [businessId, settings]);
+
+  const uploadBusinessLogo = useCallback(async (file: File): Promise<string | null> => {
+    if (!businessId) {
+      setError('No business loaded — try refreshing.');
+      return null;
+    }
+    // Pick the extension off the original filename. Defaults to
+    // 'png' for safety; the storage object's MIME type comes from
+    // contentType below regardless.
+    const ext = (file.name.split('.').pop() ?? 'png').toLowerCase().slice(0, 4);
+    const path = `${businessId}/logo.${ext}`;
+
+    // Compress images >500KB to keep PDFs small and uploads fast.
+    // compressImage takes care of skipping SVGs / non-images internally,
+    // so we only gate on size here. The returned CompressResult.file
+    // is what we actually upload — same shape as the input File when
+    // compression was skipped, or a fresh re-encoded File otherwise.
+    let payload: File = file;
+    if (file.size > 500_000) {
+      try {
+        const result = await compressImage(file);
+        payload = result.file;
+      } catch (e) {
+        console.warn('[store] uploadBusinessLogo: compression failed, uploading original:', e);
+      }
+    }
+
+    const { error: upErr } = await supabase.storage
+      .from('business-logos')
+      .upload(path, payload, {
+        // upsert=true so re-uploading replaces the previous logo at
+        // the same path without needing a separate delete.
+        upsert: true,
+        contentType: file.type || 'image/png',
+        cacheControl: '3600',
+      });
+    if (upErr) {
+      console.error('[store] uploadBusinessLogo failed:', {
+        message: upErr.message,
+        path,
+        size: file.size,
+      });
+      setError(upErr.message);
+      return null;
+    }
+    return path;
+  }, [businessId]);
+
+  const resolveLogoUrl = useCallback((storagePath: string | undefined | null): string | null => {
+    if (!storagePath) return null;
+    // The business-logos bucket is public, so getPublicUrl returns
+    // a URL anyone can fetch — perfect for embedding in customer-
+    // facing PDFs without juggling signed-URL expiry.
+    const { data } = supabase.storage
+      .from('business-logos')
+      .getPublicUrl(storagePath);
+    return data.publicUrl ?? null;
+  }, []);
+
   return (
     <StoreContext.Provider
       value={{
@@ -2062,6 +2243,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         updateQuote, deleteQuote,
         commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
         importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
+        getQuoteTemplate, saveQuoteTemplate, uploadBusinessLogo, resolveLogoUrl,
         refresh: load,
       }}
     >

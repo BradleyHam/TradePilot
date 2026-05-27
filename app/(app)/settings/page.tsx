@@ -7,7 +7,7 @@ import { supabase } from '@/lib/supabase/client';
 import { Separator } from '@/components/ui/separator';
 import { Badge } from '@/components/ui/badge';
 import {
-  Building2, User, Palette, Bell, Database, Info, ChevronRight, Hammer, LogOut,
+  Building2, User, Palette, Bell, Database, Info, ChevronRight, Hammer, LogOut, FileText,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -59,6 +59,12 @@ export default function SettingsPage() {
   const router = useRouter();
   const { jobs, entries, settings } = useStore();
 
+  // Has a quote_template settings row been written for this business?
+  // Drives the "set up" vs "edit" affordance on the row below. Migration
+  // 014 seeds one for every business but the user might want to know
+  // they haven't customised anything yet vs. just seeing the row.
+  const hasQuoteTemplate = settings.some((s) => s.key === 'quote_template');
+
   async function handleSignOut() {
     await supabase.auth.signOut();
     router.replace('/login');
@@ -94,6 +100,19 @@ export default function SettingsPage() {
           <SettingRow icon={Building2} label="Business name" value={businessName} />
           <SettingRow icon={User} label="Owner" value="Brad Hamilton" />
           <SettingRow icon={Palette} label="Industry" value="Painting" />
+        </SettingSection>
+
+        {/* Quotes — defaults that drive every generated quote PDF. */}
+        <SettingSection title="Quotes">
+          <SettingRow
+            icon={FileText}
+            label="Quote template"
+            value={hasQuoteTemplate
+              ? 'Logo, business details, payment terms, T&Cs'
+              : 'Set up your branding and defaults'}
+            badge={hasQuoteTemplate ? undefined : 'Set up'}
+            onClick={() => router.push('/settings/quote-template')}
+          />
         </SettingSection>
 
         {/* GST */}

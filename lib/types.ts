@@ -171,6 +171,75 @@ export interface Job {
   surfaceAreaM2?: number;
   /** Subjective sense of how much prep this job needs. */
   prepLevel?: PrepLevel;
+  /**
+   * Free-form scope notes captured at the site visit, in Brad's words.
+   * Distinct from `notes` (which is general-purpose) — this is specifically
+   * the "I walked the property and saw…" capture from the wrap-up sheet.
+   * Feeds Tier-2 quote drafting later.
+   */
+  scopeNotes?: string;
+  /**
+   * Site-access chip values captured at the wrap-up. Drives whether Brad
+   * needs scaffold, a cherry-picker, or just a ladder — and reminds him
+   * to mention these in the quote. Free-form strings so the chip
+   * vocabulary can evolve without a migration.
+   *
+   * Example: ['ladder-ok', 'second-storey', 'tight-driveway']
+   */
+  accessNotes?: string[];
+  /**
+   * Date Brad promised the customer the quote by. Drives a "quote owed"
+   * surface on Home — the bridge between "site visit done" and "quote
+   * actually sent". Nullable; only meaningful while status is lead/quoted.
+   */
+  quoteReadyBy?: string;
+  /**
+   * Coats to apply — 1 / 2 / 3 typically. After area, the single biggest
+   * lever on materials cost AND labour (each extra coat is ~1 extra day
+   * for a 100m² job once drying time is factored in).
+   */
+  coatsCount?: number;
+  /**
+   * Stain / paint product brand+name. Free text so Brad can write what
+   * he actually uses ('Wood-X mid stain', 'Cedarshield natural', 'Resene
+   * Woodsman cedar'). Drives materials cost AND recommended coat count.
+   */
+  stainProduct?: string;
+  /**
+   * Rough count of windows + doors in the cedar area. Used to estimate
+   * cutting-in time (every window means ~10 minutes of slow careful
+   * brush work). 0 is valid (a fully-clad shed has none).
+   */
+  windowDoorCount?: number;
+  /**
+   * Additional items the quote covers beyond the main cedar walls.
+   * Multi-select chip values: 'soffits', 'decking', 'handrails',
+   * 'pergola', 'gates', 'window-frames', 'fascia', 'garage-doors',
+   * 'pergola-posts'. Free-form strings so the vocabulary evolves
+   * without a migration. Stored as text[].
+   */
+  addonItems?: string[];
+  /**
+   * Site logistics chips — practical realities that affect job setup
+   * time and tool/material selection. Examples: 'off-street-parking',
+   * 'water-available', 'power-for-sander', 'pets-to-manage',
+   * 'tenanted', 'children-on-site', 'restricted-hours'. Multi-select.
+   */
+  siteLogistics?: string[];
+  /**
+   * Brad's gut estimate of the job duration in days (decimal allowed
+   * for half-days). Sanity-checked against area+prep math by the AI —
+   * if they disagree by >30% something's worth a second look.
+   */
+  daysEstimate?: number;
+  /**
+   * Soft commercial factors that move the quote price ±15% without
+   * changing the cost basis. Examples: 'referral', 'repeat-customer',
+   * 'price-shopping', 'urgent', 'mentioned-budget', 'first-impression-strong',
+   * 'decision-maker-present', 'not-a-rush'. Drives the AI's suggested
+   * price range vs. its calculated cost. Multi-select chips.
+   */
+  commercialSignals?: string[];
   /** Set when status = 'lost'. Mutually exclusive with wonReason. */
   lostReason?: LostReason;
   /** Set when status = 'accepted'. Mutually exclusive with lostReason. */
@@ -474,6 +543,67 @@ export interface Setting {
   value?: string;
   notes?: string;
   updatedAt: string;
+}
+
+/**
+ * Per-business quote template. Stored as a JSON blob in the `settings`
+ * row keyed 'quote_template' so the schema can evolve without
+ * migrations. Seeded by migration 014 with sensible Lakeside defaults;
+ * editable via /settings/quote-template (Session 1 of the quote
+ * builder work).
+ *
+ * Used by:
+ *   - The settings UI (read + write).
+ *   - The future AI quote drafter (read — to know the business
+ *     identity it's writing on behalf of).
+ *   - The future React-PDF generator (read — to render header,
+ *     payment terms, T&Cs on the PDF).
+ *
+ * All fields nullable so an under-filled template still renders
+ * something (just with placeholders) rather than blowing up.
+ */
+export interface QuoteTemplate {
+  header: {
+    /** Trading name shown at the top of the PDF. */
+    businessName?: string;
+    /** NZ GST registration number, formatted XX-XXX-XXX. */
+    gstNumber?: string;
+    phone?: string;
+    email?: string;
+    /** Physical address — appears under the header. */
+    address?: string;
+    /**
+     * Storage path of the logo in the `business-logos` bucket,
+     * e.g. "<businessId>/logo.png". The UI resolves this to a
+     * public URL for display + PDF embed.
+     */
+    logoStoragePath?: string;
+  };
+  paymentTerms: {
+    /** % deposit required to confirm the booking. NZ standard ~30%. */
+    depositPercent: number;
+    /** Days from quote acceptance to deposit due. */
+    depositDueDays: number;
+    /**
+     * When the balance is payable. 'on_completion' = single lump
+     * at job end. Future: 'progress' would add a midway payment.
+     */
+    balanceDue: 'on_completion' | 'progress';
+  };
+  /** Quote validity in days from issue date. Default 30. */
+  validityDays: number;
+  /**
+   * 'incl' = totals shown GST-inclusive (NZ retail convention).
+   * 'excl' = ex-GST + GST line + incl-GST total. We default to
+   * 'incl' because residential customers expect it.
+   */
+  gstTreatment: 'incl' | 'excl';
+  /**
+   * Free-form T&Cs / scope-exclusions block. Plain text — bullets
+   * with hyphens, line breaks via \n. The PDF generator splits on
+   * newlines to render a list.
+   */
+  defaultTerms?: string;
 }
 
 export type InvoiceKind = 'deposit' | 'progress' | 'final';

@@ -11,6 +11,8 @@ import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { EntryForm } from '@/components/entry/entry-form';
 import { EditScheduleItemSheet, ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
+import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
+import { VisitActionChooser } from '@/components/schedule/visit-action-chooser';
 import { downloadIcs } from '@/lib/ics';
 import {
   Select,
@@ -333,7 +335,21 @@ export default function SchedulePage() {
     return items.length > 0 ? { items } : null;
   }, [editingItemIds, scheduleItems]);
 
+  // Chooser state — when set, the user tapped the body of a quote_visit
+  // RunCard and we're showing the Wrap up / Edit chooser. The items
+  // are remembered so whichever branch the user picks can open with
+  // the same row context.
+  const [chooserItems, setChooserItems] = useState<ScheduleItem[] | null>(null);
+
   function openEdit(items: ScheduleItem[]) {
+    // Quote visits get a fork: tapping the row is ambiguous between
+    // "I want to wrap up the visit" and "I want to fix the schedule
+    // details", so we show a chooser. Other types skip straight to
+    // the edit sheet — their row tap has no ambiguity.
+    if (items.length > 0 && items[0].type === 'quote_visit') {
+      setChooserItems(items);
+      return;
+    }
     setEditingItemIds(items.map((i) => i.id));
   }
 
@@ -387,6 +403,33 @@ export default function SchedulePage() {
     notes?: string;
   }>(null);
 
+  // Wrap-up sheet state. Holds a list of schedule_item ids (usually
+  // one, occasionally a multi-day run) so we can mark them all done
+  // on save. The WrapUpTarget for the sheet is computed from the
+  // "head" item — existing-job mode if it has a jobId, otherwise
+  // create-from-visit so the sheet can mint a new lead.
+  const [wrapUpScheduleItemIds, setWrapUpScheduleItemIds] = useState<string[] | null>(null);
+  const wrapUpHead = wrapUpScheduleItemIds && wrapUpScheduleItemIds.length > 0
+    ? scheduleItems.find((s) => s.id === wrapUpScheduleItemIds[0]) ?? null
+    : null;
+  // Memoised so the WrapUpTarget identity is stable across unrelated
+  // re-renders. Without this the wrap-up sheet's hydration effect
+  // re-fires on every store update and clears any staged photos/plans
+  // the user is in the middle of queueing. See lib/store.tsx — store
+  // updates are chatty enough that this would happen on every change.
+  const wrapUpTarget = useMemo<WrapUpTarget | null>(() => {
+    if (!wrapUpHead) return null;
+    if (wrapUpHead.jobId) {
+      const linkedJob = jobs.find((j) => j.id === wrapUpHead.jobId);
+      if (linkedJob) return { mode: 'existing-job', job: linkedJob };
+    }
+    return {
+      mode: 'create-from-visit',
+      visitTitle: wrapUpHead.title,
+      visitNotes: wrapUpHead.notes,
+    };
+  }, [wrapUpHead, jobs]);
+
   // View mode: phone-first default (list on narrow viewports, month on desktop).
   // Lazy initializer runs once on mount in this `use client` page. It reads the
   // saved choice from localStorage, otherwise picks by viewport width.
@@ -418,7 +461,17 @@ export default function SchedulePage() {
   }, [filteredAll]);
 
   function handleComplete(run: ItemRun) {
-    // Mark every item in the run completed. Single-day items just flip one row.
+    // Quote visits open the wrap-up sheet instead of ticking
+    // immediately — the wrap-up's onSaved completes the items for us.
+    // Works whether or not the visit has a linked job (no-job visits
+    // create one on save). Cancelled wrap-up leaves the row
+    // uncompleted so Brad knows he still owes a write-up.
+    if (run.head.type === 'quote_visit') {
+      setWrapUpScheduleItemIds(run.items.map((it) => it.id));
+      return;
+    }
+    // Default behaviour for everything else: mark every item in the
+    // run completed. Single-day items just flip one row.
     for (const it of run.items) {
       if (!it.completed) updateScheduleItem(it.id, { completed: true });
     }
@@ -615,6 +668,9 @@ export default function SchedulePage() {
             onComplete={handleComplete}
             onEdit={openEdit}
             onAddToCalendar={handleAddItemToCalendar}
+            onWrapUp={(item) => {
+              setWrapUpScheduleItemIds([item.id]);
+            }}
           />
         ) : view === 'week' ? (
           <WeekView
@@ -633,6 +689,10 @@ export default function SchedulePage() {
             onComplete={handleComplete}
             onEditHours={(id) => setEditingHoursId(id)}
             onEdit={openEdit}
+            onWrapUp={(item) => {
+              setWrapUpScheduleItemIds([item.id]);
+            }}
+            onAddToCalendar={handleAddItemToCalendar}
           />
         )}
       </div>
@@ -723,6 +783,51 @@ export default function SchedulePage() {
         jobs={jobs}
       />
 
+      {/* Site-visit wrap-up — opens when a quote_visit row with a
+          linked job is ticked. Captures scope/photos/access while
+          the visit is fresh. On save, completes the underlying
+          schedule_item(s). */}
+      {/* Wrap-up / edit chooser — only shown after a quote_visit row
+          is tapped. Picks branch the user actually wants. */}
+      <VisitActionChooser
+        open={chooserItems !== null}
+        itemTitle={chooserItems?.[0]?.title}
+        itemDate={chooserItems?.[0]?.date
+          ? format(parseISODate(chooserItems[0].date), 'EEE, d MMM yyyy')
+          : undefined}
+        onWrapUp={() => {
+          if (chooserItems) {
+            setWrapUpScheduleItemIds(chooserItems.map((it) => it.id));
+          }
+          setChooserItems(null);
+        }}
+        onEdit={() => {
+          if (chooserItems) {
+            setEditingItemIds(chooserItems.map((it) => it.id));
+          }
+          setChooserItems(null);
+        }}
+        onCancel={() => setChooserItems(null)}
+      />
+
+      <SiteVisitWrapUpSheet
+        open={wrapUpTarget !== null}
+        target={wrapUpTarget}
+        onSaved={(resolvedJobId) => {
+          if (wrapUpScheduleItemIds) {
+            // Complete every item in the run AND attach the resolved
+            // jobId. If the wrap-up created a new job, this is the
+            // moment the schedule_item gets its link. Existing-job
+            // case writes the same id back, which is a harmless no-op.
+            for (const id of wrapUpScheduleItemIds) {
+              updateScheduleItem(id, { completed: true, jobId: resolvedJobId });
+            }
+          }
+          setWrapUpScheduleItemIds(null);
+        }}
+        onCancel={() => setWrapUpScheduleItemIds(null)}
+      />
+
       {/* Edit-hours sheet — shared by week + month view. Tap a logged-hours
           card on either view to open this; uses the same EntryForm as the
           dedicated /entries page so the experience is consistent. */}
@@ -763,6 +868,7 @@ function ListView({
   onComplete,
   onEdit,
   onAddToCalendar,
+  onWrapUp,
 }: {
   runs: ItemRun[];
   completedRuns: ItemRun[];
@@ -772,6 +878,8 @@ function ListView({
   /** Re-trigger the .ics download for a single schedule item. Optional;
    * when omitted the badge on quote_visit rows still renders but is inert. */
   onAddToCalendar?: (item: ScheduleItem) => void;
+  /** Open retroactive wrap-up for a completed quote_visit row. */
+  onWrapUp?: (item: ScheduleItem) => void;
 }) {
   // Group runs by their start-date label (Today / Tomorrow / weekday / date).
   const grouped: Record<string, ItemRun[]> = {};
@@ -828,8 +936,10 @@ function ListView({
                 job={run.head.jobId ? jobs.find((j) => j.id === run.head.jobId) : undefined}
                 onComplete={() => {}}
                 onEdit={() => onEdit(run.items)}
-                // No onAddToCalendar for completed items — no point setting
-                // a reminder for something that's already happened.
+                // Pass onWrapUp so completed quote_visit cards can offer
+                // a retroactive write-up. onAddToCalendar deliberately
+                // omitted — no point setting reminders on past events.
+                onWrapUp={onWrapUp ? () => onWrapUp(run.head) : undefined}
               />
             ))}
           </div>
@@ -845,6 +955,7 @@ function RunCard({
   onComplete,
   onEdit,
   onAddToCalendar,
+  onWrapUp,
 }: {
   run: ItemRun;
   job?: { name: string } | undefined;
@@ -858,6 +969,14 @@ function RunCard({
    * (or when icsDownloaded is true) the badge is read-only.
    */
   onAddToCalendar?: () => void;
+  /**
+   * Retroactive site-visit wrap-up. Only meaningful for quote_visit
+   * rows with a linked job that have already been ticked complete (the
+   * incomplete case is handled by onComplete itself, which opens the
+   * wrap-up via the page-level fork). Renders a small pill on the
+   * card so Brad can write up a visit he'd already marked done.
+   */
+  onWrapUp?: () => void;
 }) {
   const config = TYPE_CONFIG[run.head.type];
   const Icon = config.icon;
@@ -951,6 +1070,29 @@ function RunCard({
           )
         )}
 
+        {/* Retroactive wrap-up pill — on any already-completed quote_visit
+            row. (Incomplete visits use the tick to open the wrap-up
+            directly.) Works whether or not the visit has a linked job —
+            wrap-up creates one if needed. Discoverable on the muted
+            "done" card so Brad can write up a visit he ticked-through
+            earlier without re-opening it. */}
+        {run.head.type === 'quote_visit'
+          && run.allCompleted
+          && onWrapUp && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onWrapUp();
+            }}
+            className="mt-1.5 ml-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-primary/10 text-primary hover:bg-primary/15"
+            title="Capture scope, photos and access notes for this site visit"
+          >
+            <FileText size={10} strokeWidth={2.2} />
+            Wrap up visit
+          </button>
+        )}
+
         {run.head.notes && (
           <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{run.head.notes}</p>
         )}
@@ -990,6 +1132,9 @@ function WeekView({
   onComplete: (run: ItemRun) => void;
   onEditHours: (entryId: string) => void;
   onEdit: (items: ScheduleItem[]) => void;
+  // Note: WeekView intentionally doesn't surface the wrap-up / add-to-
+  // calendar actions — its chips are too compact to host pills, and
+  // the user can switch to Month or List to perform those actions.
 }) {
   // For the week view we want tapping any chip in a multi-day run to open
   // the *whole* run, not just the day under the cursor — so the user can
@@ -1293,6 +1438,8 @@ function MonthView({
   onComplete,
   onEditHours,
   onEdit,
+  onWrapUp,
+  onAddToCalendar,
 }: {
   items: ScheduleItem[];
   jobs: Job[];
@@ -1300,6 +1447,11 @@ function MonthView({
   onComplete: (run: ItemRun) => void;
   onEditHours: (entryId: string) => void;
   onEdit: (items: ScheduleItem[]) => void;
+  /** Retroactive site-visit wrap-up — surfaces the pill on completed
+   * quote_visit cards rendered in the day-detail popover. */
+  onWrapUp?: (item: ScheduleItem) => void;
+  /** .ics re-download for quote_visit cards in the day-detail popover. */
+  onAddToCalendar?: (item: ScheduleItem) => void;
 }) {
   // Same item→run lookup as WeekView: when the user taps an item in the
   // day-detail sheet we open the *whole run* in the editor, not just the
@@ -1540,10 +1692,16 @@ function MonthView({
                             days: 1, allCompleted: it.completed,
                           }}
                           job={job}
-                          onComplete={() => onComplete({
-                            head: it, items: [it], startDate: it.date, endDate: it.date,
-                            days: 1, allCompleted: it.completed,
-                          })}
+                          onComplete={() => {
+                            // Tick from day-detail: close the popover BEFORE
+                            // calling onComplete so the wrap-up sheet (for
+                            // quote_visit+job items) doesn't stack underneath.
+                            setSelectedDay(null);
+                            onComplete({
+                              head: it, items: [it], startDate: it.date, endDate: it.date,
+                              days: 1, allCompleted: it.completed,
+                            });
+                          }}
                           onEdit={() => {
                             // Close the day-detail sheet before opening the
                             // editor so we never have two sheets stacked.
@@ -1551,6 +1709,14 @@ function MonthView({
                             setSelectedDay(null);
                             onEdit(run ? run.items : [it]);
                           }}
+                          onWrapUp={onWrapUp ? () => {
+                            // Same closing dance as onComplete — the wrap-up
+                            // sheet is a separate modal and we don't want
+                            // two stacked.
+                            setSelectedDay(null);
+                            onWrapUp(it);
+                          } : undefined}
+                          onAddToCalendar={onAddToCalendar ? () => onAddToCalendar(it) : undefined}
                         />
                       );
                     })}
