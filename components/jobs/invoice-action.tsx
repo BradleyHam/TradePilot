@@ -1,11 +1,13 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
-import type { Job, Invoice, InvoiceKind } from '@/lib/types';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
+import type { Job, Invoice, InvoiceKind, ParsedInvoice } from '@/lib/types';
 import { useStore } from '@/lib/store';
+import { supabase } from '@/lib/supabase/client';
+import { extractPdfText } from '@/lib/pdf/extract-text';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
-import { Receipt } from 'lucide-react';
+import { Receipt, Upload, Undo2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const NZ_GST_RATE = 0.15;
@@ -105,6 +107,191 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
   const [paidDate, setPaidDate]           = useState(invoice?.paidDate ?? todayIso());
   const [submitting, setSubmitting]       = useState(false);
 
+  // ── PDF upload / extract state ──────────────────────────────────────────
+  // The user can drag an invoice PDF into the drop zone (or tap to pick one).
+  // We extract text client-side, POST to /api/parse-invoice, then populate
+  // the form fields with what came back. A snapshot of pre-upload values is
+  // captured so the "Undo" affordance can roll back.
+  type ExtractStage = 'idle' | 'reading' | 'parsing' | 'error' | 'done';
+  const [extractStage, setExtractStage] = useState<ExtractStage>('idle');
+  const [extractMsg, setExtractMsg] = useState<string | null>(null);
+  const [dragOver, setDragOver] = useState(false);
+  const dragDepth = useRef(0);
+  // The previous form values captured right before we overwrite from PDF.
+  // null = no undo available (haven't extracted yet, or already undone).
+  type FormSnapshot = {
+    kind: InvoiceKind;
+    invoiceNumber: string;
+    invoiceDate: string;
+    amountStr: string;
+    variation: string;
+  };
+  const [undoSnapshot, setUndoSnapshot] = useState<FormSnapshot | null>(null);
+  // How many fields the most recent extraction actually filled. Drives
+  // the "Filled N fields from PDF" banner copy.
+  const [filledCount, setFilledCount] = useState(0);
+
+  const handleExtractFile = useCallback(async (file: File) => {
+    setExtractMsg(null);
+    setUndoSnapshot(null);
+
+    // 1. Validate file.
+    const MAX_PDF_BYTES = 10 * 1024 * 1024;
+    if (file.size === 0) {
+      setExtractStage('error');
+      setExtractMsg('File is empty.');
+      return;
+    }
+    if (file.size > MAX_PDF_BYTES) {
+      setExtractStage('error');
+      setExtractMsg(`PDF too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max 10MB.`);
+      return;
+    }
+    if (file.type && file.type !== 'application/pdf') {
+      setExtractStage('error');
+      setExtractMsg('Not a PDF file.');
+      return;
+    }
+
+    // 2. Extract text client-side.
+    setExtractStage('reading');
+    let extracted: Awaited<ReturnType<typeof extractPdfText>>;
+    try {
+      extracted = await extractPdfText(file);
+    } catch (err) {
+      console.error('[invoice-extract] PDF text extract failed:', err);
+      setExtractStage('error');
+      setExtractMsg("Couldn't read this PDF — it may be an image-only scan or password-protected.");
+      return;
+    }
+    if (extracted.text.trim().length < 20) {
+      setExtractStage('error');
+      setExtractMsg("No readable text in this PDF — image-only scans aren't supported yet.");
+      return;
+    }
+
+    // 3. POST /api/parse-invoice.
+    setExtractStage('parsing');
+    const { data: sessionData } = await supabase.auth.getSession();
+    const token = sessionData.session?.access_token;
+    if (!token) {
+      setExtractStage('error');
+      setExtractMsg('Not signed in — please refresh and sign in again.');
+      return;
+    }
+    let parsed: ParsedInvoice;
+    try {
+      const res = await fetch('/api/parse-invoice', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${token}`,
+        },
+        body: JSON.stringify({ text: extracted.text }),
+      });
+      const json = await res.json();
+      if (!res.ok || !json.ok) {
+        const detail = json.error ?? `HTTP ${res.status}`;
+        setExtractStage('error');
+        setExtractMsg(`Parser failed: ${detail}`);
+        return;
+      }
+      parsed = json.parsed as ParsedInvoice;
+    } catch (err) {
+      console.error('[invoice-extract] parse request failed:', err);
+      setExtractStage('error');
+      setExtractMsg("Couldn't reach the parser. Check your connection and try again.");
+      return;
+    }
+
+    // 4. Snapshot current values for Undo, then overwrite from parsed.
+    //    We capture BEFORE setState calls so the snapshot is the user's
+    //    state at moment-of-upload, not the half-updated state.
+    const snapshot: FormSnapshot = {
+      kind, invoiceNumber, invoiceDate, amountStr, variation,
+    };
+
+    let filled = 0;
+    if (parsed.kind && !hasFinal /* don't auto-set to 'final' when one exists */) {
+      // Only auto-set kind if the picker would have allowed it manually —
+      // i.e. skip when a deposit/final of the same kind already exists.
+      if (!(parsed.kind === 'deposit' && hasDeposit)) {
+        setKind(parsed.kind);
+        filled++;
+      }
+    }
+    if (parsed.invoiceNumber) {
+      setInvoiceNumber(parsed.invoiceNumber);
+      filled++;
+    }
+    if (parsed.invoiceDate) {
+      setInvoiceDate(parsed.invoiceDate);
+      filled++;
+    }
+    if (typeof parsed.amountExGst === 'number' && parsed.amountExGst > 0) {
+      setAmountStr(parsed.amountExGst.toFixed(2));
+      filled++;
+    }
+    if (parsed.description) {
+      setVariation(parsed.description);
+      filled++;
+    }
+
+    if (filled === 0) {
+      // Parser ran but nothing usable came back. Don't show "filled 0
+      // fields" — surface as an error instead.
+      setExtractStage('error');
+      setExtractMsg("Couldn't read enough from this PDF to fill any fields.");
+      return;
+    }
+
+    setUndoSnapshot(snapshot);
+    setFilledCount(filled);
+    setExtractStage('done');
+    setExtractMsg(null);
+  }, [kind, invoiceNumber, invoiceDate, amountStr, variation, hasDeposit, hasFinal]);
+
+  function undoExtract() {
+    if (!undoSnapshot) return;
+    setKind(undoSnapshot.kind);
+    setInvoiceNumber(undoSnapshot.invoiceNumber);
+    setInvoiceDate(undoSnapshot.invoiceDate);
+    setAmountStr(undoSnapshot.amountStr);
+    setVariation(undoSnapshot.variation);
+    setUndoSnapshot(null);
+    setExtractStage('idle');
+  }
+
+  // Drag-drop handlers. dragDepth tracks nested enter/leave so the styling
+  // doesn't flicker when the cursor passes over child elements.
+  function onDragEnter(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepth.current++;
+    setDragOver(true);
+  }
+  function onDragOver(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+  function onDragLeave(e: React.DragEvent) {
+    e.preventDefault();
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setDragOver(false);
+  }
+  function onDrop(e: React.DragEvent) {
+    e.preventDefault();
+    dragDepth.current = 0;
+    setDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) void handleExtractFile(file);
+  }
+  const extractBusy = extractStage === 'reading' || extractStage === 'parsing';
+  const extractBusyLabel = extractStage === 'reading' ? 'Reading PDF…'
+    : extractStage === 'parsing' ? 'Reading invoice…'
+    : null;
+
   // Re-seed when re-opened or job/invoice changes
   useEffect(() => {
     if (!open) return;
@@ -125,6 +312,12 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
       setMarkPaid(false);
       setPaidDate(todayIso());
     }
+    // Clear extract state too — re-opening should feel like a fresh start,
+    // not show a stale "Filled 4 fields" banner from the last time.
+    setExtractStage('idle');
+    setExtractMsg(null);
+    setUndoSnapshot(null);
+    setFilledCount(0);
   }, [open, job.id, invoice, defaultKind, defaultNumber, suggestedAmount]);
 
   // Re-derive number when user changes kind — but only in CREATE mode.
@@ -261,6 +454,80 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
 
           {/* Body */}
           <div className="flex-1 overflow-y-auto px-4 py-4 space-y-3">
+            {/* PDF drop zone — drag in an invoice PDF (e.g. one you wrote
+                in Word/Pages/your accounting tool) to auto-fill the form
+                below. Hidden in edit mode since the form is already
+                populated with the existing invoice's data. */}
+            {!isEdit && (
+              <div
+                onDragEnter={onDragEnter}
+                onDragOver={onDragOver}
+                onDragLeave={onDragLeave}
+                onDrop={onDrop}
+              >
+                <label
+                  className={cn(
+                    'flex items-center justify-center gap-2 px-3 h-12 rounded-lg border-2 border-dashed cursor-pointer transition-colors text-sm',
+                    extractBusy && 'cursor-wait opacity-60',
+                    dragOver
+                      ? 'border-primary bg-primary/5 text-foreground'
+                      : 'border-input bg-muted/30 hover:bg-muted/50 text-muted-foreground',
+                  )}
+                >
+                  <Upload
+                    size={15}
+                    className={cn(dragOver ? 'text-primary' : 'text-muted-foreground')}
+                    strokeWidth={1.8}
+                  />
+                  <span className="font-medium">
+                    {dragOver
+                      ? 'Drop invoice PDF'
+                      : extractBusy
+                        ? extractBusyLabel
+                        : 'Drop invoice PDF to auto-fill'}
+                  </span>
+                  <input
+                    type="file"
+                    accept="application/pdf,.pdf"
+                    className="hidden"
+                    disabled={extractBusy}
+                    onChange={(e) => {
+                      const f = e.target.files?.[0];
+                      if (f) void handleExtractFile(f);
+                      e.target.value = '';
+                    }}
+                  />
+                </label>
+
+                {/* Success banner with Undo. Only shown for the most recent
+                    extraction; user can dismiss by undoing or by editing
+                    any field (we don't auto-clear, so the affordance stays
+                    discoverable for as long as it's useful). */}
+                {extractStage === 'done' && undoSnapshot && (
+                  <div className="mt-2 flex items-center gap-2 px-3 py-1.5 rounded-lg bg-emerald-50 border border-emerald-200 text-[11px]">
+                    <span className="text-emerald-800 flex-1">
+                      Filled {filledCount} field{filledCount === 1 ? '' : 's'} from PDF — check and edit if needed.
+                    </span>
+                    <button
+                      type="button"
+                      onClick={undoExtract}
+                      className="inline-flex items-center gap-1 text-emerald-800 hover:text-emerald-900 font-medium"
+                    >
+                      <Undo2 size={11} strokeWidth={2.2} />
+                      Undo
+                    </button>
+                  </div>
+                )}
+
+                {/* Error banner */}
+                {extractStage === 'error' && extractMsg && (
+                  <p className="mt-2 text-[11px] px-3 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200">
+                    {extractMsg}
+                  </p>
+                )}
+              </div>
+            )}
+
             {/* Kind picker — Deposit / Final / Progress */}
             <div>
               <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1.5 block">

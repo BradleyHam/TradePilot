@@ -3,7 +3,7 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useStore } from '@/lib/store';
-import { Job, ScheduleItem, ScheduleItemType, Entry } from '@/lib/types';
+import { Job, ScheduleItem, ScheduleItemType, Entry, ScheduleSkipReasonKind } from '@/lib/types';
 import { rankJobs } from '@/lib/job-match';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
@@ -12,6 +12,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { EntryForm } from '@/components/entry/entry-form';
 import { EditScheduleItemSheet, ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
+import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { VisitActionChooser } from '@/components/schedule/visit-action-chooser';
 import { downloadIcs } from '@/lib/ics';
 import {
@@ -25,7 +26,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   CalendarDays, Plus, Briefcase, FileText, Bell, AlertCircle, Receipt, CheckCircle2,
   ChevronLeft, ChevronRight, List as ListIcon, Calendar as CalendarIcon, LayoutGrid,
-  Clock,
+  Clock, CloudRain, Stethoscope, UserX, MoreHorizontal,
 } from 'lucide-react';
 import {
   format, parseISO, isToday, isTomorrow, isPast, isThisWeek,
@@ -86,6 +87,28 @@ const TYPE_CONFIG: Record<ScheduleItemType, { label: string; icon: React.Element
   invoice_due:  { label: 'Invoice',   icon: Receipt,     color: 'text-amber-600',  bg: 'bg-amber-50',  ring: 'ring-amber-200',  bar: 'bg-amber-500' },
   reminder:     { label: 'Reminder',  icon: Bell,        color: 'text-slate-600',  bg: 'bg-slate-50',  ring: 'ring-slate-200',  bar: 'bg-slate-400' },
 };
+
+// ── Skip-reason metadata (migration 020) ────────────────────────────────────
+// User-facing labels for the "Didn't work" picker chips and the chip rendered
+// on the day's RunCard afterwards. Source-of-truth list is the union type
+// ScheduleSkipReasonKind in lib/types.ts.
+const SKIP_REASON_LABELS: Record<ScheduleSkipReasonKind, string> = {
+  rained_off:       'Rained off',
+  sick:             'Sick',
+  client_postponed: 'Client postponed',
+  other:            'Other',
+};
+const SKIP_REASON_ICONS: Record<ScheduleSkipReasonKind, React.ElementType> = {
+  rained_off:       CloudRain,
+  sick:             Stethoscope,
+  client_postponed: UserX,
+  other:            MoreHorizontal,
+};
+// Render order for the picker — most-common first so the eye lands on
+// the most likely choice without scanning.
+const SKIP_REASON_ORDER: ScheduleSkipReasonKind[] = [
+  'rained_off', 'sick', 'client_postponed', 'other',
+];
 
 /**
  * Narrow a string from a query param to a valid ScheduleItemType. Used
@@ -341,6 +364,40 @@ export default function SchedulePage() {
   // the same row context.
   const [chooserItems, setChooserItems] = useState<ScheduleItem[] | null>(null);
 
+  // Skip picker state — set to the schedule_item id when the user taps
+  // "Didn't work" on any RunCard. Storing the id (not the row) so we
+  // always re-read the latest version from the store on render.
+  const [skippingItemId, setSkippingItemId] = useState<string | null>(null);
+  const skippingItem = useMemo(
+    () => skippingItemId ? scheduleItems.find((s) => s.id === skippingItemId) : null,
+    [skippingItemId, scheduleItems],
+  );
+
+  function handleSkip(item: ScheduleItem) {
+    setSkippingItemId(item.id);
+  }
+
+  function handleUnskip(item: ScheduleItem) {
+    // Pass undefined (not null) on both columns so the mapper clears them
+    // via the `|| null` branch. Bumps the row back to a plain scheduled
+    // state — the user can then tick it complete or leave it for later.
+    updateScheduleItem(item.id, {
+      skipReasonKind: undefined,
+      skipReason: undefined,
+    });
+  }
+
+  function commitSkip(kind: ScheduleSkipReasonKind, note: string) {
+    if (!skippingItemId) return;
+    updateScheduleItem(skippingItemId, {
+      skipReasonKind: kind,
+      // Persist note only when there's something there. For 'other' the
+      // form requires a note; for other kinds it's optional context.
+      skipReason: note.trim() || undefined,
+    });
+    setSkippingItemId(null);
+  }
+
   function openEdit(items: ScheduleItem[]) {
     // Quote visits get a fork: tapping the row is ambiguous between
     // "I want to wrap up the visit" and "I want to fix the schedule
@@ -409,6 +466,16 @@ export default function SchedulePage() {
   // "head" item — existing-job mode if it has a jobId, otherwise
   // create-from-visit so the sheet can mint a new lead.
   const [wrapUpScheduleItemIds, setWrapUpScheduleItemIds] = useState<string[] | null>(null);
+
+  // After a successful wrap-up we immediately offer to mark the quote
+  // as sent — that's the natural "what happens next" for a site visit.
+  // Storing the jobId (not the Job row) so we re-read it from the store
+  // on each render and don't trap a stale snapshot.
+  const [pendingQuoteJobId, setPendingQuoteJobId] = useState<string | null>(null);
+  const pendingQuoteJob = useMemo(
+    () => pendingQuoteJobId ? jobs.find((j) => j.id === pendingQuoteJobId) ?? null : null,
+    [pendingQuoteJobId, jobs],
+  );
   const wrapUpHead = wrapUpScheduleItemIds && wrapUpScheduleItemIds.length > 0
     ? scheduleItems.find((s) => s.id === wrapUpScheduleItemIds[0]) ?? null
     : null;
@@ -722,6 +789,8 @@ export default function SchedulePage() {
             onAddToCalendar={handleAddItemToCalendar}
             onLogHours={handleAddEntry}
             onScheduleItems={handleScheduleFromDay}
+            onSkip={handleSkip}
+            onUnskip={handleUnskip}
           />
         )}
       </div>
@@ -839,6 +908,17 @@ export default function SchedulePage() {
         onCancel={() => setChooserItems(null)}
       />
 
+      {/* "Didn't work" picker — opens from the RunCard pill or the
+          day-detail popover. Captures a reason chip + optional note
+          (required for 'other'). Setting these clears the Overdue
+          state while keeping the day visible on the calendar. */}
+      <SkipPickerSheet
+        open={!!skippingItem}
+        item={skippingItem ?? null}
+        onCancel={() => setSkippingItemId(null)}
+        onConfirm={commitSkip}
+      />
+
       <SiteVisitWrapUpSheet
         open={wrapUpTarget !== null}
         target={wrapUpTarget}
@@ -853,8 +933,23 @@ export default function SchedulePage() {
             }
           }
           setWrapUpScheduleItemIds(null);
+          // Natural next step: mark the quote as sent. Open the existing
+          // Mark-as-quoted sheet for this job. The user can Cancel out
+          // of it if they haven't actually sent the quote yet (still
+          // drafting, no price, etc.) — wrap-up data is already saved.
+          setPendingQuoteJobId(resolvedJobId);
         }}
         onCancel={() => setWrapUpScheduleItemIds(null)}
+      />
+
+      {/* Quote-sent prompt — auto-opens after wrap-up so the user can
+          mark the quote sent in one continuous flow. Cancel just
+          closes; wrap-up data stays saved either way. */}
+      <MarkAsQuotedSheet
+        open={pendingQuoteJob !== null}
+        job={pendingQuoteJob}
+        onSaved={() => setPendingQuoteJobId(null)}
+        onCancel={() => setPendingQuoteJobId(null)}
       />
 
       {/* Edit-hours sheet — shared by week + month view. Tap a logged-hours
@@ -985,6 +1080,8 @@ function RunCard({
   onEdit,
   onAddToCalendar,
   onWrapUp,
+  onSkip,
+  onUnskip,
 }: {
   run: ItemRun;
   job?: { name: string } | undefined;
@@ -1006,12 +1103,27 @@ function RunCard({
    * card so Brad can write up a visit he'd already marked done.
    */
   onWrapUp?: () => void;
+  /**
+   * Opens the "Didn't work today" picker (rained off, sick, etc.). Only
+   * surfaced for past-or-today job_booking days that aren't already
+   * completed or skipped. The card stays on the calendar after skipping
+   * but renders faded with the reason chip.
+   */
+  onSkip?: () => void;
+  /** Reverts a skipped day back to scheduled-but-not-completed. */
+  onUnskip?: () => void;
 }) {
   const config = TYPE_CONFIG[run.head.type];
   const Icon = config.icon;
   const startDate = parseISO(run.startDate);
   const endDate = parseISO(run.endDate);
-  const overdue = isPast(endDate) && !isToday(endDate) && !run.allCompleted;
+  // A run is "skipped" if its representative item has a skip reason. We
+  // only ever group same-jobId same-type items into a run (groupRuns()
+  // keys on jobId+type+title), so per-day skip is preserved when the
+  // run is one day — and most skip use-cases are one day at a time
+  // (rained off TODAY, not the whole booking).
+  const isSkipped = !!run.head.skipReasonKind;
+  const overdue = isPast(endDate) && !isToday(endDate) && !run.allCompleted && !isSkipped;
   const completedCount = run.items.filter((i) => i.completed).length;
   const isMultiDay = run.days > 1;
   const title = isMultiDay ? stripDayLabel(run.head.title) : run.head.title;
@@ -1038,7 +1150,11 @@ function RunCard({
       className={cn(
       'flex items-start gap-3 p-3.5 rounded-2xl border transition-colors',
       run.allCompleted ? 'bg-muted/30 border-border' : 'bg-card border-border',
-      overdue && !run.allCompleted && 'border-red-200 bg-red-50/30',
+      overdue && !run.allCompleted && !isSkipped && 'border-red-200 bg-red-50/30',
+      // Skipped days render faded — opacity on the whole card so the
+      // icon, title and meta all wash out together. Distinct from
+      // "completed" which uses muted bg + strikethrough on the title.
+      isSkipped && 'opacity-60',
       onEdit && 'cursor-pointer hover:border-primary/40'
     )}>
       <div className={cn('w-9 h-9 rounded-xl flex items-center justify-center shrink-0 mt-0.5', config.bg)}>
@@ -1064,7 +1180,21 @@ function RunCard({
           )}
           {job && <span className="text-xs text-muted-foreground truncate">{job.name}</span>}
           {overdue && <span className="text-xs font-medium text-red-500">Overdue</span>}
+          {isSkipped && (
+            <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 text-[10px] font-semibold uppercase tracking-wide">
+              {SKIP_REASON_LABELS[run.head.skipReasonKind!] ?? 'Skipped'}
+            </span>
+          )}
         </div>
+
+        {/* Free-form note for skipped days (always shown for 'other',
+            optional for the other kinds). Sits below the meta row so
+            the structured "Rained off" chip lands first. */}
+        {isSkipped && run.head.skipReason && (
+          <p className="text-xs text-muted-foreground mt-1 italic">
+            {run.head.skipReason}
+          </p>
+        )}
 
         {/* Reminders badge — only for quote_visit rows. Two states:
             (a) icsDownloaded=true → muted "Reminders set" badge, read-only.
@@ -1122,12 +1252,54 @@ function RunCard({
           </button>
         )}
 
+        {/* "Didn't work" pill — only on past-or-today job_booking days
+            that aren't completed, aren't already skipped, and where the
+            parent provided onSkip. Lets the user mark "rained off / sick
+            / etc." instead of either ticking complete or leaving the
+            day flagged as Overdue. date-fns isPast() excludes today,
+            so OR with isToday() to cover "rained off this morning" too. */}
+        {!run.allCompleted
+          && !isSkipped
+          && run.head.type === 'job_booking'
+          && (isPast(endDate) || isToday(endDate))
+          && onSkip && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onSkip();
+            }}
+            className="mt-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-amber-50 text-amber-800 hover:bg-amber-100"
+            title="Mark this day as not worked — rained off, sick, client postponed, etc."
+          >
+            <CloudRain size={10} strokeWidth={2.2} />
+            Didn't work
+          </button>
+        )}
+
+        {/* Unskip pill — only on already-skipped days, lets the user
+            revert. Discoverability matters here because the faded
+            treatment makes the card feel inert. */}
+        {isSkipped && onUnskip && (
+          <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onUnskip();
+            }}
+            className="mt-1.5 inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md text-[10px] font-medium bg-muted text-muted-foreground hover:bg-muted/70 hover:text-foreground"
+            title="Undo skipped — put this day back on the schedule"
+          >
+            Undo skip
+          </button>
+        )}
+
         {run.head.notes && (
           <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{run.head.notes}</p>
         )}
       </div>
 
-      {!run.allCompleted && (
+      {!run.allCompleted && !isSkipped && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -1327,7 +1499,10 @@ function DayChip({
   // read as different things at a glance. Jobless items keep type colour.
   const { text: chipText } = colorFor(item);
   const Icon = config.icon;
-  const overdue = isPast(parseISO(item.date)) && !isToday(parseISO(item.date)) && !item.completed;
+  const isSkipped = !!item.skipReasonKind;
+  // Skipped days suppress the Overdue treatment — they're not overdue,
+  // they're accounted for (we know why they didn't happen).
+  const overdue = isPast(parseISO(item.date)) && !isToday(parseISO(item.date)) && !item.completed && !isSkipped;
   return (
     <div
       onClick={onEdit}
@@ -1344,6 +1519,9 @@ function DayChip({
         'flex items-start gap-1.5 p-1.5 rounded-md text-xs border-l-2',
         chipText,
         item.completed ? 'opacity-50 line-through' : '',
+        // Skipped: fade but don't strikethrough (the title is still
+        // factually accurate — we just couldn't do it).
+        isSkipped && !item.completed && 'opacity-60',
         'bg-card hover:bg-muted/50 transition-colors',
         onEdit && 'cursor-pointer',
     )} style={{ borderLeftColor: 'currentColor' }}>
@@ -1354,9 +1532,14 @@ function DayChip({
           {item.startTime && <span>{item.startTime}</span>}
           {job && <span className="truncate">{job.name}</span>}
           {overdue && !item.completed && <span className="text-red-500 font-medium">Overdue</span>}
+          {isSkipped && (
+            <span className="text-amber-700 font-medium">
+              {SKIP_REASON_LABELS[item.skipReasonKind!] ?? 'Skipped'}
+            </span>
+          )}
         </div>
       </div>
-      {!item.completed && (
+      {!item.completed && !isSkipped && (
         <button
           onClick={(e) => {
             e.stopPropagation();
@@ -1471,6 +1654,8 @@ function MonthView({
   onAddToCalendar,
   onLogHours,
   onScheduleItems,
+  onSkip,
+  onUnskip,
 }: {
   items: ScheduleItem[];
   jobs: Job[];
@@ -1489,6 +1674,10 @@ function MonthView({
   /** Called when the user schedules work inline from the day-detail sheet
    *  (only offered for today/future dates). */
   onScheduleItems: (items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) => void;
+  /** Open the "Didn't work" picker for the given schedule item. */
+  onSkip?: (item: ScheduleItem) => void;
+  /** Revert a previously-skipped day back to scheduled. */
+  onUnskip?: (item: ScheduleItem) => void;
 }) {
   // Same item→run lookup as WeekView: when the user taps an item in the
   // day-detail sheet we open the *whole run* in the editor, not just the
@@ -1834,6 +2023,13 @@ function MonthView({
                               onWrapUp(it);
                             } : undefined}
                             onAddToCalendar={onAddToCalendar ? () => onAddToCalendar(it) : undefined}
+                            onSkip={onSkip ? () => {
+                              // Close the day-detail BEFORE opening the picker
+                              // so the two sheets don't stack.
+                              setSelectedDay(null);
+                              onSkip(it);
+                            } : undefined}
+                            onUnskip={onUnskip ? () => onUnskip(it) : undefined}
                           />
                         );
                       })}
@@ -1875,6 +2071,123 @@ function MonthView({
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// "DIDN'T WORK" picker sheet — pick a reason chip + optional note
+// ─────────────────────────────────────────────────────────────────────────────
+function SkipPickerSheet({
+  open,
+  item,
+  onCancel,
+  onConfirm,
+}: {
+  open: boolean;
+  item: ScheduleItem | null;
+  onCancel: () => void;
+  onConfirm: (kind: ScheduleSkipReasonKind, note: string) => void;
+}) {
+  const [kind, setKind] = useState<ScheduleSkipReasonKind | null>(null);
+  const [note, setNote] = useState('');
+
+  // Reset whenever the sheet re-opens on a different item, so the next
+  // skip starts from a clean slate (no stale chip from last time).
+  useEffect(() => {
+    if (open) {
+      setKind(null);
+      setNote('');
+    }
+  }, [open, item?.id]);
+
+  // 'other' requires a note (otherwise we'd persist a meaningless "Other"
+  // chip with no context). Other kinds: note is optional.
+  const valid = kind !== null && (kind !== 'other' || note.trim().length > 0);
+
+  const dayLabel = item
+    ? format(parseISO(item.date), 'EEEE d MMMM')
+    : '';
+
+  return (
+    <Sheet open={open} onOpenChange={(o) => !o && onCancel()}>
+      <SheetContent
+        side="bottom"
+        className="h-auto max-h-[85vh] overflow-y-auto rounded-t-2xl px-4 pb-10"
+      >
+        <SheetHeader className="pb-4">
+          <SheetTitle>Didn't work — why?</SheetTitle>
+        </SheetHeader>
+
+        {item && (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              <span className="text-foreground font-medium">{stripDayLabel(item.title)}</span>
+              <br />
+              {dayLabel}
+            </p>
+
+            {/* Reason chips — 2x2 grid on phone so each is big enough to tap.
+                Selected chip uses the amber palette (matches the
+                "didn't work" pill on the card). */}
+            <div className="grid grid-cols-2 gap-2">
+              {SKIP_REASON_ORDER.map((k) => {
+                const Icon = SKIP_REASON_ICONS[k];
+                const selected = kind === k;
+                return (
+                  <button
+                    key={k}
+                    type="button"
+                    onClick={() => setKind(k)}
+                    className={cn(
+                      'flex items-center gap-2 h-12 px-3 rounded-xl border text-sm font-medium transition-colors',
+                      selected
+                        ? 'bg-amber-100 border-amber-300 text-amber-900'
+                        : 'bg-card border-border text-foreground hover:border-amber-200 hover:bg-amber-50/50',
+                    )}
+                  >
+                    <Icon size={16} strokeWidth={1.8} className={selected ? 'text-amber-700' : 'text-muted-foreground'} />
+                    {SKIP_REASON_LABELS[k]}
+                  </button>
+                );
+              })}
+            </div>
+
+            {/* Optional note. Visible always so the user can add context to
+                any reason ("ran into asbestos", "kids' birthday party").
+                Only REQUIRED for 'other' — the label changes to make that
+                clear. */}
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                {kind === 'other' ? 'Note *' : 'Note (optional)'}
+              </label>
+              <Textarea
+                placeholder={kind === 'other'
+                  ? 'What happened?'
+                  : 'Any extra context (optional)'
+                }
+                value={note}
+                onChange={(e) => setNote(e.target.value)}
+                rows={3}
+                className="resize-none text-sm"
+              />
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <Button variant="outline" className="flex-1 h-11" onClick={onCancel}>
+                Cancel
+              </Button>
+              <Button
+                className="flex-1 h-11 bg-amber-600 hover:bg-amber-700 text-white"
+                disabled={!valid}
+                onClick={() => kind && onConfirm(kind, note)}
+              >
+                Mark as didn't work
+              </Button>
+            </div>
+          </div>
+        )}
+      </SheetContent>
+    </Sheet>
+  );
+}
+
 function RunBar({
   run,
   cellDate,
@@ -1893,16 +2206,23 @@ function RunBar({
   const isEnd = run.endDate === cellDate;
   const Icon = config.icon;
   // Bar squares off on the side where the run continues, rounds where it ends.
+  // Skipped days fade just like completed ones so the calendar reads
+  // "this scheduled day is no longer pending action" at a glance.
+  const isSkipped = !!run.head.skipReasonKind;
   return (
     <div
       className={cn(
         'h-4 sm:h-5 px-1 flex items-center gap-1 text-[9px] sm:text-[10px] font-medium text-white truncate',
         bar,
-        run.allCompleted && 'opacity-50',
+        (run.allCompleted || isSkipped) && 'opacity-50',
         isStart ? 'rounded-l-sm' : 'rounded-l-none -ml-1 pl-2',
         isEnd ? 'rounded-r-sm' : 'rounded-r-none -mr-1 pr-2',
       )}
-      title={`${stripDayLabel(run.head.title)}${job ? ' · ' + job.name : ''}`}
+      title={
+        isSkipped
+          ? `${stripDayLabel(run.head.title)} · ${SKIP_REASON_LABELS[run.head.skipReasonKind!] ?? 'Skipped'}${run.head.skipReason ? ' — ' + run.head.skipReason : ''}`
+          : `${stripDayLabel(run.head.title)}${job ? ' · ' + job.name : ''}`
+      }
     >
       {isStart && (
         <>
@@ -2001,6 +2321,13 @@ function AddScheduleForm({
    *  calendar day in the day-detail sheet. */
   defaultDate?: string;
 }) {
+  // Pulled in so the inline "Create job" mini-form can mint a new Job
+  // row from this sheet without bouncing the user out to the Jobs page.
+  // 5:30pm-tired-painter rule: don't make Brad navigate away from the
+  // schedule entry he's halfway through to set up the job he just
+  // remembered needs to exist.
+  const { addJob, businessId } = useStore();
+
   const [type, setType] = useState<ScheduleItemType>(initialType ?? 'job_booking');
   const [title, setTitle] = useState('');
   const today = new Date().toISOString().split('T')[0];
@@ -2011,6 +2338,58 @@ function AddScheduleForm({
   const [endTime, setEndTime] = useState('');
   const [jobId, setJobId] = useState('');
   const [notes, setNotes] = useState('');
+
+  // Inline "Create job" mini-form state. `creating` flips on when the
+  // user picks the synthetic "__create__" sentinel from the Job select;
+  // it stays on until they either save the new job (we auto-select its
+  // persisted id) or hit Cancel. Single name field by design — keeping
+  // this to one tap-target avoids a wizard-inside-a-sheet.
+  const [creating, setCreating] = useState(false);
+  const [creatingName, setCreatingName] = useState('');
+  const [creatingBusy, setCreatingBusy] = useState(false);
+  const [creatingError, setCreatingError] = useState<string | null>(null);
+
+  /**
+   * Mint a new Job and auto-select it in the Job picker. Status follows
+   * the schedule item's type: a job_booking implies the work is already
+   * confirmed, so we default to 'booked'; everything else (quote visit,
+   * reminder, follow-up, …) defaults to the lower-commitment 'lead'.
+   * Brad can re-stage the status from the Jobs page later if needed.
+   */
+  async function handleCreateJob() {
+    const name = creatingName.trim();
+    if (!name) return;
+    setCreatingBusy(true);
+    setCreatingError(null);
+    const defaultStatus = type === 'job_booking' ? 'booked' : 'lead';
+    const tempId = crypto.randomUUID();
+    const nowIso = new Date().toISOString();
+    const persisted = await addJob({
+      id: tempId,
+      businessId: businessId ?? '',
+      name,
+      // clientName is required on the Job interface but we don't have
+      // it here — empty string is fine for a freshly-minted lead/booking
+      // and the Jobs page treats it as "unknown client". Brad can fill
+      // it in when he writes up the job.
+      clientName: '',
+      status: defaultStatus,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    });
+    setCreatingBusy(false);
+    if (!persisted) {
+      // addJob already surfaces the error onto the store; mirror it on
+      // the inline form so the user gets feedback right where they
+      // tapped — the global toast/error indicator isn't visible inside
+      // an open Sheet.
+      setCreatingError('Could not save job. Try again.');
+      return;
+    }
+    setJobId(persisted.id);
+    setCreating(false);
+    setCreatingName('');
+  }
 
   const supportsRange = type === 'job_booking' || type === 'quote_visit' || type === 'reminder';
 
@@ -2135,7 +2514,20 @@ function AddScheduleForm({
       </div>
 
       <FormField label="Job (optional)">
-        <Select value={jobId} onValueChange={(v) => setJobId(v ?? '')}>
+        <Select
+          value={jobId}
+          onValueChange={(v) => {
+            // "__create__" is a sentinel value — when chosen, open the
+            // inline mini-form instead of writing it into jobId. Anything
+            // else (real job id, '' for "No job") flows through normally.
+            if (v === '__create__') {
+              setCreating(true);
+              setCreatingError(null);
+              return;
+            }
+            setJobId(v ?? '');
+          }}
+        >
           <SelectTrigger className="h-9 text-sm">
             <SelectValue placeholder="No job">
               {(value) => {
@@ -2146,6 +2538,16 @@ function AddScheduleForm({
           </SelectTrigger>
           <SelectContent>
             <SelectItem value="">No job</SelectItem>
+            {/* Synthetic "Create new job…" row. Sits at the top of the
+                list so it's the first non-"No job" option Brad sees. The
+                "__create__" value is intercepted in onValueChange above —
+                it never lands in jobId state. */}
+            <SelectItem value="__create__">
+              <span className="flex items-center gap-1.5 text-primary font-medium">
+                <Plus size={12} strokeWidth={2.4} />
+                Create new job…
+              </span>
+            </SelectItem>
             {(() => {
               const tiers: Array<'active-match' | 'active' | 'recent' | 'older'> = [
                 'active-match', 'active', 'recent', 'older',
@@ -2174,6 +2576,66 @@ function AddScheduleForm({
             })()}
           </SelectContent>
         </Select>
+
+        {/* Inline "Create job" mini-form. Single name field + Create /
+            Cancel buttons. On Create we mint the job, then auto-select
+            its persisted UUID into the picker above so the schedule
+            item gets tied to it on Save. Status defaults follow the
+            schedule type (job_booking → booked, otherwise lead). */}
+        {creating && (
+          <div className="mt-2 rounded-xl border border-primary/30 bg-primary/5 p-3 space-y-2">
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide block">
+              New job name
+            </label>
+            <FormInput
+              autoFocus
+              placeholder="e.g. Cromwell Races Admin Building"
+              value={creatingName}
+              onChange={(e) => setCreatingName(e.target.value)}
+              onKeyDown={(e) => {
+                // Enter = Create when the name has content, so the user
+                // can do the whole thing keyboard-only on desktop.
+                if (e.key === 'Enter' && creatingName.trim() && !creatingBusy) {
+                  e.preventDefault();
+                  handleCreateJob();
+                }
+              }}
+            />
+            {creatingError && (
+              <p className="text-xs text-red-600">{creatingError}</p>
+            )}
+            <p className="text-[11px] text-muted-foreground">
+              Status will default to{' '}
+              <span className="font-medium text-foreground">
+                {type === 'job_booking' ? 'Booked' : 'Lead'}
+              </span>
+              . Add client, location and quote details on the Jobs page later.
+            </p>
+            <div className="flex gap-2 pt-0.5">
+              <Button
+                variant="outline"
+                size="sm"
+                className="flex-1 h-9"
+                onClick={() => {
+                  setCreating(false);
+                  setCreatingName('');
+                  setCreatingError(null);
+                }}
+                disabled={creatingBusy}
+              >
+                Cancel
+              </Button>
+              <Button
+                size="sm"
+                className="flex-1 h-9 bg-primary"
+                onClick={handleCreateJob}
+                disabled={!creatingName.trim() || creatingBusy}
+              >
+                {creatingBusy ? 'Creating…' : 'Create job'}
+              </Button>
+            </div>
+          </div>
+        )}
       </FormField>
 
       <FormField label="Notes">

@@ -446,10 +446,41 @@ interface BookVisitSheetProps {
   onCancel: () => void;
 }
 
+// Duration presets for the site-visit booking. 30 min is the new default —
+// most quote visits are a quick walk-around. 20 min covers the small
+// "I already know what I'm looking at" jobs (Brad's previous default,
+// kept as a one-tap reset). 45 and 60 cover bigger houses and full
+// colour-consult visits. Order matters: the array order is the chip order.
+const VISIT_DURATION_OPTIONS = [20, 30, 45, 60] as const;
+const DEFAULT_VISIT_DURATION = 30;
+const DEFAULT_START_TIME = '09:00';
+
+/** Add `minutes` to a `HH:MM` (24h) time string, wrapping over midnight. */
+function addMinutesToTime(time: string, minutes: number): string {
+  const [hStr, mStr] = time.split(':');
+  const h = Number(hStr);
+  const m = Number(mStr);
+  if (Number.isNaN(h) || Number.isNaN(m)) return time;
+  const total = ((h * 60 + m + minutes) % (24 * 60) + 24 * 60) % (24 * 60);
+  const nh = Math.floor(total / 60);
+  const nm = total % 60;
+  return `${String(nh).padStart(2, '0')}:${String(nm).padStart(2, '0')}`;
+}
+
+/** Minutes between two `HH:MM` times, assuming end is same-day after start.
+ *  Returns null when either input is malformed or end is before start. */
+function minutesBetween(start: string, end: string): number | null {
+  const [sh, sm] = start.split(':').map(Number);
+  const [eh, em] = end.split(':').map(Number);
+  if ([sh, sm, eh, em].some((n) => Number.isNaN(n))) return null;
+  const diff = (eh * 60 + em) - (sh * 60 + sm);
+  return diff >= 0 ? diff : null;
+}
+
 function BookVisitSheet({ job, open, onSave, onCancel }: BookVisitSheetProps) {
-  // Sensible defaults — tomorrow 9am, hour-long visit. Most site visits
-  // get booked for the next morning, and a one-hour slot is roughly the
-  // right size for a quote visit. The user can change any of it.
+  // Sensible defaults — tomorrow 9am, 30-min visit. Most site visits get
+  // booked for the next morning, and 30 min is the right size for a
+  // walk-around quote visit. The user can change any of it.
   const tomorrow = useMemo(() => {
     const d = new Date();
     d.setDate(d.getDate() + 1);
@@ -459,9 +490,14 @@ function BookVisitSheet({ job, open, onSave, onCancel }: BookVisitSheetProps) {
     return `${y}-${m}-${day}`;
   }, []);
 
+  const defaultEnd = useMemo(
+    () => addMinutesToTime(DEFAULT_START_TIME, DEFAULT_VISIT_DURATION),
+    [],
+  );
+
   const [date, setDate] = useState(tomorrow);
-  const [startTime, setStartTime] = useState('09:00');
-  const [endTime, setEndTime] = useState('10:00');
+  const [startTime, setStartTime] = useState(DEFAULT_START_TIME);
+  const [endTime, setEndTime] = useState(defaultEnd);
   const [notes, setNotes] = useState('');
 
   // Reset state whenever the sheet reopens for a different lead. Without
@@ -469,11 +505,23 @@ function BookVisitSheet({ job, open, onSave, onCancel }: BookVisitSheetProps) {
   useMemo(() => {
     if (open) {
       setDate(tomorrow);
-      setStartTime('09:00');
-      setEndTime('10:00');
+      setStartTime(DEFAULT_START_TIME);
+      setEndTime(defaultEnd);
       setNotes('');
     }
-  }, [open, tomorrow]);
+  }, [open, tomorrow, defaultEnd]);
+
+  // Which preset (if any) the current start→end span matches. Drives the
+  // pressed/selected look on the duration chips. Custom end times just
+  // leave every chip un-pressed.
+  const activeDuration = minutesBetween(startTime, endTime);
+
+  /** Re-derive end time from the current start + the chosen preset. We
+   *  recompute off `startTime` (rather than the previous end) so changing
+   *  start then tapping a chip behaves the obvious way. */
+  function applyDuration(minutes: number) {
+    setEndTime(addMinutesToTime(startTime, minutes));
+  }
 
   function handleSubmit() {
     onSave({ date, startTime, endTime: endTime || undefined, notes: notes.trim() || undefined });
@@ -534,6 +582,38 @@ function BookVisitSheet({ job, open, onSave, onCancel }: BookVisitSheetProps) {
                 onChange={(e) => setEndTime(e.target.value)}
                 className="w-full h-10 px-3 rounded-lg border border-input text-sm bg-background"
               />
+            </div>
+          </div>
+
+          {/* Quick-pick duration chips. Tap to snap the end time to a common
+              length. 30 min is the default; 20 min is the one-tap reset
+              Brad wanted (his previous default). The end time stays
+              editable for anything custom — chips are an accelerator,
+              not a constraint. */}
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+              Duration
+            </label>
+            <div className="flex gap-2 flex-wrap">
+              {VISIT_DURATION_OPTIONS.map((mins) => {
+                const isActive = activeDuration === mins;
+                return (
+                  <button
+                    key={mins}
+                    type="button"
+                    onClick={() => applyDuration(mins)}
+                    className={cn(
+                      'h-9 px-3 rounded-full border text-sm font-medium transition-colors',
+                      isActive
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'bg-background text-foreground border-input hover:bg-muted',
+                    )}
+                    aria-pressed={isActive}
+                  >
+                    {mins} min
+                  </button>
+                );
+              })}
             </div>
           </div>
 

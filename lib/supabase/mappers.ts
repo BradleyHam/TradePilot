@@ -9,6 +9,7 @@ import type {
   JobStatus, EntryType, ExpenseCategory, ActivityType,
   ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
+  ScheduleSkipReasonKind,
 } from '../types';
 
 type Row = Record<string, unknown>;
@@ -217,6 +218,8 @@ export function rowToScheduleItem(r: Row): ScheduleItem {
     endTime: asString(r.end_time),
     notes: asString(r.notes),
     completed: asBool(r.completed, false),
+    skipReasonKind: asString(r.skip_reason_kind) as ScheduleSkipReasonKind | undefined,
+    skipReason: asString(r.skip_reason),
     icsDownloaded: asBool(r.ics_downloaded, false),
     createdAt: r.created_at as string,
   };
@@ -233,6 +236,11 @@ export function scheduleItemToRow(s: Partial<ScheduleItem>): Row {
   if (s.endTime !== undefined) out.end_time = s.endTime || null;
   if (s.notes !== undefined) out.notes = s.notes || null;
   if (s.completed !== undefined) out.completed = s.completed;
+  // Skip-reason columns added in migration 020. `|| null` so passing
+  // an empty string OR undefined both clear the row (used by the
+  // "Unskip" action — pass skipReasonKind: undefined to revert).
+  if (s.skipReasonKind !== undefined) out.skip_reason_kind = s.skipReasonKind || null;
+  if (s.skipReason !== undefined) out.skip_reason = s.skipReason || null;
   if (s.icsDownloaded !== undefined) out.ics_downloaded = s.icsDownloaded;
   return out;
 }

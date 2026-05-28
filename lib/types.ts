@@ -385,6 +385,47 @@ export interface ParsedBill {
   confidence: 'high' | 'medium' | 'low';
 }
 
+/**
+ * Extracted fields from a customer-facing INVOICE PDF (one we issued, not
+ * a supplier bill). Used by the Issue-invoice form's drop-zone: drag the
+ * PDF in, this gets populated, the form pre-fills.
+ *
+ * Distinct from ParsedBill — bills are money-OUT (suppliers billing us),
+ * invoices are money-IN (us billing customers). Different schema fields
+ * (no supplier; has invoice kind), different LLM prompt (NZ tradie
+ * invoice vs supplier invoice).
+ */
+export interface ParsedInvoice {
+  /** The invoice number as printed on the document (e.g. "INV-034-DEP"). */
+  invoiceNumber?: string;
+  /** Date the invoice was issued (ISO YYYY-MM-DD). */
+  invoiceDate?: string;
+  /** Date payment is due (ISO YYYY-MM-DD) — often "On receipt", which becomes invoiceDate. */
+  dueDate?: string;
+  /** Total gross amount due (GST-inclusive). */
+  totalInclGst?: number;
+  /** GST portion. For NZ-registered tradies this is total ÷ 23 × 3. */
+  gstComponent?: number;
+  /** Net amount excluding GST (derived server-side: totalInclGst - gstComponent). */
+  amountExGst?: number;
+  /**
+   * Invoice classification — deposit / progress / final. Inferred from the
+   * description line ("Deposit (30%)…", "Final invoice…") or the invoice
+   * number suffix (-DEP, -F, -P1). Omitted when ambiguous.
+   */
+  kind?: InvoiceKind;
+  /** Project / job reference printed on the invoice (e.g. "Administration Building"). */
+  projectRef?: string;
+  /** Customer name (e.g. "Terry Emmitt"). Used for job-matching. */
+  customerName?: string;
+  /** Quote reference printed on the invoice (e.g. "QUO-034"). */
+  quoteRef?: string;
+  /** Short description line for the form's notes/variation field. */
+  description?: string;
+  /** Overall confidence — informs the UI's "double-check this" affordance. */
+  confidence: 'high' | 'medium' | 'low';
+}
+
 export type BankTransactionStatus = 'unreconciled' | 'matched' | 'ignored' | 'personal';
 
 export interface BankTransaction {
@@ -700,6 +741,23 @@ export interface Invoice {
   updatedAt: string;
 }
 
+/**
+ * Reason a scheduled day was skipped (not worked). Free-form text in
+ * Postgres (migration 020) so the vocabulary can evolve without an
+ * ALTER TYPE migration; this union is the canonical client-side list.
+ *
+ *   rained_off       → weather. Most common reason for an outdoor painter.
+ *   sick             → Brad or a crew member sick.
+ *   client_postponed → customer wasn't ready / asked to delay.
+ *   other            → catch-all. Always paired with a free-form note in
+ *                      `skip_reason`.
+ */
+export type ScheduleSkipReasonKind =
+  | 'rained_off'
+  | 'sick'
+  | 'client_postponed'
+  | 'other';
+
 export interface ScheduleItem {
   id: string;
   businessId: string;
@@ -711,6 +769,17 @@ export interface ScheduleItem {
   endTime?: string;
   notes?: string;
   completed: boolean;
+  /**
+   * When set, this scheduled day was skipped — the user couldn't / didn't
+   * work it. Distinct from `completed` (which means "I worked it"). A
+   * skipped day stays visible on the calendar but renders faded with the
+   * reason chip, and never shows as Overdue.
+   *
+   * Migration 020 added the underlying columns. Both null = not skipped.
+   */
+  skipReasonKind?: ScheduleSkipReasonKind;
+  /** Optional free-form note. Required when skipReasonKind === 'other'. */
+  skipReason?: string;
   /**
    * True once the user has downloaded the .ics calendar invite for this
    * item. Only meaningful for type='quote_visit' rows today — drives the

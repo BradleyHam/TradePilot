@@ -10,7 +10,7 @@ import {
   materialToRow, quoteToRow, quoteAttachmentToRow,
 } from './supabase/mappers';
 import type {
-  Job, Entry, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
+  Job, Entry, EntryType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate,
 } from './types';
@@ -531,6 +531,74 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return () => { sub.subscription.unsubscribe(); };
   }, [load]);
 
+  // One-time backfill: reconcile historical hours entries against their
+  // matching job_booking schedule_items on app load. The forward-looking
+  // auto-complete in addEntry/updateEntry only catches entries logged
+  // AFTER the fix shipped — anything older stays Overdue until we do
+  // this pass.
+  //
+  // Gated by ranOnceRef so it only fires the first time both tables have
+  // populated for the current business, AND only when there's actually
+  // something to fix (avoids a no-op supabase round-trip on every load).
+  const overdueBackfillDoneRef = useRef<string | null>(null);
+  useEffect(() => {
+    // Reset the gate when the business changes (sign out / switch).
+    if (overdueBackfillDoneRef.current && overdueBackfillDoneRef.current !== businessId) {
+      overdueBackfillDoneRef.current = null;
+    }
+    if (overdueBackfillDoneRef.current === businessId) return;
+    if (loading) return; // wait until the load() call settled
+    if (!businessId) return;
+    if (entries.length === 0 && scheduleItems.length === 0) return;
+    overdueBackfillDoneRef.current = businessId;
+
+    // Build a (jobId, date) → entry index for the cheap lookup. We only
+    // care about hours entries with a jobId, entryDate, and hours > 0
+    // (mirrors the auto-complete predicate).
+    const workedKey = new Set<string>();
+    for (const e of entries) {
+      if (e.type !== 'hours') continue;
+      if (!e.jobId || !e.entryDate) continue;
+      if (!e.hours || e.hours <= 0) continue;
+      workedKey.add(`${e.jobId}::${e.entryDate}`);
+    }
+
+    // Find any uncompleted job_booking rows that have a matching worked
+    // key. These are the historical "Overdue" rows the user actually
+    // worked but never ticked.
+    const toComplete: string[] = [];
+    for (const s of scheduleItems) {
+      if (s.type !== 'job_booking') continue;
+      if (s.completed) continue;
+      if (s.skipReasonKind) continue; // skipped days stay skipped
+      if (!s.jobId) continue;
+      if (workedKey.has(`${s.jobId}::${s.date}`)) toComplete.push(s.id);
+    }
+
+    if (toComplete.length === 0) return;
+
+    // eslint-disable-next-line no-console
+    console.log('[store] backfill: clearing Overdue on', toComplete.length, 'schedule_items where hours are already logged');
+
+    // Optimistic local flip + batched supabase update in a single
+    // call. RLS already filters to the user's own business, so no
+    // explicit business_id filter needed beyond the id list.
+    setScheduleItems((prev) =>
+      prev.map((s) => toComplete.includes(s.id) ? { ...s, completed: true } : s),
+    );
+    (async () => {
+      const { error: updErr } = await supabase
+        .from('schedule_items')
+        .update({ completed: true })
+        .in('id', toComplete);
+      if (updErr) {
+        console.warn('[store] backfill: supabase update failed (local state still correct):', {
+          message: updErr.message, code: updErr.code, count: toComplete.length,
+        });
+      }
+    })();
+  }, [businessId, entries, scheduleItems, loading]);
+
   // ── Mutators ─────────────────────────────────────────────────────────────
   // Each one updates local state immediately (optimistic) so the UI feels
   // instant, then writes to Supabase. On failure we roll back local state and
@@ -808,6 +876,98 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { ok: true as const };
   }, [businessId]);
 
+  /**
+   * Auto-complete a scheduled job_booking row when matching hours are logged.
+   *
+   * If an hours entry has a jobId + entryDate + hours > 0, find the
+   * job_booking schedule_item for that same (jobId, date) and flip its
+   * `completed` flag to true if it isn't already. This removes the
+   * "Overdue" pill from days the user actually worked — logging hours IS
+   * the act of completing the scheduled day, no separate tick needed.
+   *
+   * One-way: deleting or zero-ing the entry does NOT un-complete the
+   * schedule item. The flag represents an intentional human action ("I
+   * worked this day"), not a derived view. If the user genuinely wants
+   * to mark a day as not-done they can untick it on the schedule page.
+   *
+   * Implemented as an inline ref-reading helper rather than calling
+   * `updateScheduleItem` because that callback is defined later in this
+   * component and we don't want a forward dependency.
+   */
+  function maybeCompleteJobBookingForEntry(entry: { type?: EntryType; jobId?: string; entryDate?: string; hours?: number }) {
+    if (entry.type !== 'hours') return;
+    if (!entry.jobId || !entry.entryDate) return;
+    if (!entry.hours || entry.hours <= 0) return;
+
+    // Use functional setState so we ALWAYS see the freshest scheduleItems —
+    // scheduleItemsRef can lag by one render in some HMR edge cases, but
+    // the setter callback's `prev` argument is guaranteed current. We do
+    // the match-and-flip inside the setter so it's atomic. The matched
+    // id is captured in a closure so the supabase update fires once for
+    // the correct row.
+    let matchedId: string | undefined;
+    let diag: { totalJobBookings: number; sameJob: number; sameJobSameDate: number; sameJobSameDateUncompleted: number } | null = null;
+    setScheduleItems((prev) => {
+      // Diagnostic counters so a no-match case tells us WHY it didn't
+      // match (no rows for this job? rows exist but on different dates?
+      // matching date but already completed?). Cheap to compute, only
+      // logged when there's no match.
+      diag = {
+        totalJobBookings: prev.filter((s) => s.type === 'job_booking').length,
+        sameJob: prev.filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId).length,
+        sameJobSameDate: prev.filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId && s.date === entry.entryDate).length,
+        sameJobSameDateUncompleted: prev.filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId && s.date === entry.entryDate && !s.completed).length,
+      };
+      const match = prev.find(
+        (s) => s.type === 'job_booking'
+          && s.jobId === entry.jobId
+          && s.date === entry.entryDate
+          && !s.completed,
+      );
+      if (!match) return prev;
+      matchedId = match.id;
+      return prev.map((s) => (s.id === match.id ? { ...s, completed: true } : s));
+    });
+
+    if (!matchedId) {
+      // Verbose log only when an hours entry IS tagged to a job — those
+      // are the cases where we expected to match but didn't. Helps
+      // diagnose date format mismatches, jobId drift, etc.
+      // eslint-disable-next-line no-console
+      console.log('[store] auto-complete skipped — no matching schedule_item', {
+        entry: { jobId: entry.jobId, entryDate: entry.entryDate, hours: entry.hours },
+        scheduleItemCounts: diag,
+        // Show 3 sample rows for this job so we can eyeball the actual
+        // stored dates if there's a format mismatch.
+        sampleSameJobRows: scheduleItemsRef.current
+          .filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId)
+          .slice(0, 3)
+          .map((s) => ({ id: s.id, date: s.date, completed: s.completed, skipReasonKind: s.skipReasonKind })),
+      });
+      return;
+    }
+
+    // Visible in devtools so we can confirm the auto-complete fired.
+    // eslint-disable-next-line no-console
+    console.log('[store] auto-completed schedule_item for hours entry', {
+      scheduleItemId: matchedId,
+      jobId: entry.jobId,
+      date: entry.entryDate,
+    });
+
+    (async () => {
+      const { error: updErr } = await supabase
+        .from('schedule_items')
+        .update({ completed: true })
+        .eq('id', matchedId!);
+      if (updErr) {
+        console.warn('[store] auto-complete schedule_item failed (non-fatal):', {
+          message: updErr.message, code: updErr.code, scheduleItemId: matchedId,
+        });
+      }
+    })();
+  }
+
   const addEntry = useCallback((entry: Entry) => {
     if (!businessId) {
       console.warn('[store] addEntry called with no businessId; ignoring');
@@ -815,6 +975,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
     setEntries((prev) => [entry, ...prev]);
     const tempId = entry.id;
+
+    // Fire auto-complete optimistically — the user logs hours, the
+    // matching day's "Overdue" clears immediately without waiting for
+    // the supabase round-trip. The schedule_items mutation rides along
+    // separately and is fire-and-forget.
+    maybeCompleteJobBookingForEntry(entry);
 
     (async () => {
       const row = entryToRow({ ...entry, businessId });
@@ -833,10 +999,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const updateEntry = useCallback((id: string, updates: Partial<Entry>) => {
     let prevEntry: Entry | undefined;
+    let nextEntry: Entry | undefined;
     setEntries((prev) => {
       prevEntry = prev.find((e) => e.id === id);
-      return prev.map((e) => (e.id === id ? { ...e, ...updates } : e));
+      return prev.map((e) => {
+        if (e.id !== id) return e;
+        nextEntry = { ...e, ...updates };
+        return nextEntry;
+      });
     });
+
+    // Fire auto-complete optimistically so the UI reacts immediately to
+    // edits like "added a jobId" or "moved date onto a scheduled day".
+    if (nextEntry) maybeCompleteJobBookingForEntry(nextEntry);
 
     (async () => {
       const row = entryToRow(updates);

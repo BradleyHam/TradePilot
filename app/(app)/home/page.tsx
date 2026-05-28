@@ -533,18 +533,17 @@ function TodayRow({
               {item.title}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5 flex-wrap">
-              {/* Type chip — leads the meta row so "what is this?" lands
-                  before time/overdue context. Colour matches the icon so
-                  the row reads as a single coherent unit. */}
+              {/* Date chip — leads the meta row so "when?" lands first.
+                  Chip colour still encodes the item type (job/quote/etc.)
+                  so the visual grammar from before is preserved. */}
               <span className={cn(
                 'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide',
                 meta.bg, meta.color,
               )}>
-                {meta.label}
+                {chipDateLabel(item.date, todayISO)}
               </span>
               {overdue && <span className="text-red-600 font-medium">Overdue</span>}
               {item.startTime && <span className="truncate">{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
-              {!item.startTime && !overdue && <span>Today</span>}
             </p>
           </div>
         </div>
@@ -1988,7 +1987,6 @@ function ComingUpSection({
 function ComingUpRow({ item, todayISO }: { item: ScheduleItem; todayISO: string }) {
   const meta = SCHEDULE_TYPE_META[item.type] ?? SCHEDULE_TYPE_META.reminder;
   const Icon = meta.icon;
-  const dateLabel = friendlyDayLabel(item.date, todayISO);
 
   return (
     <li className="bg-card border border-border rounded-2xl flex items-center gap-3 px-4 py-3 min-h-[48px]">
@@ -1998,17 +1996,16 @@ function ComingUpRow({ item, todayISO }: { item: ScheduleItem; todayISO: string 
       <div className="flex-1 min-w-0">
         <p className="text-sm font-medium text-foreground truncate">{item.title}</p>
         <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5 flex-wrap">
-          {/* Same type chip as TodayRow — keeps the two sections visually
-              consistent so the eye learns the labels once, then reads
-              the rest of the row faster. */}
+          {/* Date chip — same shape as TodayRow so the two sections share
+              one visual grammar. Chip colour encodes type; text is the
+              date (or 'TOMORROW' for the next-day case). */}
           <span className={cn(
             'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide',
             meta.bg, meta.color,
           )}>
-            {meta.label}
+            {chipDateLabel(item.date, todayISO)}
           </span>
-          <span>{dateLabel}</span>
-          {item.startTime && <span>· {item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
+          {item.startTime && <span>{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
         </p>
       </div>
     </li>
@@ -2026,6 +2023,31 @@ function friendlyDayLabel(iso: string, todayISO: string): string {
   // Within ~7 days the weekday name is enough; add day-of-month past that
   // to avoid ambiguity (we never look further than 7 here but be defensive).
   return d.toLocaleDateString('en-NZ', { weekday: 'short' });
+}
+
+/**
+ * Date label rendered inside the type-coloured chip on TodayRow / ComingUpRow.
+ * Replaces the old static "JOB DAY" / "QUOTE VISIT" labels with the actual
+ * date — chip colour still encodes type, the text now carries the when.
+ *
+ *   today    → "TODAY"
+ *   tomorrow → "TOMORROW"
+ *   else     → "MON 8 MAY"   (day-of-week + day-of-month + month, en-NZ)
+ *
+ * Returned upper-case because the chip uses `uppercase tracking-wide`; we
+ * pre-uppercase the date so toLocaleDateString doesn't end up mixing
+ * "Mon" with CSS-uppercased "MON" at different times.
+ */
+function chipDateLabel(iso: string, todayISO: string): string {
+  if (iso === todayISO) return 'TODAY';
+  const tomorrowISO = formatISODate(addDays(parseISODate(todayISO), 1));
+  if (iso === tomorrowISO) return 'TOMORROW';
+  const d = parseISODate(iso);
+  return d.toLocaleDateString('en-NZ', {
+    weekday: 'short',
+    day: 'numeric',
+    month: 'short',
+  }).toUpperCase();
 }
 
 // ── Section: Quick add ──────────────────────────────────────────────────────

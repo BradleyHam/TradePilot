@@ -18,7 +18,8 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Trash2, CheckCircle2 } from 'lucide-react';
+import { Trash2, CheckCircle2, Scissors } from 'lucide-react';
+import { format, parseISO } from 'date-fns';
 import { cn } from '@/lib/utils';
 
 // ── Date helpers (kept local so this component is self-contained, mirroring
@@ -33,6 +34,11 @@ function formatISODate(d: Date): string {
   const m = String(d.getMonth() + 1).padStart(2, '0');
   const day = String(d.getDate()).padStart(2, '0');
   return `${y}-${m}-${day}`;
+}
+function addDaysISO(iso: string, days: number): string {
+  const d = parseISODate(iso);
+  d.setDate(d.getDate() + days);
+  return formatISODate(d);
 }
 /**
  * All ISO dates between start and end inclusive, filtered to the supplied
@@ -249,6 +255,12 @@ function EditForm({
   const [days, setDays] = useState<Set<number>>(initialDays);
   const [preset, setPreset] = useState<Preset>(() => presetFor(initialDays));
 
+  // Split mode — when true, the form swaps for a cutoff-date picker. Only
+  // offered for multi-day job_booking runs (a single-day or non-job run
+  // has nothing meaningful to split).
+  const [splitMode, setSplitMode] = useState(false);
+  const canSplit = first.type === 'job_booking' && sorted.length > 1;
+
   function applyPreset(next: Preset) {
     setPreset(next);
     const found = PRESETS.find((p) => p.value === next);
@@ -351,6 +363,48 @@ function EditForm({
     if (!confirm(msg)) return;
     for (const it of sorted) deleteScheduleItem(it.id);
     onClose();
+  }
+
+  /**
+   * Split this run in two at the chosen cutoff date. The keeper block is
+   * everything on or before cutoff; everything after is deleted. After
+   * splitting, the user can add a second range from the calendar's Add
+   * button (typically picking the resumption date for postponed work).
+   *
+   * We renumber the keeper's "(Day X/N)" titles so the calendar's
+   * groupRuns + stripDayLabel pipeline keeps treating them as one run.
+   */
+  function handleSplit(cutoffISO: string) {
+    const keep = sorted.filter((it) => it.date <= cutoffISO);
+    const drop = sorted.filter((it) => it.date > cutoffISO);
+    if (keep.length === 0) return;
+
+    for (const it of drop) deleteScheduleItem(it.id);
+
+    // Renumber the keeper block so titles read "Day 1/3" etc. — matches
+    // what booked-dates.tsx and BookedDatesForm produce so groupRuns +
+    // stripDayLabel keep treating them as one run.
+    const baseTitle = stripDayLabel(first.title);
+    keep.forEach((it, i) => {
+      const newTitle = keep.length > 1
+        ? `${baseTitle} (Day ${i + 1}/${keep.length})`
+        : baseTitle;
+      if (it.title !== newTitle) updateScheduleItem(it.id, { title: newTitle });
+    });
+
+    onClose();
+  }
+
+  // Split-mode UI takes over the whole sheet so the user isn't confused
+  // about which buttons apply. Cancel returns to the normal edit view.
+  if (splitMode) {
+    return (
+      <SplitForm
+        items={sorted}
+        onCancel={() => setSplitMode(false)}
+        onConfirm={handleSplit}
+      />
+    );
   }
 
   return (
@@ -556,6 +610,19 @@ function EditForm({
             {supportsRange && dayCount > 1 ? `Save ${dayCount} days` : 'Save'}
           </Button>
         </div>
+        {/* Split — only for multi-day job_booking runs. Lets the user
+            postpone the back half of a job (weather, materials, customer
+            request) without losing the front half they already worked. */}
+        {canSplit && (
+          <Button
+            variant="ghost"
+            className="h-11 text-orange-700 hover:text-orange-800 hover:bg-orange-50"
+            onClick={() => setSplitMode(true)}
+          >
+            <Scissors size={16} className="mr-2" />
+            Split into two blocks
+          </Button>
+        )}
         <Button
           variant="ghost"
           className="h-11 text-red-600 hover:text-red-700 hover:bg-red-50"
@@ -563,6 +630,90 @@ function EditForm({
         >
           <Trash2 size={16} className="mr-2" />
           {sorted.length === 1 ? 'Delete' : `Delete all ${sorted.length} days`}
+        </Button>
+      </div>
+    </div>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────
+// Split form
+// ─────────────────────────────────────────────────────────────────────────
+/**
+ * Choose the last day of the FIRST block. Everything after that date is
+ * removed from this booking. The user can then add a second range later
+ * (typically with the "spring" / resumption dates) from the calendar's
+ * Add button, OR from the BookedDates panel on the job detail sheet.
+ *
+ * This mirrors the SplitForm in components/jobs/booked-dates.tsx so the
+ * two surfaces behave the same way.
+ */
+function SplitForm({
+  items,
+  onCancel,
+  onConfirm,
+}: {
+  items: ScheduleItem[];
+  onCancel: () => void;
+  onConfirm: (cutoffISO: string) => void;
+}) {
+  const first = items[0];
+  const last = items[items.length - 1];
+
+  // Default the cutoff to the day BEFORE the last day — the natural
+  // majority of the original block stays as the keeper.
+  const defaultCutoff = items.length > 1 ? items[items.length - 2].date : first.date;
+  const [cutoff, setCutoff] = useState(defaultCutoff);
+
+  // Cutoff must be inside the range AND leave at least one day on each
+  // side (cutoff cannot equal the very last day).
+  const valid = cutoff >= first.date && cutoff < last.date;
+
+  const keepDays = items.filter((it) => it.date <= cutoff).length;
+  const dropDays = items.filter((it) => it.date > cutoff).length;
+  const resumeFromHint = addDaysISO(cutoff, 1);
+
+  return (
+    <div className="space-y-4">
+      <p className="text-sm text-muted-foreground">
+        Cut this block on the last day you worked. Everything scheduled
+        after that day will be removed. You can add a second block later
+        (e.g. when the work resumes in spring) by tapping <strong>+ Add</strong>
+        on the calendar, or from the Booked dates section on the job page.
+      </p>
+
+      <FormField label="Last day of first block">
+        <FormInput
+          type="date"
+          value={cutoff}
+          min={first.date}
+          max={last.date}
+          onChange={(e) => setCutoff(e.target.value)}
+        />
+      </FormField>
+
+      <div className="rounded-lg bg-muted/50 border border-border p-3 text-xs space-y-1">
+        <p>
+          <span className="text-muted-foreground">Block 1 keeps</span>{' '}
+          <span className="font-medium text-foreground">{keepDays} day{keepDays === 1 ? '' : 's'}</span>
+          {' '}({format(parseISO(first.date), 'EEE d MMM')} – {format(parseISO(cutoff), 'EEE d MMM')})
+        </p>
+        <p>
+          <span className="text-muted-foreground">Removed:</span>{' '}
+          <span className="text-muted-foreground">{dropDays} day{dropDays === 1 ? '' : 's'} from {format(parseISO(resumeFromHint), 'EEE d MMM')} onward</span>
+        </p>
+      </div>
+
+      <div className="flex gap-2 pt-1">
+        <Button variant="outline" className="flex-1 h-11" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button
+          className="flex-1 h-11 bg-primary"
+          disabled={!valid}
+          onClick={() => onConfirm(cutoff)}
+        >
+          Split
         </Button>
       </div>
     </div>
