@@ -32,6 +32,7 @@ import { useRouter } from 'next/navigation';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { parseBillFile, uploadBillDocument } from '@/lib/parse-bill-file';
+import { findMatchingBillIndex } from '@/lib/bill-dedupe';
 import { rankJobs } from '@/lib/job-match';
 import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import type { Entry, ParsedBill } from '@/lib/types';
@@ -89,10 +90,13 @@ export function BillPdfUploadCard() {
     // a backfilled amount-only one), attach the document + merge line items
     // into it instead of creating a duplicate. So Brad can drop any PDF and
     // the app works out whether it's new or one we already have.
-    if (parsed.invoiceNumber) {
-      const existing = entries.find(
-        (e) => e.type === 'bill' && e.paymentRef === parsed.invoiceNumber,
+    {
+      const bills = entries.filter((e) => e.type === 'bill');
+      const matchIdx = findMatchingBillIndex(
+        bills.map((e) => ({ invoiceNumber: e.paymentRef, amount: e.amount, supplier: e.supplier, company: e.company })),
+        { invoiceNumber: parsed.invoiceNumber, totalInclGst: parsed.totalInclGst, supplier: parsed.supplier },
       );
+      const existing = matchIdx === -1 ? undefined : bills[matchIdx];
       if (existing) {
         setStage('uploading');
         const url = (await uploadBillDocument(fileToStore, businessId)) ?? existing.billPdfUrl;

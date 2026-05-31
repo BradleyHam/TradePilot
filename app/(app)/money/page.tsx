@@ -289,6 +289,9 @@ export default function MoneyPage() {
         {/* Reconcile entry point */}
         <ReconcileEntryCard />
 
+        {/* Bills — confirm queue + bills waiting to be matched to a payment */}
+        <BillsEntryCard />
+
         {/* Charts — Revenue vs Expenses has its OWN range (independent of
             the main timeframe) so trends across a year are visible while
             the KPI cards above stay focused on this month/quarter. */}
@@ -373,6 +376,54 @@ function ReconcileEntryCard() {
         )}
       </div>
     </a>
+  );
+}
+
+function BillsEntryCard() {
+  const { entries } = useStore();
+  // Confirmed bills not yet tied to a bank payment — the ones to reconcile.
+  const toReconcile = entries.filter(
+    (e) => e.type === 'bill' && !e.isDraft && !e.paid && !e.bankTransactionId && (e.amount ?? 0) > 0,
+  );
+  // Draft bills (uploads / email / backfill) still awaiting confirmation.
+  const toConfirm = entries.filter((e) => e.type === 'bill' && e.isDraft);
+  const reconcileTotal = toReconcile.reduce((s, e) => s + (e.amount ?? 0), 0);
+  const fmtNZ = (n: number) => `$${n.toLocaleString('en-NZ')}`;
+
+  return (
+    <div className="bg-card border border-border rounded-2xl overflow-hidden">
+      <a
+        href="/reconcile"
+        className="block p-4 hover:bg-muted/30 active:bg-muted/50 transition-colors"
+      >
+        <div className="flex items-center justify-between gap-3">
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-foreground">Bills to reconcile</p>
+            <p className="text-[11px] text-muted-foreground mt-0.5">
+              {toReconcile.length > 0
+                ? `${toReconcile.length} confirmed bill${toReconcile.length !== 1 ? 's' : ''} to match to a payment · ${fmtNZ(reconcileTotal)}`
+                : 'All confirmed bills are matched to payments'}
+            </p>
+          </div>
+          {toReconcile.length > 0 && (
+            <span className="inline-flex items-center justify-center min-w-[1.5rem] h-6 px-2 rounded-full bg-amber-100 text-amber-800 text-[11px] font-bold tabular-nums">
+              {toReconcile.length}
+            </span>
+          )}
+        </div>
+      </a>
+      {toConfirm.length > 0 && (
+        <a
+          href="/home"
+          className="block px-4 py-2.5 border-t border-border hover:bg-muted/30 active:bg-muted/50 transition-colors"
+        >
+          <p className="text-[11px] text-muted-foreground">
+            <span className="font-semibold text-foreground">{toConfirm.length}</span>
+            {' '}bill{toConfirm.length !== 1 ? 's' : ''} also waiting to confirm →
+          </p>
+        </a>
+      )}
+    </div>
   );
 }
 

@@ -41,6 +41,7 @@
 import { NextResponse } from 'next/server';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { parseBillText, parseBillImage, MAX_BILL_TEXT_CHARS, MAX_BILL_VISION_BYTES } from '@/lib/bill-parser';
+import { findMatchingBillIndex } from '@/lib/bill-dedupe';
 import { extractPdfTextServer } from '@/lib/pdf/extract-text-server';
 import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import { followBillDownloadLink, type LinkFollowResult } from '@/lib/bill-link-follower';
@@ -279,6 +280,19 @@ export async function POST(req: Request) {
     if (jobRows) jobsCache = jobRows.map(rowToJob);
   }
 
+  // Fetch existing bills once for create-or-merge matching, so re-forwarding
+  // (or overlap with a backfilled amount-only stub) enriches the existing
+  // bill rather than duplicating it.
+  let existingBills: ExistingBillRow[] = [];
+  {
+    const { data: billRows } = await admin
+      .from('entries')
+      .select('id, payment_ref, amount, supplier, company, parser_raw, bill_pdf_url, source_message_id')
+      .eq('business_id', businessId)
+      .eq('type', 'bill');
+    if (billRows) existingBills = billRows as ExistingBillRow[];
+  }
+
   // ── 6. Process each PDF → create-or-merge a bill ────────────────────────
   const created: string[] = [];
   const merged: string[] = [];
@@ -292,6 +306,7 @@ export async function POST(req: Request) {
       pdfSource,
       linkFollowFinalUrl: linkFollowResult?.finalUrl,
       jobs: jobsCache,
+      existingBills,
     });
     if (r.status === 'created') created.push(r.entryId);
     else if (r.status === 'merged') merged.push(r.entryId);
@@ -329,6 +344,16 @@ export async function POST(req: Request) {
 }
 
 // ── Process one PDF: parse (text or vision) → create-or-merge a bill ──────
+interface ExistingBillRow {
+  id: string;
+  payment_ref: string | null;
+  amount: number | null;
+  supplier: string | null;
+  company: string | null;
+  parser_raw: unknown;
+  bill_pdf_url: string | null;
+  source_message_id: string | null;
+}
 interface ProcessCtx {
   businessId: string;
   messageId: string;
@@ -336,6 +361,7 @@ interface ProcessCtx {
   pdfSource: 'attachment' | 'link';
   linkFollowFinalUrl?: string;
   jobs: Job[];
+  existingBills: ExistingBillRow[];
 }
 type ProcessResult =
   | { status: 'created'; entryId: string }
@@ -347,7 +373,7 @@ async function processOnePdf(
   pdfBuffer: Buffer,
   ctx: ProcessCtx,
 ): Promise<ProcessResult> {
-  const { businessId, messageId, index, pdfSource, linkFollowFinalUrl, jobs } = ctx;
+  const { businessId, messageId, index, pdfSource, linkFollowFinalUrl, jobs, existingBills } = ctx;
 
   // Parse: extract the text layer first (fast + exact); for image-only /
   // scanned PDFs with no text, vision-read the PDF instead.
@@ -396,20 +422,19 @@ async function processOnePdf(
   // the same email stays idempotent.
   const sourceId = `${messageId}#${parsed.invoiceNumber ?? `idx${index}`}`;
 
-  // Create-or-merge: dedupe by this source id, then by invoice number (which
-  // also catches a backfilled amount-only bill of the same invoice).
-  type ExistingBill = { id: string; parser_raw: unknown; bill_pdf_url: string | null };
-  let existing: ExistingBill | null = null;
-  const bySource = await admin.from('entries')
-    .select('id, parser_raw, bill_pdf_url')
-    .eq('business_id', businessId).eq('source_message_id', sourceId).maybeSingle();
-  existing = bySource.data as ExistingBill | null;
-  if (!existing && parsed.invoiceNumber) {
-    const byRef = await admin.from('entries')
-      .select('id, parser_raw, bill_pdf_url')
-      .eq('business_id', businessId).eq('type', 'bill').eq('payment_ref', parsed.invoiceNumber)
-      .limit(1).maybeSingle();
-    existing = byRef.data as ExistingBill | null;
+  // Create-or-merge: match against bills already in the system (pre-fetched).
+  // First by the per-invoice source id (idempotent re-forward), then by
+  // normalized invoice number / identical amount + supplier — which catches a
+  // backfilled amount-only stub whose invoice number is formatted differently
+  // (e.g. 0909019353 vs 909019353).
+  let existing: ExistingBillRow | null =
+    existingBills.find((b) => b.source_message_id === sourceId) ?? null;
+  if (!existing) {
+    const idx = findMatchingBillIndex(
+      existingBills.map((b) => ({ invoiceNumber: b.payment_ref, amount: b.amount, supplier: b.supplier, company: b.company })),
+      { invoiceNumber: parsed.invoiceNumber, totalInclGst: parsed.totalInclGst, supplier: parsed.supplier },
+    );
+    if (idx !== -1) existing = existingBills[idx];
   }
 
   if (existing) {
