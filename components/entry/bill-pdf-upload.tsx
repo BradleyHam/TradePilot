@@ -31,7 +31,7 @@ import { useCallback, useEffect, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
-import { extractPdfText } from '@/lib/pdf/extract-text';
+import { parseBillFile, uploadBillDocument } from '@/lib/parse-bill-file';
 import { rankJobs } from '@/lib/job-match';
 import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import type { Entry, ParsedBill } from '@/lib/types';
@@ -44,8 +44,6 @@ import { cn } from '@/lib/utils';
 // correct it before confirming, which is fragile).
 const JOB_MATCH_MIN_SCORE = 10;
 
-const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10MB — corporate invoices, plenty
-
 type Stage =
   | 'idle'
   | 'extracting'
@@ -56,7 +54,7 @@ type Stage =
   | 'error';
 
 export function BillPdfUploadCard() {
-  const { jobs, addEntry, businessId } = useStore();
+  const { jobs, addEntry, businessId, entries, updateEntry } = useStore();
   const router = useRouter();
   const [stage, setStage] = useState<Stage>('idle');
   const [message, setMessage] = useState<string | null>(null);
@@ -65,48 +63,13 @@ export function BillPdfUploadCard() {
 
   const handleFile = useCallback(async (file: File) => {
     setMessage(null);
-
-    // ── 1. Validate file ──────────────────────────────────────────────
-    if (file.size === 0) {
-      setStage('error');
-      setMessage('File is empty.');
-      return;
-    }
-    if (file.size > MAX_PDF_BYTES) {
-      setStage('error');
-      setMessage(`PDF too large (${(file.size / 1024 / 1024).toFixed(1)}MB). Max 10MB.`);
-      return;
-    }
-    if (file.type && file.type !== 'application/pdf') {
-      setStage('error');
-      setMessage('Not a PDF file.');
-      return;
-    }
     if (!businessId) {
       setStage('error');
       setMessage('No business loaded yet — wait a moment and try again.');
       return;
     }
 
-    // ── 2. Extract text ───────────────────────────────────────────────
-    setStage('extracting');
-    let extracted: Awaited<ReturnType<typeof extractPdfText>>;
-    try {
-      extracted = await extractPdfText(file);
-    } catch (err) {
-      console.error('[bill-upload] PDF text extract failed:', err);
-      setStage('error');
-      setMessage('Couldn\'t read this PDF — it may be an image-only scan or password-protected.');
-      return;
-    }
-    if (extracted.text.trim().length < 20) {
-      setStage('error');
-      setMessage('No readable text in this PDF — image-only scans aren\'t supported yet.');
-      return;
-    }
-
-    // ── 3. POST /api/parse-bill ───────────────────────────────────────
-    setStage('parsing');
+    // Auth token for the parser route.
     const { data: sessionData } = await supabase.auth.getSession();
     const token = sessionData.session?.access_token;
     if (!token) {
@@ -114,58 +77,47 @@ export function BillPdfUploadCard() {
       setMessage('Not signed in — please refresh and sign in again.');
       return;
     }
-    let parsed: ParsedBill;
-    try {
-      const res = await fetch('/api/parse-bill', {
-        method: 'POST',
-        headers: {
-          'Content-Type': 'application/json',
-          'Authorization': `Bearer ${token}`,
-        },
-        body: JSON.stringify({ text: extracted.text }),
-      });
-      const json = await res.json();
-      if (!res.ok || !json.ok) {
-        const detail = json.error ?? `HTTP ${res.status}`;
-        setStage('error');
-        setMessage(`Parser failed: ${detail}`);
+
+    // Validate + parse — PDF text-first / vision fallback, image compress +
+    // vision. Shared with the bill-items attacher via lib/parse-bill-file.
+    setStage('parsing');
+    const res = await parseBillFile(file, token);
+    if (!res.ok) { setStage('error'); setMessage(res.message); return; }
+    const { parsed, fileToStore } = res.result;
+
+    // Create-or-merge: if this invoice number already exists as a bill (e.g.
+    // a backfilled amount-only one), attach the document + merge line items
+    // into it instead of creating a duplicate. So Brad can drop any PDF and
+    // the app works out whether it's new or one we already have.
+    if (parsed.invoiceNumber) {
+      const existing = entries.find(
+        (e) => e.type === 'bill' && e.paymentRef === parsed.invoiceNumber,
+      );
+      if (existing) {
+        setStage('uploading');
+        const url = (await uploadBillDocument(fileToStore, businessId)) ?? existing.billPdfUrl;
+        const existingRaw = (existing.parserRaw && typeof existing.parserRaw === 'object')
+          ? (existing.parserRaw as Record<string, unknown>) : {};
+        const mergedRaw: Record<string, unknown> = { ...existingRaw };
+        if (parsed.lineItems && parsed.lineItems.length > 0) mergedRaw.lineItems = parsed.lineItems;
+        const patch: Partial<Entry> = { parserRaw: mergedRaw };
+        if (url) patch.billPdfUrl = url;
+        updateEntry(existing.id, patch);
+        setStage('done');
+        setMessage(`Matched existing bill #${parsed.invoiceNumber} — added its line items.`);
+        router.push('/home');
         return;
       }
-      parsed = json.parsed as ParsedBill;
-    } catch (err) {
-      console.error('[bill-upload] parse request failed:', err);
-      setStage('error');
-      setMessage('Couldn\'t reach the parser. Check your connection and try again.');
-      return;
     }
 
-    // ── 4. Upload PDF to Storage ──────────────────────────────────────
+    // Archive the document; the parsed fields are still useful without it.
     setStage('uploading');
-    const uuid = crypto.randomUUID();
-    const objectPath = `${businessId}/${uuid}.pdf`;
-    let billPdfUrl: string | undefined;
-    try {
-      const { error: uploadErr } = await supabase.storage
-        .from('bill-pdfs')
-        .upload(objectPath, file, {
-          contentType: 'application/pdf',
-          cacheControl: '3600',
-          upsert: false,
-        });
-      if (uploadErr) {
-        // Don't abort — the parsed fields are still useful. Continue
-        // without an attached PDF and surface a warning on the draft.
-        console.warn('[bill-upload] Storage upload failed; continuing without PDF:', uploadErr);
-        setMessage('Note: PDF couldn\'t be attached — bill drafted anyway. You can re-attach later.');
-      } else {
-        billPdfUrl = objectPath;
-      }
-    } catch (err) {
-      console.warn('[bill-upload] Storage upload threw:', err);
-      setMessage('Note: PDF couldn\'t be attached — bill drafted anyway.');
+    const billPdfUrl = (await uploadBillDocument(fileToStore, businessId)) ?? undefined;
+    if (!billPdfUrl) {
+      setMessage('Note: file couldn\'t be attached — bill drafted anyway. You can re-attach later.');
     }
 
-    // ── 5. Job-guess via rankJobs ─────────────────────────────────────
+    // ── Job-guess via rankJobs ────────────────────────────────────────
     let guessedJobId: string | undefined;
     if (parsed.jobHint) {
       const ranked = rankJobs(jobs, parsed.jobHint);
@@ -175,12 +127,12 @@ export function BillPdfUploadCard() {
       }
     }
 
-    // ── 6. Create the draft entry ─────────────────────────────────────
-    // Due-date resolution: prefer the date printed on the PDF. If the PDF
-    // doesn't have one but we know the invoice date, fall back to the NZ
-    // trade-standard "20th of the following month" rule. Mark the source
-    // in parserRaw so the confirm UI can show "(from PDF)" vs "(computed)"
-    // and Brad spots a wrong inference before it lands in the books.
+    // ── Create the draft entry ────────────────────────────────────────
+    // Due-date resolution: prefer the date printed on the bill. If absent
+    // but we know the invoice date, fall back to the NZ trade-standard
+    // "20th of the following month" rule. Mark the source in parserRaw so
+    // the confirm UI can show "(from bill)" vs "(computed)" and Brad spots
+    // a wrong inference before it lands in the books.
     let resolvedDueDate: string | undefined;
     let dueDateSource: DueDateSource | undefined;
     if (parsed.dueDate) {
@@ -194,7 +146,7 @@ export function BillPdfUploadCard() {
       }
     }
     // If neither is available, dueDate stays undefined — Brad sets it
-    // manually on the confirm row (Phase 2 will surface an editable field).
+    // manually on the confirm row.
 
     setStage('saving');
     const tempId = `ent_${Date.now()}`;
@@ -207,7 +159,7 @@ export function BillPdfUploadCard() {
       billPdfUrl,
       parserConfidence: parsed.confidence,
       // Augment the raw parser blob with our locally-derived metadata so
-      // the home-screen draft row can render provenance ("from PDF" vs
+      // the home-screen draft row can render provenance ("from bill" vs
       // "computed") without needing a new column.
       parserRaw: { ...parsed, dueDateSource },
       // Bill fields mapped from the parsed payload.
@@ -233,17 +185,17 @@ export function BillPdfUploadCard() {
       console.error('[bill-upload] addEntry threw synchronously:', err);
       setStage('error');
       setMessage('Couldn\'t save the draft. Try again.');
-      // Best-effort: delete the uploaded PDF if we got one.
+      // Best-effort: delete the uploaded file if we got one.
       if (billPdfUrl) {
         void supabase.storage.from('bill-pdfs').remove([billPdfUrl]).catch(() => {});
       }
       return;
     }
 
-    // ── 7. Done — route to Home so Brad sees the Bills-to-confirm flag.
+    // ── Done — route to Home so Brad sees the Bills-to-confirm flag. ──
     setStage('done');
     router.push('/home');
-  }, [businessId, jobs, addEntry, router]);
+  }, [businessId, entries, jobs, addEntry, updateEntry, router]);
 
   // ── Drag-and-drop wiring (mirrors BankUploadCard's pattern) ──────────────
   useEffect(() => {
@@ -284,9 +236,9 @@ export function BillPdfUploadCard() {
 
   const busy = stage === 'extracting' || stage === 'parsing'
     || stage === 'uploading' || stage === 'saving';
-  const busyLabel = stage === 'extracting' ? 'Reading PDF…'
+  const busyLabel = stage === 'extracting' ? 'Reading…'
     : stage === 'parsing'   ? 'Parsing bill…'
-    : stage === 'uploading' ? 'Saving PDF…'
+    : stage === 'uploading' ? 'Saving…'
     : stage === 'saving'    ? 'Creating draft…'
     : null;
 
@@ -297,9 +249,9 @@ export function BillPdfUploadCard() {
           <FileText size={14} className="text-orange-600" strokeWidth={1.8} />
         </div>
         <div className="flex-1 min-w-0">
-          <p className="text-sm font-semibold text-foreground">Upload supplier bill</p>
+          <p className="text-sm font-semibold text-foreground">Add a supplier bill</p>
           <p className="text-[11px] text-muted-foreground">
-            PDF only. Lands as a draft on Home for you to confirm.
+            PDF or a photo. Lands as a draft on Home for you to confirm.
           </p>
         </div>
         {busy && <p className="text-[11px] text-muted-foreground">{busyLabel}</p>}
@@ -325,11 +277,11 @@ export function BillPdfUploadCard() {
           strokeWidth={1.8}
         />
         <span className="font-medium">
-          {dragOver ? 'Drop bill PDF' : busy ? busyLabel : 'Drop PDF or tap to choose'}
+          {dragOver ? 'Drop the bill' : busy ? busyLabel : 'Drop a PDF or photo, or tap to choose'}
         </span>
         <input
           type="file"
-          accept="application/pdf,.pdf"
+          accept="application/pdf,.pdf,image/*"
           className="hidden"
           disabled={busy}
           onChange={(e) => {

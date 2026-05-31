@@ -17,7 +17,7 @@
 
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
-import { FileText, Pencil } from 'lucide-react';
+import { FileText, Pencil, Trash2 } from 'lucide-react';
 
 interface Props {
   open: boolean;
@@ -26,11 +26,20 @@ interface Props {
   itemDate?: string;
   onWrapUp: () => void;
   onEdit: () => void;
+  /**
+   * Optional quick-delete shortcut. When provided, a third destructive
+   * button appears so the user can drop a misbooked visit from the chooser
+   * without having to step through Edit → Delete. Brad asked for this
+   * specifically — "I made a mistake and made the site visit the wrong day"
+   * shouldn't take more taps than booking it did. The parent is expected
+   * to confirm before actually deleting.
+   */
+  onDelete?: () => void;
   onCancel: () => void;
 }
 
 export function VisitActionChooser({
-  open, itemTitle, itemDate, onWrapUp, onEdit, onCancel,
+  open, itemTitle, itemDate, onWrapUp, onEdit, onDelete, onCancel,
 }: Props) {
   return (
     <Sheet open={open} onOpenChange={(o) => { if (!o) onCancel(); }}>
@@ -86,6 +95,28 @@ export function VisitActionChooser({
               </p>
             </div>
           </button>
+
+          {/* Tertiary action — delete. Only rendered when a handler is
+              provided so the chooser is back-compat with any caller that
+              doesn't (yet) opt into the shortcut. Destructive styling
+              keeps it visually distinct from Wrap up / Edit. */}
+          {onDelete && (
+            <button
+              type="button"
+              onClick={onDelete}
+              className="w-full text-left rounded-xl border border-red-200 bg-red-50/40 hover:bg-red-50 transition-colors p-3 flex items-start gap-3 min-h-[56px]"
+            >
+              <div className="w-9 h-9 rounded-xl bg-red-100 flex items-center justify-center shrink-0">
+                <Trash2 size={16} className="text-red-600" strokeWidth={1.8} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-red-700">Delete visit</p>
+                <p className="text-xs text-red-600/80 mt-0.5">
+                  Remove this site visit from the schedule. Can't be undone.
+                </p>
+              </div>
+            </button>
+          )}
 
           <Button variant="outline" className="w-full" onClick={onCancel}>
             Cancel

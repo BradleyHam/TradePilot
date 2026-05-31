@@ -12,6 +12,7 @@ export default function ReconcilePage() {
     bankTransactions, entries, jobs,
     updateBankTransaction,
     reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
+    markBillsPaid,
   } = useStore();
 
   // Pending = unreconciled, sorted by date desc
@@ -53,6 +54,7 @@ export default function ReconcilePage() {
                 onLinkToEntry={(entryId) => reconcileToEntry(txn.id, entryId)}
                 onCreateEntry={(entry) => reconcileAsNewEntry(txn.id, entry)}
                 onSplitEntries={(rows) => reconcileAsSplitEntries(txn.id, rows)}
+                onMatchBills={(billIds, paidDate) => markBillsPaid(txn.id, billIds, paidDate)}
                 onIgnore={() => updateBankTransaction(txn.id, { status: 'ignored' })}
                 onMarkPersonal={() => updateBankTransaction(txn.id, { status: 'personal' })}
               />

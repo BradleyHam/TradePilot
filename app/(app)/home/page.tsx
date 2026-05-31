@@ -25,6 +25,7 @@ import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocato
 import { rankJobs } from '@/lib/job-match';
 import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
+import { BillItemsAttacher } from '@/components/bills/bill-items-attacher';
 
 /**
  * Outcome of a quote being committed via the imports flow. Captured
@@ -92,7 +93,7 @@ export default function HomePage() {
   const {
     entries, scheduleItems, invoices, jobs, jobImports, businessId,
     updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry,
-    confirmBillDraftWithMaterials,
+    confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
     commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
   } = useStore();
 
@@ -351,6 +352,9 @@ export default function HomePage() {
             onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
             onConfirmDraft={(id, { jobId, materials }) =>
               void confirmBillDraftWithMaterials(id, { jobId, materials })
+            }
+            onConfirmDraftSplit={(id, slices, materials) =>
+              void confirmBillDraftAsSplit(id, slices, materials)
             }
             onDeleteDraft={(id) => deleteEntry(id)}
             onCommitImportAsLink={(id, jobId, outcome) => void commitImportAsLink(id, jobId, outcome)}
@@ -781,7 +785,7 @@ function WeekStatsSection({
 
 function MoneyFlagsCard({
   overdueInvoices, billsDueSoon, billDrafts, jobImports, jobs, todayISO,
-  onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onDeleteDraft,
+  onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onConfirmDraftSplit, onDeleteDraft,
   onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip,
 }: {
   overdueInvoices: Invoice[];
@@ -793,6 +797,7 @@ function MoneyFlagsCard({
   onMarkInvoicePaid: (invoiceId: string, paidDate: string) => void;
   onMarkBillPaid: (entryId: string, paidDate: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
+  onConfirmDraftSplit: (entryId: string, slices: { jobId: string | null; exGst: number }[], materials: MaterialInit[]) => void;
   onDeleteDraft: (entryId: string) => void;
   onCommitImportAsLink: (importId: string, jobId: string, outcome: ImportOutcome) => void;
   onCommitImportAsCreate: (importId: string) => void;
@@ -809,6 +814,7 @@ function MoneyFlagsCard({
             drafts={billDrafts}
             jobs={jobs}
             onConfirm={onConfirmDraft}
+            onConfirmSplit={onConfirmDraftSplit}
             onDelete={onDeleteDraft}
           />
         )}
@@ -1099,18 +1105,52 @@ function BillsDueFlag({
 // signal "really double-check this one before confirming" — typically a
 // failed GST validation, an unusual layout, or missing key fields.
 
+/** Type-narrow on the parserRaw.failure marker so the header summary
+ *  can split parseable drafts from "needs attention" drafts. Kept
+ *  defensive because parser_raw is `unknown` jsonb. */
+function isFailureDraft(d: Entry): boolean {
+  const raw = d.parserRaw as { failure?: unknown } | null;
+  return Boolean(raw && typeof raw === 'object' && raw.failure);
+}
+
 function BillsToConfirmFlag({
-  drafts, jobs, onConfirm, onDelete,
+  drafts, jobs, onConfirm, onConfirmSplit, onDelete,
 }: {
   drafts: Entry[];
   jobs: Job[];
   onConfirm: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
+  onConfirmSplit: (entryId: string, slices: { jobId: string | null; exGst: number }[], materials: MaterialInit[]) => void;
   onDelete: (entryId: string) => void;
 }) {
   const [open, setOpen] = useState(false);
-  // Total ex-GST across all drafts. Useful as the "if I confirm all of
-  // these, my books grow by X" preview at a glance.
-  const total = drafts.reduce((s, d) => s + billExGst(d), 0);
+  // Split into parseable drafts (ready to confirm with full data) and
+  // failure drafts (email arrived but no parseable bill — surfaced so
+  // they don't disappear silently). Sort failure drafts to the top of
+  // the list because they're action-blocking: until Brad handles them,
+  // those bills aren't in his books.
+  const failureDrafts = drafts.filter(isFailureDraft);
+  const parseable = drafts.filter((d) => !isFailureDraft(d));
+  const orderedDrafts = [...failureDrafts, ...parseable];
+  // Total only counts parseable drafts — failure drafts have no amount.
+  const total = parseable.reduce((s, d) => s + billExGst(d), 0);
+
+  // Header text: lead with whichever count is higher-priority. Failure
+  // drafts always win because they're broken; parseable drafts are
+  // routine.
+  const headerPrimary = failureDrafts.length > 0
+    ? `${failureDrafts.length} email${failureDrafts.length === 1 ? '' : 's'} need${failureDrafts.length === 1 ? 's' : ''} attention`
+    : `${parseable.length} bill${parseable.length === 1 ? '' : 's'} to confirm`;
+  const headerSecondary = failureDrafts.length > 0 && parseable.length > 0
+    ? `+ ${parseable.length} parsed · ${fmtMoney(total)} ex-GST`
+    : failureDrafts.length > 0
+      ? 'Open the originals and log manually'
+      : `From PDF · ${fmtMoney(total)} ex-GST`;
+
+  // Icon also swaps to AlertCircle when failures are present, so the
+  // dashboard scan picks up the distinction without expanding the card.
+  const Icon = failureDrafts.length > 0 ? AlertCircle : FilePlus;
+  const iconColor = failureDrafts.length > 0 ? 'text-amber-600' : 'text-orange-600';
+  const iconBg = failureDrafts.length > 0 ? 'bg-amber-50' : 'bg-orange-50';
 
   return (
     <div>
@@ -1120,15 +1160,15 @@ function BillsToConfirmFlag({
         aria-expanded={open}
         className="w-full flex items-center gap-3 px-4 py-3 min-h-[56px] hover:bg-accent transition-colors text-left"
       >
-        <div className="w-8 h-8 rounded-xl bg-orange-50 flex items-center justify-center shrink-0">
-          <FilePlus size={16} className="text-orange-600" strokeWidth={1.8} />
+        <div className={cn('w-8 h-8 rounded-xl flex items-center justify-center shrink-0', iconBg)}>
+          <Icon size={16} className={iconColor} strokeWidth={1.8} />
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-foreground">
-            {drafts.length} bill{drafts.length === 1 ? '' : 's'} to confirm
+            {headerPrimary}
           </p>
           <p className="text-xs text-muted-foreground">
-            From PDF · {fmtMoney(total)} ex-GST
+            {headerSecondary}
           </p>
         </div>
         <ChevronDown
@@ -1141,12 +1181,13 @@ function BillsToConfirmFlag({
       </button>
       {open && (
         <ul className="px-2 pb-2 space-y-2 bg-muted/30">
-          {drafts.map((d) => (
+          {orderedDrafts.map((d) => (
             <DraftBillRow
               key={d.id}
               draft={d}
               jobs={jobs}
               onConfirm={onConfirm}
+              onConfirmSplit={onConfirmSplit}
               onDelete={onDelete}
             />
           ))}
@@ -1156,10 +1197,12 @@ function BillsToConfirmFlag({
   );
 }
 
-// Per-line allocation value. '' = use bill's job (or overhead if the bill
-// picker itself is on overhead — we resolve at submit time). 'skip' = don't
-// create a material row for this line. Any other string = a job UUID for
-// per-line override.
+// Per-line allocation value:
+//   ''       = use the bill's job (the top picker)
+//   '__OH__' = force this line to overhead (no job), even when the bill has a job
+//   'skip'   = don't track this line (no material row)
+//   <uuid>   = a specific job for this line
+// splitSlices already buckets '__OH__' to overhead; resolveJobId maps it to undefined.
 type LineAlloc = '' | 'skip' | string;
 
 // Shape of a parsed line item we accept from parserRaw. The LLM may emit
@@ -1172,11 +1215,12 @@ interface ParsedLineItem {
 }
 
 function DraftBillRow({
-  draft, jobs, onConfirm, onDelete,
+  draft, jobs, onConfirm, onConfirmSplit, onDelete,
 }: {
   draft: Entry;
   jobs: Job[];
   onConfirm: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
+  onConfirmSplit: (entryId: string, slices: { jobId: string | null; exGst: number }[], materials: MaterialInit[]) => void;
   onDelete: (entryId: string) => void;
 }) {
   // Picker state: starts at whatever the parser pre-filled (jobId from
@@ -1190,8 +1234,26 @@ function DraftBillRow({
   // handles that gracefully (returns all jobs sorted by tier/recency).
   // Read both jobHint (for the dropdown ranking) and dueDateSource (for
   // the small provenance label next to the due date) from parserRaw.
+  //
+  // `failure` is populated by the webhook when an email arrived but we
+  // couldn't extract a usable bill (no PDF, image-only scan, parser
+  // error). Such drafts have no amount/supplier — they exist purely to
+  // surface the email on Home so Brad can handle it manually. See the
+  // FailureDraftRow render path below.
   const parserRaw = draft.parserRaw as
-    { jobHint?: string; dueDateSource?: 'pdf' | 'computed' | 'manual'; lineItems?: unknown } | null;
+    {
+      jobHint?: string;
+      dueDateSource?: 'pdf' | 'computed' | 'manual';
+      lineItems?: unknown;
+      failure?: {
+        reason?: string;
+        detail?: string;
+        subject?: string;
+        fromAddress?: string;
+        pdfSource?: 'attachment' | 'link';
+      };
+    } | null;
+  const failure = parserRaw?.failure;
   const hint = parserRaw?.jobHint;
   const dueDateSource = parserRaw?.dueDateSource;
   const ranked = useMemo(() => rankJobs(jobs, hint), [jobs, hint]);
@@ -1292,6 +1354,48 @@ function DraftBillRow({
     onDelete(draft.id);
   }
 
+  // When line items are allocated across 2+ jobs, this is the per-job
+  // ex-GST split: each job's share of the bill's ex-GST total, proportional
+  // to its line-cost share (so skipped / cost-less lines and parser rounding
+  // never throw the total off). null = not a multi-job split → single path.
+  const splitSlices = useMemo<{ jobId: string | null; exGst: number }[] | null>(() => {
+    if (lineItems.length === 0) return null;
+    const exTotal = billExGst(draft);
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    // The top picker is the DEFAULT bucket ('__OH__' = overhead / no job).
+    const defaultKey = pickedJobId === '' ? '__OH__' : pickedJobId;
+
+    // Sum each line into its destination: '' → default bucket, an override
+    // → that job, 'skip' → untracked (its cost falls into the remainder
+    // below). Line costs are ex-GST.
+    const sums = new Map<string, number>();
+    let tracked = 0;
+    lineItems.forEach((li, i) => {
+      const a = allocations[i] ?? '';
+      if (a === 'skip') return;
+      const key = a === '' ? defaultKey : a;
+      const c = lineCost(li) ?? 0;
+      sums.set(key, (sums.get(key) ?? 0) + c);
+      tracked += c;
+    });
+
+    // Anything not pinned to an override line (skipped lines, levies,
+    // line-vs-total rounding) stays on the DEFAULT bucket, so the slices
+    // always sum to the bill total and a skipped line never inflates
+    // another job.
+    const remainder = r2(exTotal - tracked);
+    sums.set(defaultKey, r2((sums.get(defaultKey) ?? 0) + remainder));
+
+    const present = [...sums.entries()].filter(([, v]) => Math.abs(v) > 0.005);
+    if (present.length < 2) return null; // single job → not a split
+    const slices = present.map(([key, v]) => ({ jobId: key === '__OH__' ? null : key, exGst: r2(v) }));
+    // Pin residual rounding to the last slice so they sum to the cent.
+    const exSum = slices.reduce((s, x) => s + x.exGst, 0);
+    const last = slices.length - 1;
+    slices[last] = { ...slices[last], exGst: r2(slices[last].exGst + (exTotal - exSum)) };
+    return slices;
+  }, [lineItems, allocations, pickedJobId, draft, lineCost]);
+
   function handleConfirm() {
     const billJobId: string | null = pickedJobId === '' ? null : pickedJobId;
 
@@ -1304,7 +1408,9 @@ function DraftBillRow({
       const alloc = allocations[i] ?? '';
       if (alloc === 'skip') return;
       const resolvedJobId: string | undefined =
-        alloc === '' ? (billJobId ?? undefined) : alloc;
+        alloc === '' ? (billJobId ?? undefined)
+          : alloc === '__OH__' ? undefined
+          : alloc;
       materials.push({
         jobId: resolvedJobId,
         usedOn: draft.entryDate,
@@ -1324,7 +1430,65 @@ function DraftBillRow({
       });
     });
 
-    onConfirm(draft.id, { jobId: billJobId, materials });
+    if (splitSlices) {
+      onConfirmSplit(draft.id, splitSlices, materials);
+    } else {
+      onConfirm(draft.id, { jobId: billJobId, materials });
+    }
+  }
+
+  // ── Failure draft branch ─────────────────────────────────────────────
+  // An email arrived but couldn't be turned into a parsed bill (no PDF
+  // attachment + no allowlisted download link, image-only scan, etc.).
+  // Surface it distinctly so Brad can either delete it or open the
+  // original email and log the bill manually. No "Confirm" CTA — there's
+  // nothing useful to confirm.
+  if (failure) {
+    const reasonText = describeFailureReason(failure.reason);
+    return (
+      <li className="bg-amber-50 dark:bg-amber-950/20 border border-amber-300 dark:border-amber-800 rounded-xl p-3 space-y-2">
+        <div className="flex items-start gap-2 min-w-0">
+          <AlertCircle
+            size={16}
+            strokeWidth={2}
+            className="shrink-0 mt-0.5 text-amber-700 dark:text-amber-400"
+            aria-hidden="true"
+          />
+          <div className="flex-1 min-w-0">
+            <p className="text-sm font-semibold text-foreground truncate">
+              {failure.fromAddress ?? draft.company ?? draft.supplier ?? 'Unknown sender'}
+            </p>
+            <p className="text-xs text-muted-foreground truncate">
+              {failure.subject ?? '(no subject)'}
+            </p>
+            <p className="text-xs text-amber-800 dark:text-amber-300 mt-1">
+              {reasonText}
+            </p>
+            {failure.detail && (
+              <p className="text-[11px] text-muted-foreground mt-0.5 break-words">
+                {failure.detail}
+              </p>
+            )}
+          </div>
+          <button
+            type="button"
+            onClick={handleDelete}
+            aria-label="Dismiss this email"
+            className="shrink-0 -mt-1 -mr-1 w-7 h-7 rounded-md text-muted-foreground hover:text-red-600 hover:bg-red-50 dark:hover:bg-red-950/40 flex items-center justify-center transition-colors"
+          >
+            <X size={14} strokeWidth={2} />
+          </button>
+        </div>
+        <div className="flex gap-2 pt-1">
+          <Link
+            href="/entry"
+            className="flex-1 h-10 px-3 rounded-lg bg-amber-600 hover:bg-amber-700 text-white text-xs font-semibold flex items-center justify-center transition-colors"
+          >
+            Log bill manually
+          </Link>
+        </div>
+      </li>
+    );
   }
 
   return (
@@ -1392,6 +1556,10 @@ function DraftBillRow({
         </select>
       </div>
 
+      {/* No line items yet (e.g. a backfilled bill) — let Brad drop the
+          document to read them in, which unlocks the per-line split. */}
+      {lineItems.length === 0 && <BillItemsAttacher draft={draft} />}
+
       {/* Per-line allocation — only shown when the parser found line items.
           Each line gets its own select so a single bill can split across
           jobs (e.g. 3 cans for McLeod + 1 for Aubrey + a levy to skip).
@@ -1422,8 +1590,9 @@ function DraftBillRow({
                     className="w-full h-9 px-2 rounded-md border border-input bg-card text-xs focus:outline-none focus:ring-2 focus:ring-ring"
                     aria-label={`Allocate line item ${i + 1}`}
                   >
-                    <option value="">Use bill's job</option>
-                    <option value="skip">Skip — don't track</option>
+                    <option value="">Use bill&apos;s job</option>
+                    <option value="__OH__">Overhead (no job)</option>
+                    <option value="skip">Skip — don&apos;t track</option>
                     <optgroup label="Or pick a different job">
                       {ranked.map(({ job, tier }) => (
                         <option key={job.id} value={job.id}>
@@ -1438,6 +1607,25 @@ function DraftBillRow({
               );
             })}
           </ul>
+        </div>
+      )}
+
+      {/* Split preview — when line items point at 2+ jobs, show how the
+          cost will divide before Brad confirms. Each slice becomes its own
+          bill entry on that job (linked by bill_group_id). */}
+      {splitSlices && (
+        <div className="rounded-lg bg-primary/5 border border-primary/20 p-2 space-y-1">
+          <p className="text-[10px] font-semibold uppercase tracking-wide text-primary">
+            Splits across {splitSlices.length} jobs
+          </p>
+          {splitSlices.map((s, i) => (
+            <div key={i} className="flex items-center justify-between text-xs gap-2">
+              <span className="text-foreground truncate">
+                {s.jobId ? (jobs.find((j) => j.id === s.jobId)?.name ?? 'Job') : 'Overhead'}
+              </span>
+              <span className="text-muted-foreground tabular-nums shrink-0">{fmtMoney(s.exGst)} ex-GST</span>
+            </div>
+          ))}
         </div>
       )}
 
@@ -1842,6 +2030,41 @@ function fmtDueDate(iso: string): string {
   return parseISODate(iso).toLocaleDateString('en-NZ', {
     weekday: 'short', day: 'numeric', month: 'short',
   });
+}
+
+/**
+ * Human-readable label for a webhook parser-failure reason. The webhook
+ * stores machine-readable codes in `parserRaw.failure.reason`; this maps
+ * them to a sentence that explains what to do next.
+ *
+ * Keep these short and action-oriented — Brad's reading them at 5:30pm
+ * on a phone and needs to know whether to bother investigating.
+ */
+function describeFailureReason(reason: string | undefined): string {
+  switch (reason) {
+    case 'no-pdf-attachment':
+      return 'No PDF attached. Some suppliers now send a download link instead — open the email and grab it.';
+    case 'no-allowlisted-url':
+      return 'No PDF attached and no recognised download link. Open the original email to add this bill.';
+    case 'wrong-content-type':
+      return 'Download link returned a non-PDF response. Supplier may need a login — open the email and grab it.';
+    case 'fetch-failed':
+      return 'Couldn\'t fetch the bill download link. Open the email and try downloading the PDF yourself.';
+    case 'timeout':
+      return 'Bill download timed out. Try opening the email and downloading the PDF manually.';
+    case 'too-large':
+      return 'The linked PDF was suspiciously large and was rejected. Open the email and check it yourself.';
+    case 'empty-response':
+      return 'The download link returned an empty response. Open the email and try manually.';
+    case 'image-only-pdf':
+      return 'PDF is image-only (no text layer). OCR isn\'t built yet — log this bill manually.';
+    case 'pdf-extract-failed':
+      return 'Couldn\'t read the PDF\'s text layer. Open the email and log this manually.';
+    case 'parser-error':
+      return 'Parser hit an error on this bill. Open the email and log this manually.';
+    default:
+      return 'Email arrived but couldn\'t be auto-parsed. Open the original and log manually.';
+  }
 }
 
 // ── Section: Coming up ──────────────────────────────────────────────────────

@@ -166,6 +166,7 @@ export function rowToEntry(r: Row): Entry {
     parserConfidence: asString(r.parser_confidence) as Entry['parserConfidence'],
     parserRaw: r.parser_raw ?? undefined,
     sourceMessageId: asString(r.source_message_id),
+    billGroupId: asString(r.bill_group_id),
     createdAt: r.created_at as string,
   };
 }
@@ -202,6 +203,7 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.parserConfidence !== undefined) out.parser_confidence = e.parserConfidence || null;
   if (e.parserRaw !== undefined) out.parser_raw = e.parserRaw ?? null;
   if (e.sourceMessageId !== undefined) out.source_message_id = e.sourceMessageId || null;
+  if (e.billGroupId !== undefined) out.bill_group_id = e.billGroupId || null;
   return out;
 }
 

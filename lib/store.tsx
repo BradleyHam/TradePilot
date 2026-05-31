@@ -182,6 +182,27 @@ interface StoreState {
     bankTxnId: string,
     entries: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>[],
   ) => Promise<{ inserted: number; failed: number; error?: string }>;
+
+  /**
+   * Mark several existing bill entries as PAID against one bank payment.
+   *
+   * Use case: Brad pays 3–4 supplier invoices with a single transfer. Each
+   * bill was already allocated to its job (via the Home confirm flow), so
+   * all this does is settle them: set paid=true + paidDate (the bank payment
+   * date, which is the correct claim date on payments-basis GST) + link each
+   * to the bank transaction. The bank txn flips to 'matched'.
+   *
+   * Bills only count toward GST / income-tax / Money expense totals once
+   * paid=true, so THIS is the step that moves them into the books — confirm
+   * (isDraft=false) alone never sets paid.
+   *
+   * Optimistic with full rollback on failure. Returns counts.
+   */
+  markBillsPaid: (
+    bankTxnId: string,
+    billEntryIds: string[],
+    paidDate: string,
+  ) => Promise<{ updated: number; failed: number; error?: string }>;
   /**
    * Mark an invoice paid AND auto-create a linked income entry on the
    * payment date. Idempotent: if the invoice is already paid, no-op.
@@ -213,6 +234,25 @@ interface StoreState {
   confirmBillDraftWithMaterials: (
     billId: string,
     opts: { jobId: string | null; materials: Omit<Material, 'id' | 'businessId' | 'createdAt'>[] },
+  ) => Promise<void>;
+
+  /**
+   * Confirm a draft bill by SPLITTING its cost across multiple jobs.
+   * Reuses the draft as slice #1 and inserts one extra `bill` entry per
+   * additional job, all sharing a new bill_group_id and summing to the
+   * original total. Each slice is a real bill entry, so per-job profit /
+   * GST / Money pick it up with no other changes; line items are also
+   * written as materials for the per-job detail (materials with
+   * source='bill' are not double-counted by job-stats).
+   *
+   * `slices` ex-GST amounts must already sum to the bill's ex-GST total
+   * (the caller scales them by line-cost share); this derives gross + GST
+   * and pins any rounding remainder to the last slice.
+   */
+  confirmBillDraftAsSplit: (
+    billId: string,
+    slices: { jobId: string | null; exGst: number }[],
+    materials: Omit<Material, 'id' | 'businessId' | 'createdAt'>[],
   ) => Promise<void>;
 
   /**
@@ -1438,6 +1478,147 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [updateEntry, addMaterials]);
 
+  const confirmBillDraftAsSplit = useCallback(async (
+    billId: string,
+    slices: { jobId: string | null; exGst: number }[],
+    materials: Omit<Material, 'id' | 'businessId' | 'createdAt'>[],
+  ): Promise<void> => {
+    if (billId.startsWith('ent_')) {
+      setError('Still saving the bill — give it a moment and try again.');
+      return;
+    }
+    if (!businessId) return;
+    // Fewer than 2 slices isn't a split — fall back to the single-job path.
+    if (slices.length < 2) {
+      await confirmBillDraftWithMaterials(billId, { jobId: slices[0]?.jobId ?? null, materials });
+      return;
+    }
+
+    // Read the draft from the latest entries. This callback is recreated
+    // whenever `entries` changes (see deps), so it's current at click time.
+    const d = entries.find((e) => e.id === billId);
+    if (!d) { setError('Could not find the bill to split.'); return; }
+
+    const NZ_GST_RATE = 0.15;
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    const gstApplies = d.gstApplies;
+    const grossTotal = d.amount ?? r2(slices.reduce((s, x) => s + x.exGst, 0) * (gstApplies ? 1 + NZ_GST_RATE : 1));
+
+    // Derive gross + GST per slice; pin the rounding remainder to the last
+    // slice so the slices sum to the bill total to the cent.
+    const computed = slices.map((s) => {
+      const ex = r2(s.exGst);
+      const gross = gstApplies ? r2(ex * (1 + NZ_GST_RATE)) : ex;
+      return { jobId: s.jobId, ex, gross, gst: r2(gross - ex) };
+    });
+    const drift = r2(grossTotal - computed.reduce((s, x) => s + x.gross, 0));
+    if (drift !== 0) {
+      const last = computed[computed.length - 1];
+      last.gross = r2(last.gross + drift);
+      last.gst = r2(last.gross - last.ex);
+    }
+
+    const groupId = (typeof crypto !== 'undefined' && crypto.randomUUID)
+      ? crypto.randomUUID() : `grp_${Date.now()}`;
+    const [first, ...rest] = computed;
+
+    // Optimistic local state: draft becomes slice #1; siblings prepend.
+    const prevDraft = d;
+    const siblingLocal: Entry[] = rest.map((s, i) => ({
+      id: `ent_${Date.now()}_${i}`,
+      businessId,
+      jobId: s.jobId ?? undefined,
+      type: 'bill',
+      isDraft: false,
+      paid: false,
+      company: d.company,
+      supplier: d.supplier,
+      description: d.description,
+      amount: s.gross,
+      gstApplies,
+      amountExGst: s.ex,
+      gstComponent: s.gst,
+      entryDate: d.entryDate,
+      dueDate: d.dueDate,
+      paymentRef: d.paymentRef,
+      billPdfUrl: d.billPdfUrl,
+      parserConfidence: d.parserConfidence,
+      billGroupId: groupId,
+      createdAt: new Date().toISOString(),
+    }));
+    const tempIds = siblingLocal.map((s) => s.id);
+    setEntries((list) => {
+      const updated = list.map((e) => e.id === billId
+        ? { ...e, isDraft: false, jobId: first.jobId ?? undefined, amount: first.gross, amountExGst: first.ex, gstComponent: first.gst, billGroupId: groupId }
+        : e);
+      return [...siblingLocal, ...updated];
+    });
+
+    // Persist. Raw column objects (not entryToRow) so job_id can be set to
+    // null directly for overhead slices. Siblings deliberately do NOT carry
+    // source_message_id — only the original draft keeps it (the unique
+    // (business_id, source_message_id) index must not see duplicates).
+    const updateDraft = supabase.from('entries').update({
+      is_draft: false,
+      job_id: first.jobId,
+      amount: first.gross,
+      amount_ex_gst: first.ex,
+      gst_component: first.gst,
+      bill_group_id: groupId,
+    }).eq('id', billId);
+    const siblingRows = rest.map((s, i) => ({
+      business_id: businessId,
+      job_id: computed[i + 1].jobId,
+      type: 'bill',
+      is_draft: false,
+      paid: false,
+      company: d.company ?? null,
+      supplier: d.supplier ?? null,
+      description: d.description,
+      amount: computed[i + 1].gross,
+      amount_ex_gst: computed[i + 1].ex,
+      gst_component: computed[i + 1].gst,
+      gst_applies: gstApplies,
+      entry_date: d.entryDate,
+      due_date: d.dueDate ?? null,
+      payment_ref: d.paymentRef ?? null,
+      bill_pdf_url: d.billPdfUrl ?? null,
+      parser_confidence: d.parserConfidence ?? null,
+      bill_group_id: groupId,
+      created_at: new Date().toISOString(),
+    }));
+    const [updRes, insRes] = await Promise.all([
+      updateDraft,
+      supabase.from('entries').insert(siblingRows).select('*'),
+    ]);
+
+    if (updRes.error || insRes.error || !insRes.data) {
+      const msg = describeError(updRes.error || insRes.error) || 'Failed to split the bill';
+      console.error('[store] confirmBillDraftAsSplit failed:', msg);
+      setError(msg);
+      setEntries((list) => list
+        .filter((e) => !tempIds.includes(e.id))
+        .map((e) => e.id === billId ? prevDraft : e));
+      return;
+    }
+
+    // Swap temp sibling ids for persisted rows.
+    const persisted = insRes.data.map(rowToEntry);
+    setEntries((list) => {
+      const withoutTemps = list.filter((e) => !tempIds.includes(e.id));
+      return [...persisted, ...withoutTemps];
+    });
+
+    // Materials (best-effort) — linked to the original draft (slice #1) for
+    // provenance. Their per-line job_id drives which job they display on;
+    // job-stats excludes source='bill' materials from cost, so no double count.
+    if (materials.length > 0) {
+      const stamped = materials.map((m) => ({ ...m, entryId: billId }));
+      const { failed } = await addMaterials(stamped);
+      if (failed > 0) console.error('[store] confirmBillDraftAsSplit: materials partial failure', { failed, billId });
+    }
+  }, [businessId, entries, confirmBillDraftWithMaterials, addMaterials]);
+
   // ── job_imports commit flow ────────────────────────────────────────────
   // Three mutators (link / create / skip) for committing an "Imports to
   // review" row on Home. Shared logic lives in commitImportShared which
@@ -2280,6 +2461,69 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { inserted: persisted.length, failed: entryInits.length - persisted.length };
   }, [businessId]);
 
+  /**
+   * Settle N already-confirmed bills against one bank payment. See the
+   * interface doc for the why. Optimistic + rollback; we capture the
+   * pre-state inside the functional setState updaters so we never read a
+   * stale closure of `entries` / `bankTransactions`.
+   */
+  const markBillsPaid = useCallback(async (
+    bankTxnId: string,
+    billEntryIds: string[],
+    paidDate: string,
+  ): Promise<{ updated: number; failed: number; error?: string }> => {
+    if (!businessId) return { updated: 0, failed: billEntryIds.length, error: 'No business loaded.' };
+    if (billEntryIds.length === 0) return { updated: 0, failed: 0 };
+
+    const idSet = new Set(billEntryIds);
+
+    // Optimistic flip + capture pre-state for rollback (from freshest state).
+    let prevEntries: Entry[] = [];
+    setEntries((list) => {
+      prevEntries = list.filter((e) => idSet.has(e.id));
+      return list.map((e) => idSet.has(e.id)
+        ? { ...e, paid: true, paidDate, bankTransactionId: bankTxnId }
+        : e);
+    });
+    // The bank_transactions table has a single entry_id column; point it at
+    // the first bill (arbitrary but consistent) — each bill keeps its own
+    // bank_transaction_id for the full audit trail.
+    let prevTxn: BankTransaction | undefined;
+    setBankTransactions((list) => {
+      prevTxn = list.find((t) => t.id === bankTxnId);
+      return list.map((t) => t.id === bankTxnId
+        ? { ...t, status: 'matched', entryId: billEntryIds[0] }
+        : t);
+    });
+
+    const [re, rt] = await Promise.all([
+      supabase.from('entries')
+        .update({ paid: true, paid_date: paidDate, bank_transaction_id: bankTxnId })
+        .in('id', billEntryIds),
+      supabase.from('bank_transactions')
+        .update({ status: 'matched', entry_id: billEntryIds[0] })
+        .eq('id', bankTxnId),
+    ]);
+
+    if (re.error || rt.error) {
+      const msg = describeError(re.error || rt.error) || 'Failed to mark bills paid';
+      console.error('[store] markBillsPaid failed:', msg);
+      setError(msg);
+      // Roll back both sides to the captured pre-state.
+      setEntries((list) => list.map((e) => {
+        const prev = prevEntries.find((p) => p.id === e.id);
+        return prev ?? e;
+      }));
+      if (prevTxn) {
+        const restore = prevTxn;
+        setBankTransactions((list) => list.map((t) => t.id === bankTxnId ? restore : t));
+      }
+      return { updated: 0, failed: billEntryIds.length, error: msg };
+    }
+
+    return { updated: billEntryIds.length, failed: 0 };
+  }, [businessId]);
+
   // ── Quote template ─────────────────────────────────────────────────
   // The settings row keyed 'quote_template' holds a JSON blob; we
   // parse it on read and stringify on write. Migration 014 seeded a
@@ -2412,12 +2656,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         addEntry, updateEntry, deleteEntry,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
-        confirmBillDraft, confirmBillDraftWithMaterials,
+        confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
         addMaterials, addMaterialFromOverhead,
         addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment,
         updateQuote, deleteQuote,
         commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
         importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
+        markBillsPaid,
         getQuoteTemplate, saveQuoteTemplate, uploadBusinessLogo, resolveLogoUrl,
         refresh: load,
       }}

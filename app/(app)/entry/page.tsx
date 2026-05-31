@@ -194,6 +194,7 @@ function BankReconcileSection() {
   const {
     bankTransactions, entries, jobs,
     updateBankTransaction, reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
+    markBillsPaid,
   } = useStore();
 
   const pending = useMemo(
@@ -247,6 +248,7 @@ function BankReconcileSection() {
               onLinkToEntry={(entryId) => reconcileToEntry(txn.id, entryId)}
               onCreateEntry={(entry) => reconcileAsNewEntry(txn.id, entry)}
               onSplitEntries={(rows) => reconcileAsSplitEntries(txn.id, rows)}
+              onMatchBills={(billIds, paidDate) => markBillsPaid(txn.id, billIds, paidDate)}
               onIgnore={() => updateBankTransaction(txn.id, { status: 'ignored' })}
               onMarkPersonal={() => updateBankTransaction(txn.id, { status: 'personal' })}
             />

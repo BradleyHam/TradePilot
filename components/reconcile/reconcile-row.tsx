@@ -5,7 +5,7 @@ import { useStore } from '@/lib/store';
 import { classifyBankRow, findMatchingEntry, type Suggestion } from '@/lib/bank-classifier';
 import { rankJobs } from '@/lib/job-match';
 import type { BankTransaction, Entry, ExpenseCategory } from '@/lib/types';
-import { CheckCircle2, ArrowRight, Receipt, DollarSign, Split, Plus, X } from 'lucide-react';
+import { CheckCircle2, ArrowRight, Receipt, DollarSign, Split, Plus, X, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const fmt = (n: number) =>
@@ -32,13 +32,20 @@ interface ReconcileRowProps {
    * bank txn's gross amount.
    */
   onSplitEntries: (entries: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>[]) => Promise<{ inserted: number; failed: number; error?: string }>;
+  /**
+   * Called when the user settles one or more already-confirmed bills against
+   * this single bank payment (the "I paid 3 Trademax invoices at once" case).
+   * Marks each selected bill paid on the payment date and links it to the
+   * bank txn. The payment date is supplied by this component (txn.txnDate).
+   */
+  onMatchBills: (billEntryIds: string[], paidDate: string) => Promise<{ updated: number; failed: number; error?: string }>;
   onIgnore: () => void;
   onMarkPersonal: () => void;
 }
 
 export function ReconcileRow({
   txn, entries, jobs,
-  onLinkToEntry, onCreateEntry, onSplitEntries, onIgnore, onMarkPersonal,
+  onLinkToEntry, onCreateEntry, onSplitEntries, onMatchBills, onIgnore, onMarkPersonal,
 }: ReconcileRowProps) {
   const isCredit = txn.amount > 0;
 
@@ -52,11 +59,25 @@ export function ReconcileRow({
     [txn, entries],
   );
 
+  // Confirmed-but-unpaid bills available to settle against this payment.
+  // (type 'bill', confirmed, not yet paid, not yet linked to a bank txn,
+  // with a real amount.) Drives whether we show the "Match to bills"
+  // affordance — no point offering it when there's nothing to match.
+  const unpaidBills = useMemo(
+    () => entries.filter(
+      (e) => e.type === 'bill' && !e.isDraft && !e.paid && !e.bankTransactionId && (e.amount ?? 0) > 0,
+    ),
+    [entries],
+  );
+
   // For "create new entry" we need a job picker + GST toggle
   const [showCreateForm, setShowCreateForm] = useState(false);
   // Splitter mode — replaces the single-entry form when the user wants
   // to allocate one bank txn across multiple entries.
   const [showSplitForm, setShowSplitForm] = useState(false);
+  // Bill-match mode — settle several already-uploaded bills against this
+  // one payment (the "paid 3–4 invoices at once" case). Debits only.
+  const [showBillMatch, setShowBillMatch] = useState(false);
 
   return (
     <div className="bg-card border border-border rounded-2xl overflow-hidden">
@@ -87,7 +108,25 @@ export function ReconcileRow({
 
       {/* Body — actions */}
       <div className="border-t border-border bg-muted/20 px-3.5 py-3 space-y-2">
-        {showSplitForm ? (
+        {showBillMatch ? (
+          <BillMatchForm
+            txn={txn}
+            entries={entries}
+            jobs={jobs}
+            onSubmit={async (billIds) => {
+              const result = await onMatchBills(billIds, txn.txnDate);
+              if (result.failed > 0) {
+                alert(`Couldn't mark bills paid — ${result.error ?? 'see console for details.'}`);
+              }
+              if (result.updated > 0) {
+                // Bank txn flips to matched → parent re-filters and this row
+                // unmounts. Defensive close in case it doesn't.
+                setShowBillMatch(false);
+              }
+            }}
+            onCancel={() => setShowBillMatch(false)}
+          />
+        ) : showSplitForm ? (
           <SplitForm
             txn={txn}
             suggestion={suggestion}
@@ -128,9 +167,20 @@ export function ReconcileRow({
               jobs={jobs}
               onSubmit={(entry) => onCreateEntry(entry)}
             />
-            {/* Discoverability hook for the splitter — sits right below the
-                main form so when you're staring at a Mitre 10 row with two
-                jobs in your head, the answer is one tap away. */}
+            {/* Discoverability hooks. Bill-match first (settles invoices
+                you've already uploaded against this payment), then the
+                manual job splitter. Bill-match only shows for debits with
+                unpaid bills waiting — otherwise there's nothing to match. */}
+            {!isCredit && unpaidBills.length > 0 && (
+              <button
+                type="button"
+                onClick={() => setShowBillMatch(true)}
+                className="w-full text-[11px] font-medium text-primary hover:underline flex items-center justify-center gap-1 h-7"
+              >
+                <FileText size={11} strokeWidth={2} />
+                Match to bills you&apos;ve uploaded ({unpaidBills.length})
+              </button>
+            )}
             <button
               type="button"
               onClick={() => setShowSplitForm(true)}
@@ -144,7 +194,7 @@ export function ReconcileRow({
         {/* Bottom-right escape hatches — always visible regardless of
             primary suggestion. Hidden during split form (it has its own
             Cancel button to avoid mixed signals). */}
-        {!showSplitForm && !(suggestion.kind === 'transfer' && !showCreateForm) && (
+        {!showSplitForm && !showBillMatch && !(suggestion.kind === 'transfer' && !showCreateForm) && (
           <div className="flex items-center justify-end gap-1 pt-1">
             <button
               onClick={onMarkPersonal}
@@ -797,6 +847,211 @@ function SplitForm({
             : <>Save {rows.length} entries <ArrowRight size={12} /></>}
         </button>
       </div>
+    </div>
+  );
+}
+
+// ── Match: settle several uploaded bills against one payment ───────────────
+//
+// The "I paid 3–4 Trademax invoices with one transfer" case. The bills were
+// already read by the AI and allocated to their jobs when they landed as
+// drafts on Home; here we just tick which ones this payment covered and mark
+// them paid on the PAYMENT date — the correct claim date on payments-basis
+// GST. No new entries are created (so nothing double-counts), and each split
+// bill's job allocation is already baked into the bill entries themselves.
+
+/**
+ * Cheap token-overlap score between a bill's supplier/company text and the
+ * bank payment's identifying text. Mirrors lib/job-match's tokeniser. Used
+ * to float likely matches to the top and pre-tick the obvious ones.
+ */
+function billSupplierScore(bill: Entry, ctx: string): number {
+  const toks = (s: string) => new Set(
+    s.toLowerCase().replace(/[^a-z0-9 ]+/g, ' ').split(/\s+/).filter((t) => t.length >= 3),
+  );
+  const ctxTokens = toks(ctx);
+  if (ctxTokens.size === 0) return 0;
+  const billTokens = toks([bill.supplier, bill.company, bill.description].filter(Boolean).join(' '));
+  let hits = 0;
+  for (const t of ctxTokens) {
+    if (billTokens.has(t)) { hits += 10; continue; }
+    for (const bt of billTokens) {
+      if (bt.includes(t) || t.includes(bt)) { hits += 5; break; }
+    }
+  }
+  return hits;
+}
+
+function BillMatchForm({
+  txn, entries, jobs, onSubmit, onCancel,
+}: {
+  txn: BankTransaction;
+  entries: Entry[];
+  jobs: ReturnType<typeof useStore>['jobs'];
+  onSubmit: (billEntryIds: string[]) => Promise<void>;
+  onCancel: () => void;
+}) {
+  const paymentGross = Math.abs(txn.amount);
+  const ctx = [txn.payee, txn.particulars, txn.reference, txn.description]
+    .filter(Boolean).join(' ');
+
+  // Candidate bills: confirmed, unpaid, unlinked, positive amount. Sorted
+  // by supplier-match (desc) then most-recent first.
+  const candidates = useMemo(() => {
+    const list = entries
+      .filter((e) => e.type === 'bill' && !e.isDraft && !e.paid && !e.bankTransactionId && (e.amount ?? 0) > 0)
+      .map((e) => ({ bill: e, score: billSupplierScore(e, ctx) }));
+    list.sort((a, b) => {
+      if (a.score !== b.score) return b.score - a.score;
+      return (b.bill.entryDate ?? '').localeCompare(a.bill.entryDate ?? '');
+    });
+    return list;
+  }, [entries, ctx]);
+
+  // Pre-tick the strong supplier matches (score >= 10). If none match the
+  // payee, start empty so Brad chooses deliberately.
+  const [selected, setSelected] = useState<Set<string>>(() => {
+    const init = new Set<string>();
+    candidates.forEach((c) => { if (c.score >= 10) init.add(c.bill.id); });
+    return init;
+  });
+  const [saving, setSaving] = useState(false);
+
+  function toggle(id: string) {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(id)) next.delete(id); else next.add(id);
+      return next;
+    });
+  }
+
+  const selectedTotal = candidates
+    .filter((c) => selected.has(c.bill.id))
+    .reduce((s, c) => s + (c.bill.amount ?? 0), 0);
+  const remaining = Math.round((paymentGross - selectedTotal) * 100) / 100;
+  const balanced = Math.abs(remaining) <= 0.02;
+  const canSave = selected.size > 0 && !saving;
+
+  async function handleSubmit() {
+    if (!canSave) return;
+    setSaving(true);
+    try {
+      await onSubmit([...selected]);
+    } finally {
+      setSaving(false);
+    }
+  }
+
+  if (candidates.length === 0) {
+    return (
+      <div className="space-y-2">
+        <p className="text-xs text-muted-foreground">
+          No unpaid bills to match yet. Upload the supplier invoices first
+          (Entry → Upload supplier bill, or they arrive by email), confirm
+          them on Home, then come back here to settle them against this payment.
+        </p>
+        <button
+          type="button"
+          onClick={onCancel}
+          className="h-8 px-3 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted"
+        >
+          Back
+        </button>
+      </div>
+    );
+  }
+
+  return (
+    <div className="space-y-2">
+      <p className="text-xs font-semibold text-foreground">
+        Which bills did this {fmt(paymentGross)} payment cover?
+      </p>
+
+      <ul className="space-y-1.5">
+        {candidates.map(({ bill }) => {
+          const job = bill.jobId ? jobs.find((j) => j.id === bill.jobId) : null;
+          const isSel = selected.has(bill.id);
+          return (
+            <li key={bill.id}>
+              <button
+                type="button"
+                onClick={() => toggle(bill.id)}
+                aria-pressed={isSel}
+                className={cn(
+                  'w-full flex items-center gap-2.5 p-2 rounded-lg border text-left transition-colors',
+                  isSel
+                    ? 'border-primary bg-primary/5'
+                    : 'border-border bg-background hover:bg-muted/50',
+                )}
+              >
+                <span className={cn(
+                  'shrink-0 w-4 h-4 rounded flex items-center justify-center border',
+                  isSel ? 'bg-primary border-primary text-primary-foreground' : 'border-input bg-background',
+                )}>
+                  {isSel && <CheckCircle2 size={12} strokeWidth={2.5} />}
+                </span>
+                <div className="flex-1 min-w-0">
+                  <p className="text-xs font-medium text-foreground truncate">
+                    {bill.supplier ?? bill.company ?? bill.description}
+                  </p>
+                  <p className="text-[11px] text-muted-foreground truncate">
+                    {job ? job.name : 'Overhead'}
+                    {' · '}{fmtDateNZ(bill.entryDate)}
+                    {bill.paymentRef ? ` · #${bill.paymentRef}` : ''}
+                  </p>
+                </div>
+                <p className="text-xs font-semibold text-foreground shrink-0 tabular-nums">
+                  {fmt(bill.amount ?? 0)}
+                </p>
+              </button>
+            </li>
+          );
+        })}
+      </ul>
+
+      {/* Running total vs payment — a cross-check, not a hard gate. */}
+      <div className={cn(
+        'text-[11px] tabular-nums font-semibold flex items-center justify-end gap-1',
+        selected.size === 0 ? 'text-muted-foreground'
+          : balanced ? 'text-green-700' : 'text-amber-700',
+      )}>
+        {balanced && selected.size > 0
+          ? <><CheckCircle2 size={11} strokeWidth={2} /> Matches payment · {fmt(selectedTotal)}</>
+          : <>{fmt(selectedTotal)} / {fmt(paymentGross)} ({remaining > 0 ? `${fmt(remaining)} left` : `${fmt(Math.abs(remaining))} over`})</>}
+      </div>
+
+      {/* Save / Cancel */}
+      <div className="flex items-center gap-1.5 pt-1">
+        <button
+          type="button"
+          onClick={onCancel}
+          disabled={saving}
+          className="h-9 px-3 rounded-md text-xs font-medium text-muted-foreground hover:text-foreground hover:bg-muted transition-colors"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={handleSubmit}
+          disabled={!canSave}
+          className={cn(
+            'flex-1 h-9 rounded-md text-xs font-semibold transition-colors flex items-center justify-center gap-1',
+            canSave
+              ? 'bg-primary text-primary-foreground hover:bg-primary/90'
+              : 'bg-muted text-muted-foreground cursor-not-allowed',
+          )}
+        >
+          {saving
+            ? 'Saving…'
+            : <>Mark {selected.size || ''} paid <ArrowRight size={12} /></>}
+        </button>
+      </div>
+
+      {selected.size > 0 && !balanced && (
+        <p className="text-[11px] text-muted-foreground">
+          Doesn&apos;t have to match exactly — just tick the bills this payment covered. They&apos;ll be marked paid on {fmtDateNZ(txn.txnDate)}.
+        </p>
+      )}
     </div>
   );
 }

@@ -11,6 +11,7 @@ import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { EntryForm } from '@/components/entry/entry-form';
 import { EditScheduleItemSheet, ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
+import { EditSiteVisitSheet } from '@/components/schedule/edit-site-visit-sheet';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
 import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { VisitActionChooser } from '@/components/schedule/visit-action-chooser';
@@ -335,7 +336,8 @@ function dateGroup(dateStr: string): string {
 export default function SchedulePage() {
   const {
     scheduleItems, jobs, entries,
-    addScheduleItem, updateScheduleItem, addEntry, updateEntry, deleteEntry,
+    addScheduleItem, updateScheduleItem, deleteScheduleItem,
+    addEntry, updateEntry, deleteEntry,
     businessId,
   } = useStore();
 
@@ -363,6 +365,17 @@ export default function SchedulePage() {
   // are remembered so whichever branch the user picks can open with
   // the same row context.
   const [chooserItems, setChooserItems] = useState<ScheduleItem[] | null>(null);
+
+  // Dedicated site-visit edit sheet — distinct from EditScheduleItemSheet
+  // because quote_visit rows are always one day, so the multi-day range +
+  // working-days UI on the shared sheet is noise. Single id (no run) since
+  // visits don't multi-day. Re-resolve from the store on each render to
+  // dodge the stale-prop trap (CLAUDE.md "Gotchas").
+  const [editingVisitId, setEditingVisitId] = useState<string | null>(null);
+  const editingVisit = useMemo(
+    () => editingVisitId ? scheduleItems.find((s) => s.id === editingVisitId) ?? null : null,
+    [editingVisitId, scheduleItems],
+  );
 
   // Skip picker state — set to the schedule_item id when the user taps
   // "Didn't work" on any RunCard. Storing the id (not the row) so we
@@ -900,12 +913,38 @@ export default function SchedulePage() {
           setChooserItems(null);
         }}
         onEdit={() => {
-          if (chooserItems) {
-            setEditingItemIds(chooserItems.map((it) => it.id));
+          // Quote visits route to the dedicated EditSiteVisitSheet rather
+          // than the multi-day EditScheduleItemSheet. Visits are always
+          // single-day, so the simpler focused form is what Brad asked
+          // for. We grab the head of the run — visits never multi-day.
+          if (chooserItems && chooserItems[0]) {
+            setEditingVisitId(chooserItems[0].id);
+          }
+          setChooserItems(null);
+        }}
+        onDelete={() => {
+          // Quick-delete from the chooser — bypasses the edit screen so
+          // "I booked the wrong day" is two taps from the schedule list.
+          // Confirm to avoid an accidental fat-finger delete.
+          if (chooserItems && chooserItems[0]) {
+            if (confirm('Delete this site visit?')) {
+              for (const it of chooserItems) deleteScheduleItem(it.id);
+            }
           }
           setChooserItems(null);
         }}
         onCancel={() => setChooserItems(null)}
+      />
+
+      {/* Dedicated single-day site-visit edit sheet. Opened from the
+          chooser's "Edit details" branch for quote_visit rows; the
+          multi-day EditScheduleItemSheet still handles job_booking
+          and reminder ranges. */}
+      <EditSiteVisitSheet
+        open={!!editingVisit}
+        onOpenChange={(open) => !open && setEditingVisitId(null)}
+        item={editingVisit}
+        jobs={jobs}
       />
 
       {/* "Didn't work" picker — opens from the RunCard pill or the

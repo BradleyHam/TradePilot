@@ -18,7 +18,7 @@
 // have two slightly-different parsers behaving differently between flows.
 
 import Anthropic from '@anthropic-ai/sdk';
-import type { Tool } from '@anthropic-ai/sdk/resources/messages';
+import type { Tool, MessageParam, ContentBlockParam } from '@anthropic-ai/sdk/resources/messages';
 import type { ParsedBill } from './types';
 
 const NZ_GST_RATE = 0.15;
@@ -107,6 +107,28 @@ const SYSTEM_PROMPT = [
 export const MAX_BILL_TEXT_CHARS = 40_000;
 
 /**
+ * Media types the vision parser accepts — images plus PDF (for scanned /
+ * image-only PDFs with no text layer). Keep in sync with the client upload
+ * card and the /api/parse-bill route validation.
+ */
+export const VISION_MEDIA_TYPES = [
+  'image/jpeg', 'image/png', 'image/webp', 'image/gif', 'application/pdf',
+] as const;
+export type VisionMediaType = typeof VISION_MEDIA_TYPES[number];
+
+export function isVisionMediaType(v: string): v is VisionMediaType {
+  return (VISION_MEDIA_TYPES as ReadonlyArray<string>).includes(v);
+}
+
+/**
+ * Max raw bytes for a vision payload. Kept well under Vercel's ~4.5MB
+ * serverless request-body limit once base64-inflated (×1.37). Photos are
+ * compressed client-side to a few hundred KB; this mainly guards scanned
+ * PDFs. Oversized inputs get a clear "send a photo instead" message.
+ */
+export const MAX_BILL_VISION_BYTES = 3_000_000;
+
+/**
  * Run the LLM bill parser on text extracted from a supplier PDF.
  *
  * Throws on:
@@ -131,24 +153,12 @@ export async function parseBillText(text: string): Promise<ParsedBill> {
 
   const client = new Anthropic({ apiKey });
 
-  const response = await callAnthropicWithRetry(client, text);
+  const response = await callAnthropicWithRetry(client,
+    'Extract the structured invoice fields from the following supplier ' +
+    'bill text and call the emit_bill tool with them.\n\n---\n' + text + '\n---',
+  );
 
-  // Locate the tool_use block. Forcing tool_choice means it MUST be present,
-  // but defensive lookups are cheap.
-  let toolInput: Record<string, unknown> | null = null;
-  for (const block of response.content) {
-    if (block.type === 'tool_use' && block.name === 'emit_bill') {
-      if (typeof block.input === 'object' && block.input !== null) {
-        toolInput = block.input as Record<string, unknown>;
-      }
-      break;
-    }
-  }
-  if (!toolInput) {
-    throw new Error('Parser returned no structured output');
-  }
-
-  return normaliseParsedBill(toolInput);
+  return normaliseParsedBill(extractEmittedBill(response));
 }
 
 /**
@@ -166,7 +176,7 @@ export async function parseBillText(text: string): Promise<ParsedBill> {
  */
 async function callAnthropicWithRetry(
   client: Anthropic,
-  text: string,
+  userContent: MessageParam['content'],
 ): Promise<Anthropic.Message> {
   const delays = [1_000, 3_000, 9_000];
   let lastErr: unknown;
@@ -178,17 +188,7 @@ async function callAnthropicWithRetry(
         system: SYSTEM_PROMPT,
         tools: [PARSE_TOOL],
         tool_choice: { type: 'tool', name: 'emit_bill' },
-        messages: [
-          {
-            role: 'user',
-            content:
-              'Extract the structured invoice fields from the following ' +
-              'supplier bill text and call the emit_bill tool with them.\n\n' +
-              '---\n' +
-              text +
-              '\n---',
-          },
-        ],
+        messages: [{ role: 'user', content: userContent }],
       });
     } catch (err) {
       lastErr = err;
@@ -277,4 +277,65 @@ export function normaliseParsedBill(raw: Record<string, unknown>): ParsedBill {
 
 function round2(n: number): number {
   return Math.round(n * 100) / 100;
+}
+
+/**
+ * Pull the emit_bill tool input out of a parser response. Forcing
+ * tool_choice means it's always present, but we defend anyway. Shared by
+ * the text and vision parsers so they can't diverge.
+ */
+function extractEmittedBill(response: Anthropic.Message): Record<string, unknown> {
+  for (const block of response.content) {
+    if (block.type === 'tool_use' && block.name === 'emit_bill') {
+      if (typeof block.input === 'object' && block.input !== null) {
+        return block.input as Record<string, unknown>;
+      }
+    }
+  }
+  throw new Error('Parser returned no structured output');
+}
+
+/**
+ * Vision parser: read a PHOTO, screenshot, or scanned/image-only PDF of a
+ * supplier bill and extract the same structured fields as parseBillText.
+ *
+ * Why this exists: painters mostly get bills as phone photos, Gmail-scanned
+ * receipts, or hosted-invoice screenshots — none of which have a text layer
+ * for parseBillText to read. We hand the raw bytes to the same model +
+ * emit_bill tool and run the output through the identical GST validation
+ * (normaliseParsedBill), so the two paths can't drift.
+ *
+ * `dataBase64` is the raw file bytes, base64-encoded (no `data:` prefix).
+ * The caller MUST size-check before calling (see MAX_BILL_VISION_BYTES) — a
+ * huge image wastes tokens and can blow the request-body limit.
+ */
+export async function parseBillImage(
+  dataBase64: string,
+  mediaType: VisionMediaType,
+): Promise<ParsedBill> {
+  const apiKey = process.env.ANTHROPIC_API_KEY;
+  if (!apiKey) throw new Error('ANTHROPIC_API_KEY not set');
+  if (dataBase64.length === 0) throw new Error('Cannot parse empty image');
+
+  const client = new Anthropic({ apiKey });
+
+  const mediaBlock: ContentBlockParam = mediaType === 'application/pdf'
+    ? { type: 'document', source: { type: 'base64', media_type: 'application/pdf', data: dataBase64 } }
+    : { type: 'image', source: { type: 'base64', media_type: mediaType, data: dataBase64 } };
+
+  const content: ContentBlockParam[] = [
+    mediaBlock,
+    {
+      type: 'text',
+      text:
+        'This is a photo or scan of a New Zealand supplier bill, receipt, or ' +
+        'invoice. Read it and call the emit_bill tool with the structured ' +
+        'fields. If the image is blurry or a value is unreadable, omit that ' +
+        'field rather than guessing.',
+    },
+  ];
+
+  const response = await callAnthropicWithRetry(client, content);
+
+  return normaliseParsedBill(extractEmittedBill(response));
 }

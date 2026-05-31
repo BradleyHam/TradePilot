@@ -355,6 +355,14 @@ export interface Entry {
    * via /api/webhooks/inbound-bill; null for manual uploads + legacy data.
    */
   sourceMessageId?: string;
+  /**
+   * Links the slices of ONE supplier bill that was split across multiple
+   * jobs at confirm time. Every sibling bill entry created from the same
+   * invoice shares this id; a normal single-job bill leaves it undefined.
+   * Lets us keep the slices together for display, exempt them from
+   * duplicate detection, and reconcile a payment against the whole group.
+   */
+  billGroupId?: string;
   createdAt: string;
 }
 

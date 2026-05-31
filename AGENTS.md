@@ -227,6 +227,67 @@ The "Mark paid" tickbox only handles unpaid → paid. Going paid → unpaid woul
 
 ---
 
+## Inbound bill webhook (Gmail → CloudMailin → Trade Pilot)
+
+The route at `app/api/webhooks/inbound-bill/route.ts` turns forwarded supplier emails into draft bills that land in the Home screen's "Bills to confirm" flag. Pipeline:
+
+```
+Supplier email
+  → Gmail (bradleyjamesham@gmail.com) filter matches supplier rules
+  → Gmail auto-forwards to the CloudMailin address (verified May 2026)
+  → CloudMailin POSTs the email as JSON to the production webhook
+  → /api/webhooks/inbound-bill validates, parses the PDF, inserts a draft entry
+  → Draft appears on Home next time the app loads
+```
+
+**Env vars (must be set on Vercel AND in `.env.local`):**
+- `INBOUND_BILL_WEBHOOK_SECRET` — shared secret. CloudMailin must send it as `x-webhook-secret` header OR embed it in the URL as basic-auth (`https://anything:<secret>@host/...`). Free-tier CloudMailin can't set custom headers, so the basic-auth form is what's currently wired up.
+- `TRADEPILOT_BUSINESS_ID` — which business the drafts land against.
+- `SUPABASE_SERVICE_ROLE_KEY` — used for the insert (bypasses RLS, since there's no auth.uid() on an inbound webhook).
+- `ANTHROPIC_API_KEY` — used by `parseBillText` to extract supplier/amount/GST.
+
+**CloudMailin → webhook URL.** Format is `https://anything:<INBOUND_BILL_WEBHOOK_SECRET>@<your-vercel-domain>/api/webhooks/inbound-bill`. The username before the colon is ignored by the route — only the password (the secret) is matched.
+
+**Idempotency.** Dedup is on `(business_id, source_message_id)` where `source_message_id = headers['Message-ID']`. A second delivery of the same email returns 200 + `{dedup: true}` without inserting.
+
+**Link-following fallback (added May 2026).** Some suppliers — Dulux as of late May 2026 — have switched from PDF-attached invoice emails to "click here to securely download" link-style emails. When the route sees no PDF attachment, it scans the email body for URLs against a host allowlist in `lib/bill-link-follower.ts` (`ALLOWED_HOSTS`), fetches the first match server-side with a 15s timeout, verifies `content-type: application/pdf`, and feeds the bytes into the existing parser pipeline. Adding a new supplier = one line in `ALLOWED_HOSTS`. Only HTTPS, only allowlisted hosts — we never follow arbitrary email-body URLs.
+
+**Nothing silently disappears (added May 2026).** Previously the route returned 200 + `skipped:true` for emails it couldn't parse (no PDF, image-only scan, parser error). That hid the Dulux switchover for several days. The route now inserts a "failure draft" — a bill entry with `is_draft=true`, no amount, and a `parser_raw.failure` payload — so the email shows up on Home as a "needs attention" row inside the existing Bills-to-confirm flag. Sorted to the top of the flag (action-blocking) with a distinct amber-tinted UI, an "Open original email" / "Log bill manually" CTA, and a delete button.
+
+Failure reasons recorded in `parser_raw.failure.reason`:
+- `no-pdf-attachment` — old code path, kept for legacy data; current code goes via link-follower instead.
+- `no-allowlisted-url` — link-follower scanned the body and found no allowlisted URLs.
+- `wrong-content-type` — followed an allowlisted URL but got HTML / 4xx instead of a PDF (usually means the link is auth-gated and we'd need to log into a portal).
+- `fetch-failed`, `timeout`, `too-large`, `empty-response` — network/payload problems with the download.
+- `image-only-pdf` — PDF had <20 chars of extractable text. OCR not built.
+- `pdf-extract-failed` — pdf-parse threw.
+- `parser-error` — `parseBillText` threw.
+
+Human-readable copy for each reason lives in `describeFailureReason()` in `app/(app)/home/page.tsx`. Update both when adding a new reason code.
+
+**Debugging path when no drafts appear:**
+1. Check Vercel function logs for `/api/webhooks/inbound-bill` — every call logs either `draft created`, `dedup hit`, `no PDF attachment`, or an error.
+2. Check CloudMailin dashboard → message log. If CloudMailin shows 401, the secret in Vercel doesn't match the URL it's POSTing to. If 5xx, the route errored — check Vercel logs.
+3. Check Gmail → Settings → Forwarding and POP/IMAP — Gmail occasionally suspends an auto-forward (e.g. if the destination bounces, or if the verification token expired). Confirm the CloudMailin address is still listed and "Forwarding is enabled".
+4. Check the Gmail filter itself — Gmail filters silently stop matching when supplier email patterns change (e.g. Resene moves from `accounts@resene.co.nz` to `noreply@…`). Test by searching the inbox for the supplier email and confirming the "Forwarded" label is on it.
+5. Query Supabase directly:
+   ```sql
+   select id, created_at, supplier, amount, source_message_id, is_draft
+   from entries
+   where business_id = '<TRADEPILOT_BUSINESS_ID>'
+     and source_message_id is not null
+   order by created_at desc limit 20;
+   ```
+   This shows everything the webhook has ever ingested.
+
+**Smoke test.** `npx tsx scripts/test-inbound-bill.ts <path/to/bill.pdf>` POSTs a CloudMailin-shaped payload to the dev server (or set `INBOUND_BILL_ENDPOINT` to hit prod). Verifies the dedup path also.
+
+**Gotcha — Gmail forwarding verification.** When adding a Gmail forwarding address, Gmail sends a verification code to the destination. CloudMailin doesn't display incoming mail by default; we had to temporarily add `console.log('CLOUDMAILIN_RAW_PAYLOAD:', …)` in the route (commits `c6ffe92` → `80905c1`) to grab the code from Vercel logs. If a new forwarding address is ever added, expect to do the same dance again.
+
+**Gotcha — bills count as expenses only when `paid = true`.** A draft confirmed via Home creates `isDraft = false`, but the bill still doesn't hit money math until it's marked paid (matches Brad's payments-basis GST registration). If a confirmed bill is missing from Money, check `paid`.
+
+---
+
 ## Brad's tax structure (confirmed April 2026)
 
 This is the source of truth for Brad's tax position. Update this section whenever something changes — every other tax-related decision in the app and in conversations should be consistent with what's written here.

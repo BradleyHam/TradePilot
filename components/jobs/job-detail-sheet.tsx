@@ -1840,6 +1840,13 @@ function JobAttachmentsList({
   // Staged files = picked but not yet uploaded. Each has an editable kind.
   const [staged, setStaged] = useState<{ id: string; file: File; kind: QuoteAttachmentKind }[]>([]);
   const [uploading, setUploading] = useState(false);
+  // True while a drag is hovering the drop zone — drives the highlighted
+  // border + overlay so the user knows we'll accept the drop. We use a
+  // counter ref (not a boolean) because dragenter/dragleave fire on
+  // every child element too, and a naive boolean flickers when the
+  // pointer crosses a child boundary.
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragCounter = useRef(0);
 
   // Set of quote ids on this job — used to filter attachments + know
   // whether we already have a quote to attach to.
@@ -1859,10 +1866,22 @@ function JobAttachmentsList({
   const scopePhotoCount = (grouped.scope_photo?.length ?? 0) + staged.filter((s) => s.kind === 'scope_photo').length;
   const softCapHit = scopePhotoCount > 4;
 
-  function handlePickFiles(e: React.ChangeEvent<HTMLInputElement>) {
-    const files = Array.from(e.target.files ?? []);
+  /**
+   * Shared staging logic — used by both the file input and the drop
+   * zone so the two paths produce identical staged-file rows. Filters
+   * out any file whose type/extension isn't in the accept set; mirrors
+   * what the file input's `accept` attribute does for the picker but
+   * which the drop API doesn't enforce on its own.
+   */
+  function stageFiles(files: File[]) {
     if (files.length === 0) return;
-    const next = files.map((f) => ({
+    const accepted = files.filter(isAcceptedFile);
+    const rejected = files.length - accepted.length;
+    if (rejected > 0) {
+      alert(`${rejected} file${rejected === 1 ? '' : 's'} skipped — only images, PDFs, and HEIC files can be attached.`);
+    }
+    if (accepted.length === 0) return;
+    const next = accepted.map((f) => ({
       id: `staged_${Date.now()}_${Math.random().toString(36).slice(2, 7)}`,
       file: f,
       // Default to scope_photo. inferAttachmentKind-style guess from
@@ -1871,8 +1890,45 @@ function JobAttachmentsList({
       kind: guessKind(f.name),
     }));
     setStaged((prev) => [...prev, ...next]);
+  }
+
+  function handlePickFiles(e: React.ChangeEvent<HTMLInputElement>) {
+    const files = Array.from(e.target.files ?? []);
+    stageFiles(files);
     // Reset the input so picking the same file twice re-fires onChange.
     if (fileInputRef.current) fileInputRef.current.value = '';
+  }
+
+  // ── Drag-and-drop handlers ─────────────────────────────────────────────
+  // We use a child-aware counter so the highlight doesn't flicker when
+  // the pointer crosses inner elements (rows, buttons, etc.) — each
+  // dragenter increments, each dragleave decrements, and we only flip
+  // back to "not dragging" when the count hits zero.
+  function handleDragEnter(e: React.DragEvent<HTMLDivElement>) {
+    // Only respond to file drags, not text/element drags inside the page.
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragCounter.current += 1;
+    setIsDragOver(true);
+  }
+  function handleDragOver(e: React.DragEvent<HTMLDivElement>) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    // preventDefault on dragover is REQUIRED or the drop event never fires.
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+  function handleDragLeave(e: React.DragEvent<HTMLDivElement>) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    dragCounter.current = Math.max(0, dragCounter.current - 1);
+    if (dragCounter.current === 0) setIsDragOver(false);
+  }
+  function handleDrop(e: React.DragEvent<HTMLDivElement>) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragCounter.current = 0;
+    setIsDragOver(false);
+    const files = Array.from(e.dataTransfer.files ?? []);
+    stageFiles(files);
   }
 
   function updateStagedKind(id: string, kind: QuoteAttachmentKind) {
@@ -1912,7 +1968,19 @@ function JobAttachmentsList({
   return (
     <>
       <Separator />
-      <div>
+      <div
+        // Whole-section drop zone — anywhere inside the Plans & photos
+        // block accepts dragged files. The relative wrapper hosts the
+        // hover overlay so it doesn't push existing layout around.
+        onDragEnter={handleDragEnter}
+        onDragOver={handleDragOver}
+        onDragLeave={handleDragLeave}
+        onDrop={handleDrop}
+        className={cn(
+          'relative rounded-lg transition-colors',
+          isDragOver && 'ring-2 ring-primary ring-offset-2 ring-offset-background bg-primary/5',
+        )}
+      >
         <div className="flex items-center justify-between mb-2">
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
             Plans &amp; photos {jobAttachments.length > 0 ? `(${jobAttachments.length})` : ''}
@@ -1938,6 +2006,21 @@ function JobAttachmentsList({
           className="hidden"
           onChange={handlePickFiles}
         />
+
+        {/* Drag-over overlay — only visible mid-drag. pointer-events-none
+            lets the underlying dragleave/drop fire on the wrapper rather
+            than this layer (otherwise dragleave would think the cursor
+            left the zone the moment the overlay appears). */}
+        {isDragOver && (
+          <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-lg bg-primary/10 backdrop-blur-[1px]">
+            <div className="rounded-xl bg-background/90 border-2 border-dashed border-primary px-4 py-3 text-center shadow-sm">
+              <p className="text-sm font-semibold text-primary">Drop to add</p>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Images, PDFs and HEICs welcome
+              </p>
+            </div>
+          </div>
+        )}
 
         {/* Existing attachments grouped by kind. */}
         {jobAttachments.length > 0 ? (
@@ -1965,7 +2048,7 @@ function JobAttachmentsList({
           </div>
         ) : staged.length === 0 ? (
           <p className="text-xs text-muted-foreground mb-3">
-            No photos yet. Add 1–4 scope photos to help the quoting assistant price similar jobs.
+            No photos yet. Add 1–4 scope photos to help the quoting assistant price similar jobs. Tap <strong>Add photos</strong> or drag files in.
           </p>
         ) : null}
 
@@ -2038,6 +2121,22 @@ function JobAttachmentsList({
       </div>
     </>
   );
+}
+
+/**
+ * Whether this dropped/picked file is a supported attachment type.
+ * Mirrors the `accept` attribute on the hidden file input so the
+ * drag-and-drop path doesn't sneak unsupported MIME types past the
+ * uploader. HEIC files often come through with empty/quirky MIME
+ * types from Safari, so we fall back to the extension.
+ */
+function isAcceptedFile(f: File): boolean {
+  const lower = (f.name || '').toLowerCase();
+  if (f.type.startsWith('image/')) return true;
+  if (f.type === 'application/pdf') return true;
+  if (lower.endsWith('.pdf')) return true;
+  if (lower.endsWith('.heic') || lower.endsWith('.heif')) return true;
+  return false;
 }
 
 /**

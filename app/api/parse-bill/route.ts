@@ -26,7 +26,10 @@
 
 import { NextResponse } from 'next/server';
 import { createClient } from '@supabase/supabase-js';
-import { parseBillText, MAX_BILL_TEXT_CHARS } from '@/lib/bill-parser';
+import {
+  parseBillText, parseBillImage, isVisionMediaType,
+  MAX_BILL_TEXT_CHARS, MAX_BILL_VISION_BYTES,
+} from '@/lib/bill-parser';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -92,15 +95,51 @@ export async function POST(req: Request) {
   }
 
   // ── 3. Parse + validate body ───────────────────────────────────────────
-  let body: { text?: unknown };
+  let body: { text?: unknown; fileBase64?: unknown; mediaType?: unknown };
   try {
-    body = (await req.json()) as { text?: unknown };
+    body = (await req.json()) as { text?: unknown; fileBase64?: unknown; mediaType?: unknown };
   } catch {
     return NextResponse.json(
       { ok: false, error: 'Body must be valid JSON.' },
       { status: 400 },
     );
   }
+
+  // ── 3a. Vision path — an image / scanned PDF sent as base64 bytes ───────
+  // Used for phone photos, screenshots, and image-only PDFs that have no
+  // text layer for the text parser to read.
+  const fileBase64 = typeof body.fileBase64 === 'string' ? body.fileBase64 : '';
+  if (fileBase64) {
+    const mediaType = typeof body.mediaType === 'string' ? body.mediaType : '';
+    if (!isVisionMediaType(mediaType)) {
+      return NextResponse.json(
+        { ok: false, error: 'Unsupported mediaType — expected a JPG/PNG/WebP/GIF image or application/pdf.' },
+        { status: 400 },
+      );
+    }
+    // base64 inflates the byte count by ~4/3; estimate the decoded size.
+    const approxBytes = Math.floor((fileBase64.length * 3) / 4);
+    if (approxBytes > MAX_BILL_VISION_BYTES) {
+      return NextResponse.json(
+        { ok: false, error: `Image too large (${(approxBytes / 1024 / 1024).toFixed(1)}MB). Try a photo instead of a full-resolution scan.` },
+        { status: 413 },
+      );
+    }
+    try {
+      const parsed = await parseBillImage(fileBase64, mediaType);
+      return NextResponse.json({ ok: true, parsed });
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      console.error('[parse-bill] parseBillImage failed:', msg);
+      const isConfig = msg.includes('not set');
+      return NextResponse.json(
+        { ok: false, error: isConfig ? msg : 'Upstream parser error.', detail: msg },
+        { status: isConfig ? 500 : 502 },
+      );
+    }
+  }
+
+  // ── 3b. Text path — pre-extracted PDF text ──────────────────────────────
   const text = typeof body.text === 'string' ? body.text.trim() : '';
   if (text.length === 0) {
     return NextResponse.json(
