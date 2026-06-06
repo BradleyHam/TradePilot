@@ -422,7 +422,7 @@ interface StoreState {
    */
   saveJobMarketing: (
     jobId: string,
-    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId'>>,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook'>>,
   ) => Promise<{ ok: boolean; error?: string }>;
 
   // Re-fetch everything from Supabase (useful after a write succeeds).
@@ -2630,6 +2630,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         heroMode: parsed.heroMode,
         heroBeforeId: parsed.heroBeforeId,
         heroAfterId: parsed.heroAfterId,
+        facebook: parsed.facebook,
         updatedAt: parsed.updatedAt ?? row.updatedAt,
       };
     } catch (e) {
@@ -2640,7 +2641,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const saveJobMarketing = useCallback(async (
     jobId: string,
-    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId'>>,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook'>>,
   ): Promise<{ ok: boolean; error?: string }> => {
     if (!businessId) {
       return { ok: false, error: 'No business loaded — try refreshing.' };
@@ -2666,6 +2667,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       heroMode: updates.heroMode !== undefined ? updates.heroMode : prevData.heroMode,
       heroBeforeId: updates.heroBeforeId !== undefined ? updates.heroBeforeId : prevData.heroBeforeId,
       heroAfterId: updates.heroAfterId !== undefined ? updates.heroAfterId : prevData.heroAfterId,
+      facebook: updates.facebook !== undefined ? updates.facebook : prevData.facebook,
       updatedAt: now,
     };
     const valueJson = JSON.stringify(merged);

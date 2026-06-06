@@ -278,6 +278,96 @@ export async function rewriteProjectBody(input: {
   return { description, overview };
 }
 
+// ── Facebook post caption ───────────────────────────────────────────────────
+
+export interface FacebookPostInput {
+  jobName: string;
+  location?: string;
+  /** Human-readable service labels, e.g. ["Exterior Painting", "Cedar Restoration"]. */
+  services?: string[];
+  /** The reviewed website lead paragraph — the main source of truth for facts. */
+  description?: string;
+  /** The reviewed website overview paragraphs, for extra detail to draw on. */
+  overview?: string[];
+  /** Free-text scope notes captured at the site visit, if any. */
+  scopeNotes?: string;
+  /** The stain/paint product if recorded. */
+  stainProduct?: string;
+  /** Public URL of the live project page, included as a CTA when the site is published. */
+  projectUrl?: string;
+}
+
+export interface FacebookPost {
+  /** The full caption to post, hashtags + link included — posted verbatim. */
+  caption: string;
+}
+
+const FB_TOOL: Tool = {
+  name: 'emit_facebook_post',
+  description: 'Emit a ready-to-post Facebook caption for a completed painting job.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      caption: {
+        type: 'string',
+        description:
+          'The complete Facebook caption, ready to post as-is. Structure: 2–4 short, ' +
+          'warm sentences about the job (what was done + where), then a light ' +
+          'call-to-action, then the project link on its own line IF one is provided, ' +
+          'then 3–6 relevant lowercase hashtags on the final line. Plain text only ' +
+          '(Facebook has no markdown). A tasteful emoji or two is fine but keep it ' +
+          'light. Always include #lakesidepainting and a location hashtag.',
+      },
+    },
+    required: ['caption'],
+  },
+};
+
+const FB_SYSTEM = [
+  'You write Facebook captions for Lakeside Painting / Painters Wanaka, a small',
+  'painting business in Wānaka, Central Otago, New Zealand. The audience is local',
+  'homeowners and property managers scrolling their feed.',
+  'Voice: warm, friendly, first-person plural ("we"), proud of the work but not',
+  'salesy. Shorter and a touch more casual than the website — this is social, not',
+  'a portfolio page. NZ English.',
+  'Keep it tight: roughly 40–80 words before the hashtags. One light call-to-action',
+  '(e.g. inviting a free quote). Never invent specifics (colours, brands, m²,',
+  'client names) that are not in the inputs. If a detail is unknown, write around it.',
+].join('\n');
+
+/**
+ * Turn the reviewed website copy + job facts into a Facebook-flavoured caption.
+ * Reuses the same facts Brad already approved for the website so the two stay
+ * consistent, just reshaped for a feed: shorter, friendlier, hashtags + link.
+ */
+export async function generateFacebookPost(input: FacebookPostInput): Promise<FacebookPost> {
+  const client = getClient();
+  const facts = [
+    `Job: ${input.jobName}`,
+    input.location ? `Location: ${input.location}` : '',
+    input.services && input.services.length ? `Services: ${input.services.join(', ')}` : '',
+    input.stainProduct ? `Product used: ${input.stainProduct}` : '',
+    input.scopeNotes ? `Scope notes: ${input.scopeNotes}` : '',
+    input.description ? `Website lead paragraph (the approved facts to draw on): ${input.description}` : '',
+    input.overview && input.overview.length ? `Website detail:\n${input.overview.join('\n')}` : '',
+    input.projectUrl ? `Project page link to include as the CTA: ${input.projectUrl}` : 'No live project link yet — do NOT invent a URL; end on the call-to-action instead.',
+  ].filter(Boolean).join('\n');
+
+  const raw = await callTool(client, {
+    system: FB_SYSTEM,
+    tool: FB_TOOL,
+    maxTokens: 600,
+    content:
+      'Write ONE Facebook caption for this finished painting job, reshaping the ' +
+      'approved website facts below into something friendly and feed-ready. Call ' +
+      'emit_facebook_post.\n\n=== THIS JOB ===\n' + facts,
+  });
+
+  const caption = typeof raw.caption === 'string' ? raw.caption.trim() : '';
+  if (!caption) throw new Error('AI returned an empty Facebook caption');
+  return { caption };
+}
+
 // ── Image labelling (vision) ────────────────────────────────────────────────
 
 export type VisionImageMediaType = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif';

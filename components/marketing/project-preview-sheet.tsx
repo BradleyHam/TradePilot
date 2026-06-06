@@ -13,6 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import { useStore } from '@/lib/store';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
+import { FacebookPanel } from './facebook-panel';
 import type { Job, QuoteAttachment } from '@/lib/types';
 import {
   Sparkles, Plus, Minus, Undo2, Loader2, Check, Globe, Pencil,
@@ -428,6 +429,17 @@ export function ProjectPreviewSheet({
                     <Gallery images={processImages} signedUrls={signedUrls} />
                   </div>
                 )}
+
+                {/* Facebook channel — same job + photos, reshaped for the feed. */}
+                <FacebookPanel
+                  job={job}
+                  afterImages={afterImages}
+                  beforeImages={beforeImages}
+                  signedUrls={signedUrls}
+                  websiteDescription={description}
+                  websiteOverview={overview}
+                  websiteServices={services}
+                />
               </>
             )}
           </div>

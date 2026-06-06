@@ -855,6 +855,27 @@ export interface PipelineData {
 export type JobMarketingStatus = 'draft' | 'ready' | 'published';
 
 /**
+ * Facebook channel state for a job, nested inside JobMarketing (same settings
+ * JSON blob — no new table). The caption is the platform-tailored copy Brad
+ * reviews/edits in the preview; once posted we keep the Graph API post id +
+ * permalink so the UI can show a "View on Facebook" link and a posted badge.
+ */
+export interface JobFacebook {
+  /** The Facebook-flavoured caption shown in the preview and posted as-is. */
+  caption?: string;
+  /** quote_attachments.ids of the photos to attach, in post order (hero first). */
+  photoAttachmentIds?: string[];
+  /** 'draft' until posted, then 'posted'. */
+  status?: 'draft' | 'posted';
+  /** Graph API post id returned on a successful publish. */
+  postId?: string;
+  /** Public permalink to the post (permalink_url), for the "View on Facebook" link. */
+  permalink?: string;
+  /** ISO timestamp of the successful post. */
+  postedAt?: string;
+}
+
+/**
  * Marketing/portfolio metadata for a completed job — the bits that turn a
  * finished job into a website project + (later) a social post.
  *
@@ -890,6 +911,8 @@ export interface JobMarketing {
   heroBeforeId?: string;
   /** Chosen AFTER image (quote_attachments.id) — slider's after side + the main/card image. */
   heroAfterId?: string;
+  /** Facebook channel: caption + post status/link. See JobFacebook. */
+  facebook?: JobFacebook;
   /** ISO timestamp of the last save. */
   updatedAt?: string;
 }

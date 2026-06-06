@@ -20,7 +20,19 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { Button } from '@/components/ui/button';
 import { useStore } from '@/lib/store';
 import type { Job } from '@/lib/types';
-import { Send, CalendarClock, DollarSign, MapPin, FileText, X } from 'lucide-react';
+import { Send, CalendarClock, DollarSign, MapPin, FileText, X, UploadCloud, Loader2 } from 'lucide-react';
+import { cn } from '@/lib/utils';
+import { extractPdfText } from '@/lib/pdf/extract-text';
+import { supabase } from '@/lib/supabase/client';
+
+/** Add N days to an ISO YYYY-MM-DD date, TZ-safe. Returns the same string on bad input. */
+function addDaysISO(iso: string, n: number): string {
+  const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
+  if (!m) return iso;
+  const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
+  d.setUTCDate(d.getUTCDate() + n);
+  return d.toISOString().slice(0, 10);
+}
 
 interface Props {
   open: boolean;
@@ -52,6 +64,12 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
   // wants the file kept alongside the structured job data.
   const [stagedPdf, setStagedPdf] = useState<File | null>(null);
   const pdfInputRef = useRef<HTMLInputElement>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragDepth = useRef(0);
+  // True while we read the dropped PDF + ask the AI for the total.
+  const [parsing, setParsing] = useState(false);
+  // Set once Brad manually edits a date — stops PDF auto-fill from clobbering it.
+  const [datesTouched, setDatesTouched] = useState(false);
 
   // Defaults — today for date sent, +5 calendar days for follow-up.
   // 5 days because tradies typically expect a "we'll think about it"
@@ -75,6 +93,7 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
     setFollowUpDate(job.followUpDate ?? defaultFollowUp);
     setStagedPdf(null);
     setError(null);
+    setDatesTouched(false);
   }, [open, job, initialTotal, todayISO, defaultFollowUp]);
 
   async function handleSave() {
@@ -144,20 +163,84 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
     }
   }
 
-  function handlePickPdf(e: React.ChangeEvent<HTMLInputElement>) {
-    const file = e.target.files?.[0];
-    if (pdfInputRef.current) pdfInputRef.current.value = '';
-    if (!file) return;
-    // Only accept PDFs — anything else gets silently ignored. We
-    // could fall back to allowing images / docx etc but the field
-    // is explicitly "the quote PDF you sent" so the constraint is
-    // intentional.
+  // Shared by the file picker and drag-drop. The field is explicitly "the
+  // quote PDF you sent", so non-PDFs are rejected with a clear message.
+  function stagePdfFile(file: File) {
     if (file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)) {
       setError('Attach a PDF — that\'s the format quotes get sent in.');
       return;
     }
     setStagedPdf(file);
     setError(null);
+    void autofillFromPdf(file);
+  }
+
+  // Best-effort: read the quote PDF and fill the total from it. Only fills an
+  // EMPTY total field, so it never clobbers a number Brad already typed.
+  // Silent on failure — he can always type the amount himself.
+  async function autofillFromPdf(file: File) {
+    setParsing(true);
+    try {
+      const { text } = await extractPdfText(file);
+      if (!text || !text.trim()) return;
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      const res = await fetch('/api/parse-quote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ text }),
+      });
+      const json = (await res.json().catch(() => null)) as
+        { ok?: boolean; parsed?: { totalAmountInclGst?: number; dateSent?: string } } | null;
+      if (!res.ok || !json?.ok || !json.parsed) return;
+      const { totalAmountInclGst: total, dateSent: sent } = json.parsed;
+      if (typeof total === 'number' && total > 0) {
+        setTotalIncl((cur) => (cur.trim() ? cur : String(total)));
+      }
+      // Dates: fill the send date from the quote and derive follow-up as
+      // +5 days — unless Brad has already edited the date fields.
+      if (sent && /^\d{4}-\d{2}-\d{2}$/.test(sent) && !datesTouched) {
+        setDateSent(sent);
+        setFollowUpDate(addDaysISO(sent, 5));
+      }
+    } catch (err) {
+      console.warn('[mark-as-quoted] auto-fill from PDF failed:', err);
+    } finally {
+      setParsing(false);
+    }
+  }
+
+  function handlePickPdf(e: React.ChangeEvent<HTMLInputElement>) {
+    const file = e.target.files?.[0];
+    if (pdfInputRef.current) pdfInputRef.current.value = '';
+    if (file) stagePdfFile(file);
+  }
+
+  // Drag-and-drop onto the attach zone. Counter-ref avoids flicker when the
+  // pointer crosses child elements (same pattern as the photo dropzones).
+  function handleDragEnter(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepth.current += 1;
+    setIsDragOver(true);
+  }
+  function handleDragOver(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = 'copy';
+  }
+  function handleDragLeave(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    dragDepth.current = Math.max(0, dragDepth.current - 1);
+    if (dragDepth.current === 0) setIsDragOver(false);
+  }
+  function handleDropPdf(e: React.DragEvent) {
+    if (!e.dataTransfer.types.includes('Files')) return;
+    e.preventDefault();
+    dragDepth.current = 0;
+    setIsDragOver(false);
+    const file = e.dataTransfer.files?.[0];
+    if (file) stagePdfFile(file);
   }
 
   if (!job) return null;
@@ -219,7 +302,7 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
             <input
               type="date"
               value={dateSent}
-              onChange={(e) => setDateSent(e.target.value)}
+              onChange={(e) => { setDateSent(e.target.value); setDatesTouched(true); }}
               className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
             />
           </div>
@@ -233,7 +316,7 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
             <input
               type="date"
               value={followUpDate}
-              onChange={(e) => setFollowUpDate(e.target.value)}
+              onChange={(e) => { setFollowUpDate(e.target.value); setDatesTouched(true); }}
               className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
             />
             <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
@@ -255,10 +338,24 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
               <button
                 type="button"
                 onClick={() => pdfInputRef.current?.click()}
-                className="w-full min-h-[44px] rounded-xl border-2 border-dashed border-input bg-background hover:bg-accent transition-colors flex items-center justify-center gap-2 text-sm font-medium text-foreground"
+                onDragEnter={handleDragEnter}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDropPdf}
+                className={cn(
+                  'w-full min-h-[88px] rounded-xl border-2 border-dashed transition-colors flex flex-col items-center justify-center gap-1.5 px-3 py-3 text-center',
+                  isDragOver
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-input bg-background hover:bg-accent text-foreground',
+                )}
               >
-                <FileText size={14} strokeWidth={1.8} />
-                Attach the quote PDF you sent
+                <UploadCloud size={22} strokeWidth={1.7} className={isDragOver ? 'text-primary' : 'text-muted-foreground'} />
+                <span className="text-sm font-medium">
+                  {isDragOver ? 'Drop the PDF here' : 'Drag & drop your quote PDF'}
+                </span>
+                <span className="text-[11px] font-normal text-muted-foreground">
+                  or click to choose — we&apos;ll read the total for you
+                </span>
               </button>
             ) : (
               <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-muted/40 border border-border">
@@ -283,9 +380,15 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
               className="hidden"
               onChange={handlePickPdf}
             />
-            <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
-              Skip this if you used the AI-generated PDF — that's already saved on the job.
-            </p>
+            {parsing ? (
+              <p className="mt-1 text-[11px] text-primary leading-snug flex items-center gap-1.5">
+                <Loader2 size={11} className="animate-spin" /> Reading the quote to fill the total…
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+                Skip this if you used the AI-generated PDF — that&apos;s already saved on the job.
+              </p>
+            )}
           </div>
 
           <div className="flex gap-2 pt-2">

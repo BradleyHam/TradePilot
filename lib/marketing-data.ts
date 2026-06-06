@@ -70,6 +70,7 @@ export async function loadJobMarketingContext(jobId: string): Promise<JobMarketi
         heroMode: parsed.heroMode,
         heroBeforeId: parsed.heroBeforeId,
         heroAfterId: parsed.heroAfterId,
+        facebook: parsed.facebook,
         updatedAt: parsed.updatedAt,
       };
     } catch {
@@ -96,6 +97,7 @@ export async function markJobMarketingPublished(
     heroMode: prev?.heroMode,
     heroBeforeId: prev?.heroBeforeId,
     heroAfterId: prev?.heroAfterId,
+    facebook: prev?.facebook,
     updatedAt: new Date().toISOString(),
   });
   const { error } = await supabaseAdmin.from('settings').upsert(
@@ -105,5 +107,39 @@ export async function markJobMarketingPublished(
   if (error) {
     // Non-fatal: the page files are already written; status is cosmetic.
     console.warn('[website-publish] could not mark published:', error.message);
+  }
+}
+
+/**
+ * Persist the Facebook channel state (after a successful post) onto the job's
+ * marketing blob, preserving the website copy/status. Best-effort: a settings
+ * write failure is logged, not thrown — the post itself already succeeded, so
+ * we don't want to surface a hard error for a cosmetic bookkeeping miss.
+ */
+export async function saveJobFacebook(
+  job: Pick<Job, 'id' | 'businessId'>,
+  prev: JobMarketing | null,
+  facebook: JobMarketing['facebook'],
+): Promise<void> {
+  const value = JSON.stringify({
+    jobId: job.id,
+    title: prev?.title,
+    description: prev?.description,
+    overview: prev?.overview,
+    services: prev?.services,
+    status: prev?.status ?? 'draft',
+    heroAttachmentId: prev?.heroAttachmentId,
+    heroMode: prev?.heroMode,
+    heroBeforeId: prev?.heroBeforeId,
+    heroAfterId: prev?.heroAfterId,
+    facebook,
+    updatedAt: new Date().toISOString(),
+  });
+  const { error } = await supabaseAdmin.from('settings').upsert(
+    { business_id: job.businessId, key: `marketing:${job.id}`, value },
+    { onConflict: 'business_id,key' },
+  );
+  if (error) {
+    console.warn('[facebook-publish] could not save facebook state:', error.message);
   }
 }
