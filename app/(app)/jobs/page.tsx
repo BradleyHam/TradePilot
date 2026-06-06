@@ -2,7 +2,7 @@
 
 import { useState } from 'react';
 import { useStore } from '@/lib/store';
-import { Job, JobStatus, ScheduleItem } from '@/lib/types';
+import { Job, JobStatus, ScheduleItem, ScheduleItemType } from '@/lib/types';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { JobCard } from '@/components/jobs/job-card';
@@ -16,12 +16,25 @@ import { jobStats } from '@/lib/job-stats';
 import { cn } from '@/lib/utils';
 
 // Filter values: a synthetic 'coming-up' group, or a literal JobStatus.
-// 'coming-up' is committed work (accepted/booked) plus anything with a
-// future schedule item; sits cleanly alongside In progress. No 'all'
-// chip — search covers the cross-status case better than a giant mixed
-// list does, and the page now defaults to In progress (what am I doing
-// right now) which is far more useful as a first-glance view.
+// 'coming-up' is committed work (accepted/booked) plus any lead/quote
+// that has a booked work day on the calendar (a site visit does NOT
+// count — that's still pipeline, not committed work); sits cleanly
+// alongside In progress. No 'all' chip — search covers the cross-status
+// case better than a giant mixed list does, and the page now defaults
+// to In progress (what am I doing right now) which is far more useful as
+// a first-glance view.
 type FilterValue = 'coming-up' | JobStatus;
+
+// Schedule item types that represent committed WORK — an actual day on
+// the tools. These are the only types that should pull a lead/quote into
+// Coming up via the schedule-reality override below. Everything else on
+// the calendar is pipeline or admin, not committed work:
+//   - quote_visit  : a SITE VISIT to price the job. The job is still a
+//                    lead/quote until Brad's won it — it does NOT belong
+//                    in Coming up just because a visit is booked.
+//   - follow_up    : a reminder to chase a lead. Pipeline, not work.
+//   - bill_due / invoice_due / reminder : money/admin reminders, not work.
+const COMMITTED_WORK_SCHEDULE_TYPES: ScheduleItemType[] = ['job_booking'];
 
 const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
   { label: 'In progress', value: 'in-progress' },
@@ -41,16 +54,24 @@ const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
  * future items. Used by both the Coming up filter and its sort so
  * jobs whose calendar reality lives in schedule_items (rather than
  * the Job row's startDate) still surface correctly.
+ *
+ * Pass `types` to only consider certain schedule item types. The
+ * Coming up qualifier passes COMMITTED_WORK_SCHEDULE_TYPES so a booked
+ * site visit doesn't masquerade as committed work; the sort leaves it
+ * unset so ordering still respects every calendar event (including the
+ * next site visit) when deciding what's soonest.
  */
 function earliestFutureScheduleDate(
   jobId: string,
   scheduleItems: ScheduleItem[],
   todayISO: string,
+  types?: ScheduleItemType[],
 ): string | null {
   let earliest: string | null = null;
   for (const s of scheduleItems) {
     if (s.jobId !== jobId) continue;
     if (s.completed) continue;
+    if (types && !types.includes(s.type)) continue;
     if (s.date < todayISO) continue;
     if (!earliest || s.date < earliest) earliest = s.date;
   }
@@ -61,16 +82,19 @@ function earliestFutureScheduleDate(
  * Should this job appear in the Coming up tab? Coming up means
  * "committed work that's coming". Leads and quoted jobs are pipeline,
  * not coming up — they have their own chips. The only exception is
- * the schedule reality override: if a job has a future schedule item
- * attached, treat it as coming up regardless of status (catches the
- * "I forgot to flip status to booked after scheduling it" case).
+ * the schedule reality override: if a job has a future booked WORK day
+ * attached (job_booking), treat it as coming up regardless of status
+ * (catches the "I forgot to flip status to booked after scheduling it"
+ * case). A booked site visit (quote_visit) does NOT count — the job is
+ * still a lead/quote in the pipeline until Brad's actually won it.
  *
  *   - in-progress        : never (it's on the job already — In progress
  *     chip is the right home). Coming up and In progress are meant to be
  *     mutually exclusive per AGENTS.md.
  *   - completed/invoiced/paid/lost : never (terminal — own chips).
  *   - accepted / booked  : always in (committed work).
- *   - lead / quoted      : in only if a future schedule item exists.
+ *   - lead / quoted      : in only if a future booked work day
+ *     (job_booking) exists. A booked site visit does not qualify.
  */
 function comingUpQualifies(
   job: Job,
@@ -94,11 +118,15 @@ function comingUpQualifies(
   // Committed statuses: always in.
   if (job.status === 'accepted' || job.status === 'booked') return true;
 
-  // Schedule reality override (lead/quoted only): a future schedule item
-  // means this job is genuinely coming up, even if its status hasn't caught
-  // up yet. Catches Troy-style cases where the calendar knows about July but
-  // the Job row still says 'quoted'.
-  if (earliestFutureScheduleDate(job.id, scheduleItems, todayISO)) return true;
+  // Schedule reality override (lead/quoted only): a future booked WORK
+  // day means this job is genuinely coming up, even if its status hasn't
+  // caught up yet. Catches Troy-style cases where the calendar knows about
+  // July but the Job row still says 'quoted'. Restricted to
+  // COMMITTED_WORK_SCHEDULE_TYPES so a booked site visit (quote_visit) —
+  // which is still pipeline, not committed work — doesn't drag a lead in.
+  if (earliestFutureScheduleDate(job.id, scheduleItems, todayISO, COMMITTED_WORK_SCHEDULE_TYPES)) {
+    return true;
+  }
 
   return false;
 }

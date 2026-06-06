@@ -138,6 +138,32 @@ const COMMERCIAL_CHIPS: { value: string; label: string }[] = [
   { value: 'difficult-vibe',           label: 'Difficult vibe'        },
 ];
 
+// ── Numeric input sanitisers ────────────────────────────────────────────────
+// These fields map to DB columns with sane-range CHECK constraints (e.g.
+// migration 015's `window_door_count between 0 and 200`). A stray minus
+// sign — easy to catch with the number spinner or a fat-fingered key —
+// used to sail through the form and only blow up at the Supabase insert,
+// surfacing as a misleading "check your migrations" error. We strip the
+// sign at the input instead. Counts/areas are never negative; treating a
+// typed "-14" as "14" matches the "forgive bad input" rule.
+
+/** Digits only, capped at `max`. Empty stays empty. */
+function sanitizeCount(raw: string, max: number): string {
+  const digits = raw.replace(/[^\d]/g, '');
+  if (digits === '') return '';
+  return String(Math.min(parseInt(digits, 10), max));
+}
+
+/** Non-negative decimal: strips the minus sign and any extra dots. */
+function sanitizeNonNegDecimal(raw: string): string {
+  let s = raw.replace(/[^\d.]/g, '');
+  const firstDot = s.indexOf('.');
+  if (firstDot !== -1) {
+    s = s.slice(0, firstDot + 1) + s.slice(firstDot + 1).replace(/\./g, '');
+  }
+  return s;
+}
+
 /**
  * Two ways the wrap-up can open:
  *
@@ -459,8 +485,12 @@ export function SiteVisitWrapUpSheet({
         quoteReadyBy: quoteReadyBy || undefined,
         coatsCount: coatsCount ? parseInt(coatsCount, 10) : undefined,
         stainProduct: stainProduct.trim() || undefined,
-        windowDoorCount: windowDoorCount ? parseInt(windowDoorCount, 10) : undefined,
-        daysEstimate: daysEstimate ? parseFloat(daysEstimate) : undefined,
+        // Backstop the DB CHECK (0–200) in case a stale/negative value
+        // is still in state — abs handles a leftover "-14", min caps it.
+        windowDoorCount: windowDoorCount
+          ? Math.min(Math.abs(parseInt(windowDoorCount, 10)), 200)
+          : undefined,
+        daysEstimate: daysEstimate ? Math.abs(parseFloat(daysEstimate)) : undefined,
         addonItems: Array.from(addonChips),
         siteLogistics: Array.from(siteLogisticsChips),
         commercialSignals: Array.from(commercialChips),
@@ -824,9 +854,10 @@ export function SiteVisitWrapUpSheet({
             <input
               type="number"
               inputMode="decimal"
+              min={0}
               placeholder="e.g. 180"
               value={surfaceAreaM2}
-              onChange={(e) => setSurfaceAreaM2(e.target.value)}
+              onChange={(e) => setSurfaceAreaM2(sanitizeNonNegDecimal(e.target.value))}
               className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
             />
             <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
@@ -892,9 +923,11 @@ export function SiteVisitWrapUpSheet({
             <input
               type="number"
               inputMode="numeric"
+              min={0}
+              max={200}
               placeholder="e.g. 12"
               value={windowDoorCount}
-              onChange={(e) => setWindowDoorCount(e.target.value)}
+              onChange={(e) => setWindowDoorCount(sanitizeCount(e.target.value, 200))}
               className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
             />
             <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
@@ -1003,10 +1036,11 @@ export function SiteVisitWrapUpSheet({
             <input
               type="number"
               inputMode="decimal"
+              min={0}
               step="0.5"
               placeholder="e.g. 4"
               value={daysEstimate}
-              onChange={(e) => setDaysEstimate(e.target.value)}
+              onChange={(e) => setDaysEstimate(sanitizeNonNegDecimal(e.target.value))}
               className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
             />
             <p className="mt-1 text-[11px] text-muted-foreground leading-snug">

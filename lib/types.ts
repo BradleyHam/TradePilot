@@ -563,6 +563,7 @@ export type QuoteAttachmentKind =
   | 'before_photo'
   | 'after_photo'
   | 'scope_photo'
+  | 'process_photo'
   | 'quote_pdf'
   | 'other';
 
@@ -843,4 +844,52 @@ export interface PipelineData {
   status: string;
   value: number;
   count: number;
+}
+
+/**
+ * Where a job's marketing content sits in its lifecycle.
+ *   draft     — being put together (default for any job once it has marketing data).
+ *   ready     — Brad has eyeballed the photos + blurb and it's good to publish.
+ *   published — pushed live to the website (set by the future publish flow).
+ */
+export type JobMarketingStatus = 'draft' | 'ready' | 'published';
+
+/**
+ * Marketing/portfolio metadata for a completed job — the bits that turn a
+ * finished job into a website project + (later) a social post.
+ *
+ * Deliberately NOT a database table. It's persisted as a JSON blob in the
+ * `settings` table keyed `marketing:{jobId}`, exactly the same pattern as
+ * QuoteTemplate (settings key 'quote_template'). That means this whole
+ * feature ships with ZERO schema migration and can't disturb any existing
+ * table — see getJobMarketing / saveJobMarketing in lib/store.tsx.
+ *
+ * Photos are NOT stored here. They reuse the existing quote_attachments
+ * pipeline: `before_photo` / `scope_photo` (captured at the site-visit
+ * wrap-up) and `after_photo` (added on the Marketing tab once the job's
+ * done). The Marketing tab reads them per job via the job's quotes, the
+ * same way JobDetailSheet's "Plans & photos" panel does.
+ */
+export interface JobMarketing {
+  jobId: string;
+  /** Page title for the website project (defaults to the job name). */
+  title?: string;
+  /** Lead paragraph / card summary — the substantial opening line(s) on the page. */
+  description?: string;
+  /** The body of the project page: 2–4 paragraphs. Reviewed + edited before publish. */
+  overview?: string[];
+  /** Services Provided list shown on the page (selectable pills in the preview). */
+  services?: string[];
+  /** Publishing lifecycle. See JobMarketingStatus. */
+  status: JobMarketingStatus;
+  /** Chosen hero image: the quote_attachments.id of the best 'after' shot. */
+  heroAttachmentId?: string;
+  /** Hero presentation on the project page: a single image, or a before/after slider. */
+  heroMode?: 'image' | 'slider';
+  /** Chosen BEFORE image (quote_attachments.id) for the slider. */
+  heroBeforeId?: string;
+  /** Chosen AFTER image (quote_attachments.id) — slider's after side + the main/card image. */
+  heroAfterId?: string;
+  /** ISO timestamp of the last save. */
+  updatedAt?: string;
 }

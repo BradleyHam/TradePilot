@@ -12,7 +12,7 @@ import {
 import type {
   Job, Entry, EntryType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
-  JobStatus, QuoteTemplate,
+  JobStatus, QuoteTemplate, JobMarketing,
 } from './types';
 import { compressImage } from './image-compress';
 
@@ -41,6 +41,7 @@ function inferAttachmentKind(name: string): QuoteAttachmentKind {
   if (/\.(jpe?g|png|webp|heic)$/.test(lower)) {
     if (lower.includes('before') || lower.includes('start')) return 'before_photo';
     if (lower.includes('after') || lower.includes('final') || lower.includes('done')) return 'after_photo';
+    if (lower.includes('progress') || lower.includes('during') || lower.includes('wip')) return 'process_photo';
     return 'scope_photo';
   }
   return 'other';
@@ -406,6 +407,23 @@ interface StoreState {
    * is public — no signing required.
    */
   resolveLogoUrl: (storagePath: string | undefined | null) => string | null;
+
+  /**
+   * Read a job's marketing metadata (description, publish status, hero
+   * image) from the settings-backed store. Returns null when the job has
+   * no marketing row yet. No DB round-trip — settings are already loaded.
+   */
+  getJobMarketing: (jobId: string) => JobMarketing | null;
+  /**
+   * Save (merge) a job's marketing metadata. Stored as a JSON blob in the
+   * settings row keyed `marketing:{jobId}` — same mechanism as
+   * saveQuoteTemplate, so no migration is needed. Only the fields you pass
+   * are changed; the rest are preserved. Optimistic + rollback on failure.
+   */
+  saveJobMarketing: (
+    jobId: string,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId'>>,
+  ) => Promise<{ ok: boolean; error?: string }>;
 
   // Re-fetch everything from Supabase (useful after a write succeeds).
   refresh: () => Promise<void>;
@@ -2588,6 +2606,96 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { ok: true };
   }, [businessId, settings]);
 
+  // ── Job marketing ──────────────────────────────────────────────────
+  // Per-job marketing metadata (description + publish status + hero image)
+  // lives as a JSON blob in the settings row keyed `marketing:{jobId}`.
+  // Same read/parse + stringify/upsert pattern as the quote template, so
+  // the whole Marketing feature needs no schema migration. Photos are
+  // handled separately via quote_attachments (see addQuoteAttachments).
+  const marketingKey = (jobId: string) => `marketing:${jobId}`;
+
+  const getJobMarketing = useCallback((jobId: string): JobMarketing | null => {
+    const row = settings.find((s) => s.key === marketingKey(jobId));
+    if (!row || !row.value) return null;
+    try {
+      const parsed = JSON.parse(row.value) as Partial<JobMarketing>;
+      return {
+        jobId,
+        title: parsed.title,
+        description: parsed.description,
+        overview: Array.isArray(parsed.overview) ? parsed.overview : undefined,
+        services: Array.isArray(parsed.services) ? parsed.services : undefined,
+        status: parsed.status ?? 'draft',
+        heroAttachmentId: parsed.heroAttachmentId,
+        heroMode: parsed.heroMode,
+        heroBeforeId: parsed.heroBeforeId,
+        heroAfterId: parsed.heroAfterId,
+        updatedAt: parsed.updatedAt ?? row.updatedAt,
+      };
+    } catch (e) {
+      console.error('[store] getJobMarketing: invalid JSON in settings row', e);
+      return null;
+    }
+  }, [settings]);
+
+  const saveJobMarketing = useCallback(async (
+    jobId: string,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId'>>,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!businessId) {
+      return { ok: false, error: 'No business loaded — try refreshing.' };
+    }
+    const key = marketingKey(jobId);
+    const now = new Date().toISOString();
+
+    // Merge onto whatever's already stored so a partial update (e.g. just
+    // flipping status) doesn't wipe the description.
+    const prev = settings.find((s) => s.key === key);
+    let prevData: Partial<JobMarketing> = {};
+    if (prev?.value) {
+      try { prevData = JSON.parse(prev.value) as Partial<JobMarketing>; } catch { /* treat as empty */ }
+    }
+    const merged: JobMarketing = {
+      jobId,
+      title: updates.title !== undefined ? updates.title : prevData.title,
+      description: updates.description !== undefined ? updates.description : prevData.description,
+      overview: updates.overview !== undefined ? updates.overview : prevData.overview,
+      services: updates.services !== undefined ? updates.services : prevData.services,
+      status: updates.status !== undefined ? updates.status : (prevData.status ?? 'draft'),
+      heroAttachmentId: updates.heroAttachmentId !== undefined ? updates.heroAttachmentId : prevData.heroAttachmentId,
+      heroMode: updates.heroMode !== undefined ? updates.heroMode : prevData.heroMode,
+      heroBeforeId: updates.heroBeforeId !== undefined ? updates.heroBeforeId : prevData.heroBeforeId,
+      heroAfterId: updates.heroAfterId !== undefined ? updates.heroAfterId : prevData.heroAfterId,
+      updatedAt: now,
+    };
+    const valueJson = JSON.stringify(merged);
+
+    // Optimistic local update first; rollback on failure (mirrors saveQuoteTemplate).
+    setSettings((list) => {
+      const others = list.filter((s) => s.key !== key);
+      return [...others, { businessId, key, value: valueJson, notes: prev?.notes, updatedAt: now }];
+    });
+
+    const { error: upsertErr } = await supabase
+      .from('settings')
+      .upsert(
+        { business_id: businessId, key, value: valueJson },
+        { onConflict: 'business_id,key' },
+      );
+    if (upsertErr) {
+      console.error('[store] saveJobMarketing failed:', {
+        message: upsertErr.message, code: upsertErr.code,
+        details: upsertErr.details, hint: upsertErr.hint,
+      });
+      setSettings((list) => {
+        const others = list.filter((s) => s.key !== key);
+        return prev ? [...others, prev] : others;
+      });
+      return { ok: false, error: upsertErr.message };
+    }
+    return { ok: true };
+  }, [businessId, settings]);
+
   const uploadBusinessLogo = useCallback(async (file: File): Promise<string | null> => {
     if (!businessId) {
       setError('No business loaded — try refreshing.');
@@ -2664,6 +2772,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         importBankTransactions, updateBankTransaction, reconcileToEntry, reconcileAsNewEntry, reconcileAsSplitEntries,
         markBillsPaid,
         getQuoteTemplate, saveQuoteTemplate, uploadBusinessLogo, resolveLogoUrl,
+        getJobMarketing, saveJobMarketing,
         refresh: load,
       }}
     >

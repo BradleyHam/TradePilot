@@ -288,6 +288,69 @@ Human-readable copy for each reason lives in `describeFailureReason()` in `app/(
 
 ---
 
+## Inbound Tapi lead webhook (Gmail → CloudMailin → Trade Pilot)
+
+The route at `app/api/webhooks/inbound-tapi-lead/route.ts` turns Tapi
+"Provide a quote" emails (property managers asking Lakeside to quote a job)
+into `lead`-status jobs with `source = 'tapi'`. Same transport as the
+inbound-bill pipeline:
+
+```
+PM requests a quote in Tapi
+  → Tapi emails hi@tapihq.com → info@lakesidepainting.co.nz
+  → Gmail filter (from:hi@tapihq.com + subject "Provide a quote") auto-forwards to CloudMailin
+  → CloudMailin POSTs the email JSON to /api/webhooks/inbound-tapi-lead
+  → route validates, parses subject + plaintext, inserts a lead
+  → lead appears in Jobs → Leads next time the app loads
+```
+
+**Parsing.** `lib/tapi-lead-parser.ts` — pure + dependency-free (no LLM;
+Tapi's format is consistent enough to parse with string ops). Pulls job
+type, address (from the subject, incl. suburb), property manager, agency
+(the sign-off), the PM's free-text message, and the Tapi deep link.
+`isTapiQuoteRequest()` is a precise guard: only genuine "Provide a quote"
+emails create leads. "Quote accepted/declined", "New work order", and
+"Confirm work" emails are accepted with `{skipped:true}` and create nothing
+(so a broad Gmail forward rule can't make junk leads).
+
+**Lead fields.** name = "{job type} — {short address}"; client_name = the
+agency (falls back to the PM person, then "Property manager (Tapi)");
+location = full address; notes = PM message + who it's from + the
+"View on Tapi" link.
+
+**Dedup.** Content-based, no schema change: a Tapi lead with the same
+normalised address + job type created in the last 7 days short-circuits with
+`{dedup:true}`. Catches CloudMailin retries / double-forwards while still
+letting a genuine re-quote of the same property weeks later through. (There's
+no `source_message_id` column on `jobs`; if we ever need exact idempotency or
+Tapi quote-accepted/declined status-sync, add one mirroring `entries`.)
+
+**Env vars (Vercel AND `.env.local`):**
+- `TAPI_LEAD_WEBHOOK_SECRET` — shared secret. Sent as an `x-webhook-secret`
+  header OR as basic-auth in the URL (`https://anything:<secret>@host/...`),
+  same dual scheme as inbound-bill (free-tier CloudMailin can't set custom
+  headers, so the basic-auth form is what's wired up).
+- Reuses `TRADEPILOT_BUSINESS_ID`, `NEXT_PUBLIC_SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`.
+
+**`source` is a free-form string here.** Stored as `'tapi'` directly; NOT yet
+added to the `LeadSource` TS union (the feature was deliberately kept to new
+files only so it could ship independently of in-flight leads/home UI work).
+Consequence: Tapi leads currently render with no source pill. To add the
+pill later: add `'tapi'` to `LeadSource` in `lib/types.ts` and a `tapi` entry
+to the two `Record<LeadSource, …>` maps (`components/jobs/job-card.tsx` and
+`app/(app)/leads/page.tsx`).
+
+**Scope (v1).** Only quote requests → leads. Work orders and
+accepted/declined status-sync were considered and deferred — see the chat
+where this was built.
+
+**Smoke test.** `npx tsx scripts/test-inbound-tapi-lead.ts` POSTs
+Tapi-shaped payloads at the dev server (or prod via `INBOUND_TAPI_ENDPOINT`)
+and asserts create → dedup → new-address → skip-non-quote → bad-secret.
+
+---
+
 ## Brad's tax structure (confirmed April 2026)
 
 This is the source of truth for Brad's tax position. Update this section whenever something changes — every other tax-related decision in the app and in conversations should be consistent with what's written here.

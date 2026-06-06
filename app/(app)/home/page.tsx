@@ -26,6 +26,9 @@ import { rankJobs } from '@/lib/job-match';
 import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
 import { BillItemsAttacher } from '@/components/bills/bill-items-attacher';
+import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
+import { Button } from '@/components/ui/button';
 
 /**
  * Outcome of a quote being committed via the imports flow. Captured
@@ -47,8 +50,9 @@ type MaterialInit = Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId'
 import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
+  Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck,
 } from 'lucide-react';
-import { cn } from '@/lib/utils';
+import { cn, gmailComposeUrl } from '@/lib/utils';
 
 // ── ISO date helpers (local time — UTC drift bites week boundaries) ─────────
 function parseISODate(s: string): Date {
@@ -81,18 +85,48 @@ function fmtMoney(n: number): string {
   return `$${r.toLocaleString('en-NZ')}`;
 }
 
+/**
+ * Whether a lead has any site-visit / wrap-up data captured yet. A lead
+ * WITH this data is ready to quote (→ "Quotes to prep"); a lead WITHOUT
+ * it is a raw enquiry that still needs a first contact (→ "Leads to
+ * contact"). Shared by both Home sections so a lead never shows in both.
+ * Mirrors the same predicate on the Leads page.
+ */
+function hasWrapUpData(j: Job): boolean {
+  return Boolean(
+    j.scopeNotes
+    || j.surfaceAreaM2
+    || j.prepLevel
+    || j.quoteReadyBy
+    || (j.accessNotes && j.accessNotes.length > 0),
+  );
+}
+
+/**
+ * Whole days between a created-at timestamp and today. Used for the
+ * "waiting N days" chip on uncontacted leads. Clamped at 0 so a lead
+ * logged later today never reads as negative.
+ */
+function daysWaiting(createdAtISO: string, todayISO: string): number {
+  const created = new Date(createdAtISO);
+  const createdDayISO = formatISODate(created);
+  const ms = parseISODate(todayISO).getTime() - parseISODate(createdDayISO).getTime();
+  return Math.max(0, Math.floor(ms / 86400000));
+}
+
 // ── Constants ───────────────────────────────────────────────────────────────
 const HOURS_TARGET_PER_WEEK = 30; // flat target per Brad's call
 const OVERDUE_INVOICE_DAYS = 14;  // unpaid > 14 days = overdue (no dueDate column)
 const BILLS_DUE_LOOKAHEAD_DAYS = 7;
 const COMING_UP_LOOKAHEAD_DAYS = 7;
 const COMING_UP_MAX_ROWS = 6;
+const LEADS_TO_CONTACT_MAX_ROWS = 6;
 
 // ── Page ────────────────────────────────────────────────────────────────────
 export default function HomePage() {
   const {
     entries, scheduleItems, invoices, jobs, jobImports, businessId,
-    updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry,
+    updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry, updateJob,
     confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
     commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
   } = useStore();
@@ -102,6 +136,16 @@ export default function HomePage() {
   // no linked job — in which case the wrap-up creates one. Computed
   // WrapUpTarget below decides which mode the sheet opens in.
   const [wrapUpScheduleItemId, setWrapUpScheduleItemId] = useState<string | null>(null);
+
+  // "Leads to contact" → Mark contacted flow. Tapping Mark contacted no
+  // longer stamps-and-clears immediately; it first asks "site visit
+  // arranged?" via a small prompt sheet. Answering Yes opens the shared
+  // BookVisitSheet (schedule item + calendar invite); No just stamps
+  // lastContactedDate and clears the row (the old behaviour).
+  //   visitPromptJob — lead awaiting the Yes/No answer.
+  //   bookVisitJob   — lead whose booking form is open (after "Yes").
+  const [visitPromptJob, setVisitPromptJob] = useState<Job | null>(null);
+  const [bookVisitJob, setBookVisitJob] = useState<Job | null>(null);
   const wrapUpItem = wrapUpScheduleItemId
     ? scheduleItems.find((s) => s.id === wrapUpScheduleItemId) ?? null
     : null;
@@ -255,16 +299,7 @@ export default function HomePage() {
   // urgent promise to the customer shows up first.
   const toQuoteJobs = useMemo(() => {
     return jobs
-      .filter((j) => {
-        if (j.status !== 'lead') return false;
-        return Boolean(
-          j.scopeNotes
-          || j.surfaceAreaM2
-          || j.prepLevel
-          || j.quoteReadyBy
-          || (j.accessNotes && j.accessNotes.length > 0),
-        );
-      })
+      .filter((j) => j.status === 'lead' && hasWrapUpData(j))
       .sort((a, b) => {
         const aDue = a.quoteReadyBy ?? '';
         const bDue = b.quoteReadyBy ?? '';
@@ -273,6 +308,25 @@ export default function HomePage() {
         if (bDue) return 1;
         return 0;
       });
+  }, [jobs]);
+
+  // Raw enquiries that still need a first contact: status=lead, no
+  // site-visit data yet (those go to "Quotes to prep"), and never
+  // marked contacted. Once Brad taps "Mark contacted" on a row,
+  // lastContactedDate is stamped and the row drops out of this list —
+  // so the section doubles as a "leads I still owe a reply" inbox that
+  // empties as he works through it.
+  //
+  // Sorted oldest-waiting first: the enquiry sitting longest without a
+  // reply is the most at risk of going cold, so it belongs at the top.
+  const leadsToContact = useMemo(() => {
+    return jobs
+      .filter((j) =>
+        j.status === 'lead'
+        && !hasWrapUpData(j)
+        && !j.lastContactedDate,
+      )
+      .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
   }, [jobs]);
 
   // ── Render ──────────────────────────────────────────────────────────────
@@ -324,6 +378,21 @@ export default function HomePage() {
             });
           }}
         />
+
+        {/* Leads to contact — raw enquiries Brad hasn't replied to yet.
+            One-tap "Mark contacted" stamps lastContactedDate and the
+            row disappears, so the list empties as he works through it.
+            Hides when empty per the "no empty visualisations" rule. */}
+        {leadsToContact.length > 0 && (
+          <LeadsToContactSection
+            items={leadsToContact}
+            todayISO={todayISO}
+            onMarkContacted={(jobId) =>
+              updateJob(jobId, { lastContactedDate: new Date().toISOString() })
+            }
+            onArrangeVisit={(job) => setVisitPromptJob(job)}
+          />
+        )}
 
         {/* Quotes-to-prep — surfaces jobs where the site visit's
             done but the quote hasn't been sent yet. Hides when
@@ -391,7 +460,91 @@ export default function HomePage() {
         }}
         onCancel={() => setWrapUpScheduleItemId(null)}
       />
+
+      {/* "Site visit arranged?" prompt — the branch after Mark contacted.
+          Yes opens the booking form; No just stamps lastContactedDate
+          (the old one-tap behaviour) and clears the row. */}
+      <SiteVisitPromptSheet
+        job={visitPromptJob}
+        onYes={(job) => {
+          setVisitPromptJob(null);
+          setBookVisitJob(job);
+        }}
+        onNo={(job) => {
+          updateJob(job.id, { lastContactedDate: new Date().toISOString() });
+          setVisitPromptJob(null);
+        }}
+        onCancel={() => setVisitPromptJob(null)}
+      />
+
+      {/* Shared booking sheet — adds a quote_visit schedule item, bumps
+          lastContactedDate, and downloads the .ics calendar invite. Same
+          component the Leads page uses. */}
+      <BookVisitSheet
+        job={bookVisitJob}
+        open={bookVisitJob !== null}
+        onSaved={() => setBookVisitJob(null)}
+        onCancel={() => setBookVisitJob(null)}
+      />
     </div>
+  );
+}
+
+// ── Section: Site-visit prompt ───────────────────────────────────────────────
+//
+// The branch Brad asked for: after tapping "Mark contacted" on a lead,
+// ask whether a site visit was arranged before clearing the row. Yes →
+// book it (schedule + calendar). No → just mark contacted. A compact
+// bottom sheet with two big tap targets — the 5:30pm-on-a-phone rule.
+function SiteVisitPromptSheet({
+  job, onYes, onNo, onCancel,
+}: {
+  job: Job | null;
+  onYes: (job: Job) => void;
+  onNo: (job: Job) => void;
+  onCancel: () => void;
+}) {
+  return (
+    <Sheet open={job !== null} onOpenChange={(o) => { if (!o) onCancel(); }}>
+      <SheetContent side="bottom" className="rounded-t-2xl">
+        <SheetHeader>
+          <SheetTitle>Site visit arranged?</SheetTitle>
+        </SheetHeader>
+        {job && (
+          <div className="mt-4 space-y-4 pb-4">
+            <div className="rounded-xl bg-muted/40 border border-border px-3 py-2.5">
+              <p className="text-sm font-medium text-foreground">{job.name}</p>
+              {job.clientName && (
+                <p className="text-xs text-muted-foreground">{job.clientName}</p>
+              )}
+            </div>
+
+            <p className="text-sm text-muted-foreground leading-snug">
+              Did you book a site visit with this lead? You can add it to your
+              schedule and download a calendar reminder.
+            </p>
+
+            <div className="space-y-2">
+              <Button
+                className="w-full h-12 bg-primary text-base"
+                onClick={() => onYes(job)}
+              >
+                <CalendarPlus size={18} className="mr-2" strokeWidth={2} />
+                Yes — book the visit
+              </Button>
+              <Button
+                variant="outline"
+                className="w-full h-12 text-base"
+                onClick={() => onNo(job)}
+              >
+                <CalendarCheck size={18} className="mr-2" strokeWidth={2} />
+                No — just mark contacted
+              </Button>
+            </div>
+          </div>
+        )}
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -473,6 +626,17 @@ function TodayRow({
   const Icon = meta.icon;
   const overdue = item.date < todayISO;
 
+  // Has the scheduled time of a site visit already gone by? A visit on a
+  // past date is always "passed"; a visit today is passed once the clock
+  // is at/after its start time (or immediately, if no time was set). Drives
+  // whether we show the prominent "Wrap up" button — you can only write up
+  // a visit that's actually happened. Compared as zero-padded "HH:MM".
+  const nowHHMM = new Date().toTimeString().slice(0, 5);
+  const visitTimePassed =
+    overdue
+    || (item.date === todayISO
+      && (!item.startTime || item.startTime.slice(0, 5) <= nowHHMM));
+
   // When the user ticks a row that has a linked job, we keep the row mounted
   // and reveal an inline hours form. We deliberately DO NOT call onMarkDone
   // yet — the schedule item stays `completed=false` in the store until the
@@ -494,9 +658,18 @@ function TodayRow({
   // The wrap-up fork only triggers when the parent provided
   // onOpenWrapUp — falling back to the hours form preserves the old
   // behaviour for any future caller that hasn't wired it up yet.
+  // Any quote_visit can be wrapped up — the wrap-up sheet creates a job
+  // from the visit when none is linked yet, so we no longer require a
+  // jobId here (it used to, which meant un-linked visits silently fell
+  // back to a bare "mark done" with no way to capture details).
   const isWrapUpVisit =
-    item.type === 'quote_visit' && item.jobId != null && onOpenWrapUp != null;
+    item.type === 'quote_visit' && onOpenWrapUp != null;
   const tickOpensHoursForm = !isWrapUpVisit && item.jobId != null;
+
+  // Once a visit's time has passed, surface an explicit "Wrap up" button
+  // in place of the bare tick — the tick read as "mark done" and hid the
+  // fact that this is where you add the visit details from Home.
+  const showWrapUpButton = isWrapUpVisit && visitTimePassed;
 
   function handleTickClick() {
     if (isWrapUpVisit) {
@@ -551,25 +724,41 @@ function TodayRow({
             </p>
           </div>
         </div>
-        <button
-          type="button"
-          onClick={handleTickClick}
-          disabled={formOpen}
-          aria-label={`Mark "${item.title}" done`}
-          aria-pressed={formOpen}
-          className={cn(
-            'flex items-center justify-center w-14 border-l border-border transition-colors',
-            formOpen
-              ? 'bg-green-50 cursor-default'
-              : 'hover:bg-accent active:bg-accent/70',
-          )}
-        >
-          <Check
-            size={18}
-            className={formOpen ? 'text-green-600' : 'text-muted-foreground'}
-            strokeWidth={2}
-          />
-        </button>
+        {showWrapUpButton ? (
+          // Site visit whose time has passed → explicit "Wrap up" CTA so
+          // adding the details is reachable straight from Home (no need to
+          // detour through the Schedule tab). Opens the same wrap-up sheet
+          // the tick used to open, just with an obvious label.
+          <button
+            type="button"
+            onClick={() => onOpenWrapUp!(item)}
+            aria-label={`Wrap up "${item.title}" — add visit details`}
+            className="flex items-center justify-center gap-1.5 px-4 border-l border-border text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 active:bg-primary/20 transition-colors"
+          >
+            <FilePlus size={15} strokeWidth={2} />
+            Wrap up
+          </button>
+        ) : (
+          <button
+            type="button"
+            onClick={handleTickClick}
+            disabled={formOpen}
+            aria-label={`Mark "${item.title}" done`}
+            aria-pressed={formOpen}
+            className={cn(
+              'flex items-center justify-center w-14 border-l border-border transition-colors',
+              formOpen
+                ? 'bg-green-50 cursor-default'
+                : 'hover:bg-accent active:bg-accent/70',
+            )}
+          >
+            <Check
+              size={18}
+              className={formOpen ? 'text-green-600' : 'text-muted-foreground'}
+              strokeWidth={2}
+            />
+          </button>
+        )}
       </div>
       {formOpen && (
         <TickedHoursForm
@@ -1506,9 +1695,12 @@ function DraftBillRow({
           </p>
           <p className="text-xs text-muted-foreground truncate">
             {draft.paymentRef && <span>#{draft.paymentRef}</span>}
+            {draft.entryDate && (
+              <span>{draft.paymentRef ? ' · ' : ''}Received {fmtDueDate(draft.entryDate)}</span>
+            )}
             {draft.dueDate && (
               <>
-                <span>{draft.paymentRef ? ' · ' : ''}Due {fmtDueDate(draft.dueDate)}</span>
+                <span>{(draft.paymentRef || draft.entryDate) ? ' · ' : ''}Due {fmtDueDate(draft.dueDate)}</span>
                 {/* Provenance: computed = NZ "20th of next month" rule,
                     not from the PDF. Worth flagging so Brad spots wrong
                     inferences (e.g. a supplier on net-7 terms). pdf is
@@ -1560,12 +1752,14 @@ function DraftBillRow({
           document to read them in, which unlocks the per-line split. */}
       {lineItems.length === 0 && <BillItemsAttacher draft={draft} />}
 
-      {/* Per-line allocation — only shown when the parser found line items.
+      {/* Per-line allocation — only shown when the parser found 2+ line
+          items, since a single line can't split and its picker would just
+          duplicate the bill-level "Allocate to job" dropdown above. With one
+          line the default still applies at submit: cost-bearing → '' (follows
+          the bill picker), cost-less → 'skip' (don't pollute materials).
           Each line gets its own select so a single bill can split across
-          jobs (e.g. 3 cans for McLeod + 1 for Aubrey + a levy to skip).
-          Default for cost-bearing lines is '' (follow the bill picker);
-          default for cost-less lines is 'skip' (don't pollute materials). */}
-      {lineItems.length > 0 && (
+          jobs (e.g. 3 cans for McLeod + 1 for Aubrey + a levy to skip). */}
+      {lineItems.length > 1 && (
         <div className="space-y-1.5">
           <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide">
             Line items · {lineItems.filter((_, i) => allocations[i] !== 'skip').length} of {lineItems.length} tracked
@@ -2080,6 +2274,149 @@ function describeFailureReason(reason: string | undefined): string {
  * picking which to start with. Cheaper than opening one and bailing.
  */
 const QUOTES_TO_PREP_MAX_ROWS = 4;
+
+// ── Section: Leads to contact ───────────────────────────────────────────────
+//
+// Uncontacted raw enquiries. Each row carries its own one-tap actions —
+// Mark contacted (the primary), plus Call / Email shortcuts when we have
+// the client's details. Tapping Mark contacted bumps lastContactedDate,
+// which removes the row from the parent's `leadsToContact` filter, so it
+// animates out and the user gets immediate, visible feedback (the fix for
+// "I tapped Mark contacted and nothing happened").
+
+function LeadsToContactSection({
+  items, todayISO, onMarkContacted, onArrangeVisit,
+}: {
+  items: Job[];
+  todayISO: string;
+  onMarkContacted: (jobId: string) => void;
+  /** Primary action: opens the "site visit arranged?" prompt for this lead. */
+  onArrangeVisit: (job: Job) => void;
+}) {
+  const shown = items.slice(0, LEADS_TO_CONTACT_MAX_ROWS);
+  const overflow = items.length - shown.length;
+
+  return (
+    <section>
+      <div className="flex items-baseline justify-between mb-2">
+        <SectionLabel className="mb-0">Leads to contact</SectionLabel>
+        <Link href="/leads" className="text-xs font-medium text-primary hover:underline">
+          See all
+        </Link>
+      </div>
+      <ul className="space-y-2">
+        {shown.map((job) => (
+          <LeadToContactRow
+            key={job.id}
+            job={job}
+            todayISO={todayISO}
+            onMarkContacted={() => onMarkContacted(job.id)}
+            onArrangeVisit={() => onArrangeVisit(job)}
+          />
+        ))}
+      </ul>
+      {overflow > 0 && (
+        <Link
+          href="/leads"
+          className="mt-2 flex items-center justify-center gap-1 h-10 rounded-xl border border-dashed border-border text-xs font-medium text-muted-foreground hover:text-foreground hover:border-primary/40 transition-colors"
+        >
+          {overflow} more to contact — open leads
+          <ChevronRight size={12} />
+        </Link>
+      )}
+    </section>
+  );
+}
+
+function LeadToContactRow({
+  job, todayISO, onMarkContacted, onArrangeVisit,
+}: {
+  job: Job;
+  todayISO: string;
+  onMarkContacted: () => void;
+  /** Opens the "site visit arranged?" prompt — the primary action. */
+  onArrangeVisit: () => void;
+}) {
+  const waiting = daysWaiting(job.createdAt, todayISO);
+  // Only show the waiting chip once a lead has aged at least a day — a
+  // brand-new enquiry logged today doesn't need a nag badge.
+  const waitingLabel = waiting >= 1
+    ? `${waiting}d waiting`
+    : null;
+  // Tint the chip red once a lead has sat uncontacted for 2+ days — by
+  // then a reply is genuinely overdue.
+  const waitingUrgent = waiting >= 2;
+
+  return (
+    <li className="bg-card border border-border rounded-2xl overflow-hidden">
+      <Link
+        href="/leads"
+        className="flex items-center gap-3 px-4 pt-3 pb-2 hover:bg-accent/40 transition-colors"
+      >
+        <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 bg-blue-50">
+          <UserPlus size={14} className="text-blue-600" strokeWidth={1.8} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground truncate">{job.name}</p>
+          <p className="text-xs text-muted-foreground mt-0.5 truncate">
+            {job.clientName}
+          </p>
+        </div>
+        {waitingLabel && (
+          <span
+            className={cn(
+              'shrink-0 inline-flex items-center px-1.5 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide',
+              waitingUrgent ? 'bg-red-50 text-red-700' : 'bg-muted text-muted-foreground',
+            )}
+          >
+            {waitingLabel}
+          </span>
+        )}
+        <ChevronRight size={14} className="text-muted-foreground shrink-0" />
+      </Link>
+
+      {/* Action row — Mark contacted is the primary, sized to the
+          44px tap-target rule. Call / Email appear only when we have
+          the detail. stopPropagation so tapping an action never also
+          triggers the row's navigate-to-leads link. */}
+      <div className="border-t border-border/60 px-2 py-1.5 flex items-center gap-1">
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onArrangeVisit(); }}
+          className="flex-1 min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 active:scale-[0.98] transition-all"
+          title="Mark contacted — asks if you arranged a site visit"
+        >
+          <MessageCircle size={14} strokeWidth={2} /> Mark contacted
+        </button>
+        {job.clientPhone && (
+          <a
+            href={`tel:${job.clientPhone}`}
+            onClick={(e) => e.stopPropagation()}
+            className="flex-1 min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-medium text-foreground hover:bg-accent transition-colors"
+            title={`Call ${job.clientName}`}
+          >
+            <Phone size={13} strokeWidth={1.8} /> Call
+          </a>
+        )}
+        {job.clientEmail && (
+          <a
+            href={gmailComposeUrl(job.clientEmail)}
+            target="_blank"
+            rel="noopener noreferrer"
+            // Emailing IS contact — stamp it so the lead clears from this
+            // list, same as the Mark contacted button. Opens Gmail compose
+            // in a new tab; the row unmounts behind it.
+            onClick={(e) => { e.stopPropagation(); onMarkContacted(); }}
+            className="flex-1 min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-medium text-foreground hover:bg-accent transition-colors"
+            title={`Email ${job.clientName} in Gmail`}
+          >
+            <Mail size={13} strokeWidth={1.8} /> Email
+          </a>
+        )}
+      </div>
+    </li>
+  );
+}
 
 function QuotesToPrepSection({ items }: { items: Job[] }) {
   const shown = items.slice(0, QUOTES_TO_PREP_MAX_ROWS);

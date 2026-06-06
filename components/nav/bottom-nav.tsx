@@ -2,14 +2,17 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Sparkles } from 'lucide-react';
+import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Sparkles, Megaphone } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
-// Six items on the phone bottom nav is the upper limit before icons
-// start to crowd. Leads slots between Entry and Jobs to match the
-// desktop sidebar order and the user's mental flow (log → chase → work).
-// Schedule is the least-tapped — keep an eye on whether it should
-// move to a "more" menu if we ever add a seventh tab.
+// Leads slots between Entry and Jobs to match the desktop sidebar order
+// and the user's mental flow (log → chase → work → showcase).
+//
+// NOTE: this is now SEVEN items — one past the old "six is the crowding
+// limit" guidance. On a 380px phone each tab still gets ~54px (above the
+// 44px tap-target floor), so it holds, but it's tight. If an eighth tab
+// ever lands, move the least-tapped ones (Schedule / Marketing) behind a
+// "More" menu rather than shrinking further.
 const NAV_ITEMS = [
   { href: '/home', label: 'Home', icon: Home },
   { href: '/entry', label: 'Entry', icon: PenLine },
@@ -17,6 +20,7 @@ const NAV_ITEMS = [
   { href: '/jobs', label: 'Jobs', icon: Briefcase },
   { href: '/money', label: 'Money', icon: DollarSign },
   { href: '/schedule', label: 'Schedule', icon: CalendarDays },
+  { href: '/marketing', label: 'Marketing', icon: Megaphone },
 ];
 
 export function BottomNav() {

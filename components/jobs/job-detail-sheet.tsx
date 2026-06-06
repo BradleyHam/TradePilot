@@ -1,6 +1,6 @@
 'use client';
 
-import { useState, useRef } from 'react';
+import { useState, useRef, useEffect } from 'react';
 import { Job, Entry, Material, Quote, QuoteAttachment, QuoteAttachmentKind, ActivityType, Unit } from '@/lib/types';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
@@ -29,6 +29,7 @@ import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
 import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
 import { CostEnginePreview } from './cost-engine-preview';
+import { PhotoLightbox, PhotoThumb, isImageName, type LightboxImage } from './photo-lightbox';
 
 interface JobDetailSheetProps {
   job: Job | null;
@@ -1847,6 +1848,13 @@ function JobAttachmentsList({
   // pointer crosses a child boundary.
   const [isDragOver, setIsDragOver] = useState(false);
   const dragCounter = useRef(0);
+  // Signed URLs for the image attachments, keyed by storage path. Minted in
+  // one batched request (see effect below) and reused for both the thumbnail
+  // grid and the lightbox, so opening a photo is instant.
+  const [signedUrls, setSignedUrls] = useState<Record<string, string>>({});
+  // Which image the lightbox is showing (index into `imageAttachments`), or
+  // null when the lightbox is closed.
+  const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
 
   // Set of quote ids on this job — used to filter attachments + know
   // whether we already have a quote to attach to.
@@ -1856,7 +1864,7 @@ function JobAttachmentsList({
   // Group existing attachments by kind. Order: plans → before → after →
   // scope → quote_pdf → other.
   const order: QuoteAttachment['kind'][] = [
-    'plan', 'before_photo', 'after_photo', 'scope_photo', 'quote_pdf', 'other',
+    'plan', 'before_photo', 'after_photo', 'process_photo', 'scope_photo', 'quote_pdf', 'other',
   ];
   const grouped: Record<string, QuoteAttachment[]> = {};
   for (const a of jobAttachments) {
@@ -1865,6 +1873,48 @@ function JobAttachmentsList({
 
   const scopePhotoCount = (grouped.scope_photo?.length ?? 0) + staged.filter((s) => s.kind === 'scope_photo').length;
   const softCapHit = scopePhotoCount > 4;
+
+  // Flat, display-ordered list of just the *image* attachments. This is the
+  // set the lightbox flicks through; the index into this array is the
+  // lightbox index. PDFs and other docs are excluded (they still open in a
+  // new tab via AttachmentRow). Sort is stable, so within-kind order holds.
+  const imageAttachments = jobAttachments
+    .filter((a) => isImageName(a.fileName ?? a.storagePath))
+    .sort((a, b) => order.indexOf(a.kind) - order.indexOf(b.kind));
+  const imagePathsKey = imageAttachments.map((a) => a.storagePath).join('|');
+  const indexOfImageId = new Map<string, number>();
+  imageAttachments.forEach((a, i) => indexOfImageId.set(a.id, i));
+  const lightboxImages: LightboxImage[] = imageAttachments.map((a) => ({
+    id: a.id,
+    fileName: a.fileName ?? a.storagePath.split('/').pop() ?? 'photo',
+    signedUrl: signedUrls[a.storagePath] ?? null,
+  }));
+
+  // Batch-sign every image path in one request whenever the set of images
+  // changes. 1-hour expiry comfortably outlives a detail-sheet session.
+  useEffect(() => {
+    const paths = imagePathsKey ? imagePathsKey.split('|') : [];
+    // Nothing to sign. Leave any existing entries as-is — they're keyed by
+    // path, so stale ones are harmless and never rendered.
+    if (paths.length === 0) return;
+    let cancelled = false;
+    supabase.storage
+      .from('quote-attachments')
+      .createSignedUrls(paths, 3600)
+      .then(({ data, error }) => {
+        if (cancelled) return;
+        if (error || !data) {
+          console.error('[job-attachments] Failed to sign photo thumbnails:', error);
+          return;
+        }
+        const map: Record<string, string> = {};
+        for (const row of data) {
+          if (row.signedUrl && row.path) map[row.path] = row.signedUrl;
+        }
+        setSignedUrls(map);
+      });
+    return () => { cancelled = true; };
+  }, [imagePathsKey]);
 
   /**
    * Shared staging logic — used by both the file input and the drop
@@ -2022,26 +2072,45 @@ function JobAttachmentsList({
           </div>
         )}
 
-        {/* Existing attachments grouped by kind. */}
+        {/* Existing attachments grouped by kind. Image kinds render as a
+            tappable thumbnail grid (tap → lightbox); PDFs and other docs
+            stay as rows that open in a new tab. */}
         {jobAttachments.length > 0 ? (
           <div className="space-y-3 mb-3">
             {order.map((kind) => {
               const items = grouped[kind];
               if (!items || items.length === 0) return null;
+              const imageItems = items.filter((a) => isImageName(a.fileName ?? a.storagePath));
+              const fileItems = items.filter((a) => !isImageName(a.fileName ?? a.storagePath));
               return (
                 <div key={kind}>
                   <p className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1">
                     {kindLabel(kind)} ({items.length})
                   </p>
-                  <ul className="space-y-1.5">
-                    {items.map((a) => (
-                      <AttachmentRow
-                        key={a.id}
-                        attachment={a}
-                        onDelete={() => deleteQuoteAttachment(a.id)}
-                      />
-                    ))}
-                  </ul>
+                  {imageItems.length > 0 && (
+                    <div className="grid grid-cols-3 gap-1.5 sm:grid-cols-4">
+                      {imageItems.map((a) => (
+                        <PhotoThumb
+                          key={a.id}
+                          url={signedUrls[a.storagePath] ?? null}
+                          fileName={a.fileName ?? a.storagePath.split('/').pop() ?? 'photo'}
+                          onOpen={() => setLightboxIndex(indexOfImageId.get(a.id) ?? 0)}
+                          onDelete={() => deleteQuoteAttachment(a.id)}
+                        />
+                      ))}
+                    </div>
+                  )}
+                  {fileItems.length > 0 && (
+                    <ul className={cn('space-y-1.5', imageItems.length > 0 && 'mt-1.5')}>
+                      {fileItems.map((a) => (
+                        <AttachmentRow
+                          key={a.id}
+                          attachment={a}
+                          onDelete={() => deleteQuoteAttachment(a.id)}
+                        />
+                      ))}
+                    </ul>
+                  )}
                 </div>
               );
             })}
@@ -2079,6 +2148,7 @@ function JobAttachmentsList({
                       <SelectItem value="scope_photo">Scope</SelectItem>
                       <SelectItem value="before_photo">Before</SelectItem>
                       <SelectItem value="after_photo">After</SelectItem>
+                      <SelectItem value="process_photo">Progress</SelectItem>
                       <SelectItem value="plan">Plan</SelectItem>
                       <SelectItem value="quote_pdf">Quote PDF</SelectItem>
                       <SelectItem value="other">Other</SelectItem>
@@ -2097,7 +2167,7 @@ function JobAttachmentsList({
             </ul>
             {softCapHit && (
               <p className="text-[11px] text-amber-600 dark:text-amber-400">
-                You'll have {scopePhotoCount} scope photos for this job — 1–4 is usually plenty.
+                You&apos;ll have {scopePhotoCount} scope photos for this job — 1–4 is usually plenty.
               </p>
             )}
             <Button
@@ -2119,6 +2189,15 @@ function JobAttachmentsList({
           </div>
         )}
       </div>
+
+      {lightboxIndex !== null && lightboxImages.length > 0 && (
+        <PhotoLightbox
+          images={lightboxImages}
+          index={Math.min(lightboxIndex, lightboxImages.length - 1)}
+          onIndexChange={setLightboxIndex}
+          onClose={() => setLightboxIndex(null)}
+        />
+      )}
     </>
   );
 }
@@ -2153,6 +2232,7 @@ function guessKind(name: string): QuoteAttachmentKind {
   }
   if (lower.includes('before') || lower.includes('start')) return 'before_photo';
   if (lower.includes('after') || lower.includes('final') || lower.includes('done')) return 'after_photo';
+  if (lower.includes('progress') || lower.includes('during') || lower.includes('wip')) return 'process_photo';
   return 'scope_photo';
 }
 
@@ -2161,6 +2241,7 @@ function kindLabel(kind: QuoteAttachment['kind']): string {
     case 'plan': return 'Plans';
     case 'before_photo': return 'Before';
     case 'after_photo': return 'After';
+    case 'process_photo': return 'Progress';
     case 'scope_photo': return 'Scope photos';
     case 'quote_pdf': return 'Quote PDF';
     case 'other': return 'Other';
