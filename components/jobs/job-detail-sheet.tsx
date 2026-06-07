@@ -94,6 +94,9 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   } = useStore();
   const [reconciling, setReconciling] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
+  // When set, the InvoiceAction opens in create mode pre-loaded from this PDF
+  // (dropped on the Documents panel and chosen "Record as invoice").
+  const [invoiceInitialFile, setInvoiceInitialFile] = useState<File | null>(null);
   // When set, the InvoiceAction sheet opens in edit mode for this invoice.
   const [editingInvoice, setEditingInvoice] = useState<import('@/lib/types').Invoice | null>(null);
   // When set, the OutcomeSheet opens to capture why we won/lost a job.
@@ -498,13 +501,17 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               const allInvoiced = totalWork > 0 && totalInvoiced >= totalWork - 0.01;
               const allPaid = jobInvoices.length > 0 && jobInvoices.every((i) => i.paid);
 
-              if (allInvoiced && allPaid) return null;
-
+              // Always keep an "issue invoice" affordance available — the
+              // "all invoiced" check relies on the job's recorded total, which
+              // is often just the deposit (or a draft quote with no total), so
+              // hiding it stranded users who still need to bill the balance.
               const label = jobInvoices.length === 0
                 ? 'Issue first invoice'
-                : allInvoiced
+                : (allInvoiced && allPaid)
                   ? 'Issue another invoice'
-                  : `Issue invoice (${jobInvoices.length} so far)`;
+                  : allInvoiced
+                    ? 'Issue another invoice'
+                    : `Issue invoice (${jobInvoices.length} so far)`;
 
               return (
                 <Button
@@ -688,6 +695,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             jobId={liveJob.id}
             quotes={quotes}
             attachments={quoteAttachments}
+            onRecordInvoice={(file) => {
+              setEditingInvoice(null);
+              setInvoiceInitialFile(file);
+              setShowInvoice(true);
+            }}
           />
 
           <JobMaterialsList jobId={liveJob.id} materials={materials} entries={entries} />
@@ -843,9 +855,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         job={liveJob}
         open={showInvoice}
         invoice={editingInvoice ?? undefined}
+        initialFile={invoiceInitialFile ?? undefined}
         onClose={() => {
           setShowInvoice(false);
           setEditingInvoice(null);
+          setInvoiceInitialFile(null);
         }}
       />
 
@@ -1684,6 +1698,36 @@ function QuoteEditForm({
   const [scopeSummary, setScopeSummary] = useState(quote.scopeSummary ?? '');
   const [saving, setSaving] = useState(false);
 
+  // Quote PDF drag-drop — attaches the sent quote document straight to this
+  // quote (kind quote_pdf), so it lives with the quote (and shows in Documents).
+  const { addQuoteAttachments } = useStore();
+  const pdfInputRef = useRef<HTMLInputElement>(null);
+  const [uploadingPdf, setUploadingPdf] = useState(false);
+  const [pdfDone, setPdfDone] = useState(false);
+  const [pdfDragOver, setPdfDragOver] = useState(false);
+  const pdfDragDepth = useRef(0);
+
+  async function attachPdf(file: File) {
+    if (file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)) return;
+    setUploadingPdf(true);
+    try {
+      const res = await addQuoteAttachments(quote.id, [{ file, kind: 'quote_pdf' }]);
+      if (res.inserted > 0) setPdfDone(true);
+      else alert("Couldn't upload the quote PDF — try again.");
+    } finally {
+      setUploadingPdf(false);
+    }
+  }
+  function onPickPdf(e: React.ChangeEvent<HTMLInputElement>) {
+    const f = e.target.files?.[0];
+    if (f) void attachPdf(f);
+    if (pdfInputRef.current) pdfInputRef.current.value = '';
+  }
+  function onPdfDragEnter(e: React.DragEvent) { if (!e.dataTransfer.types.includes('Files')) return; e.preventDefault(); pdfDragDepth.current += 1; setPdfDragOver(true); }
+  function onPdfDragOver(e: React.DragEvent) { if (!e.dataTransfer.types.includes('Files')) return; e.preventDefault(); e.dataTransfer.dropEffect = 'copy'; }
+  function onPdfDragLeave(e: React.DragEvent) { if (!e.dataTransfer.types.includes('Files')) return; pdfDragDepth.current = Math.max(0, pdfDragDepth.current - 1); if (pdfDragDepth.current === 0) setPdfDragOver(false); }
+  function onPdfDrop(e: React.DragEvent) { if (!e.dataTransfer.types.includes('Files')) return; e.preventDefault(); pdfDragDepth.current = 0; setPdfDragOver(false); const f = e.dataTransfer.files?.[0]; if (f) void attachPdf(f); }
+
   const totalNum = parseFloat(totalStr);
   const totalValid = totalStr === '' || (Number.isFinite(totalNum) && totalNum >= 0);
 
@@ -1782,6 +1826,48 @@ function QuoteEditForm({
         />
       </div>
 
+      {/* Quote PDF — drag the sent quote document in to keep it on this quote. */}
+      <div>
+        <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
+          Quote PDF
+        </label>
+        <button
+          type="button"
+          onClick={() => pdfInputRef.current?.click()}
+          onDragEnter={onPdfDragEnter}
+          onDragOver={onPdfDragOver}
+          onDragLeave={onPdfDragLeave}
+          onDrop={onPdfDrop}
+          disabled={uploadingPdf}
+          className={cn(
+            'w-full min-h-[56px] rounded-lg border-2 border-dashed flex flex-col items-center justify-center gap-0.5 px-3 py-2 text-xs transition-colors',
+            pdfDragOver
+              ? 'border-primary bg-primary/10 text-primary'
+              : 'border-input bg-background hover:bg-accent text-muted-foreground',
+          )}
+        >
+          {uploadingPdf ? (
+            <span>Uploading…</span>
+          ) : pdfDone ? (
+            <span className="font-medium text-emerald-600">Quote PDF attached ✓ — add another?</span>
+          ) : (
+            <>
+              <span className="inline-flex items-center gap-1.5 font-medium text-foreground">
+                <FileText size={13} strokeWidth={1.8} /> Drag the quote PDF here
+              </span>
+              <span>or click to choose</span>
+            </>
+          )}
+        </button>
+        <input
+          ref={pdfInputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          className="hidden"
+          onChange={onPickPdf}
+        />
+      </div>
+
       <div className="flex items-center justify-between gap-2 pt-1">
         <button
           type="button"
@@ -1830,11 +1916,14 @@ function QuoteEditForm({
 // generic scope photos last.
 
 function JobAttachmentsList({
-  jobId, quotes, attachments,
+  jobId, quotes, attachments, onRecordInvoice,
 }: {
   jobId: string;
   quotes: Quote[];
   attachments: QuoteAttachment[];
+  /** Hand a dropped/picked invoice PDF to the Issue-invoice flow so it's
+   *  recorded (updates the money) rather than just filed as a document. */
+  onRecordInvoice?: (file: File) => void;
 }) {
   const { addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment } = useStore();
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -2033,7 +2122,7 @@ function JobAttachmentsList({
       >
         <div className="flex items-center justify-between mb-2">
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
-            Plans &amp; photos {jobAttachments.length > 0 ? `(${jobAttachments.length})` : ''}
+            Documents &amp; photos {jobAttachments.length > 0 ? `(${jobAttachments.length})` : ''}
           </p>
           <Button
             type="button"
@@ -2043,8 +2132,8 @@ function JobAttachmentsList({
             onClick={() => fileInputRef.current?.click()}
             disabled={uploading}
           >
-            <Camera size={13} strokeWidth={2} />
-            Add photos
+            <FileText size={13} strokeWidth={2} />
+            Add files
           </Button>
         </div>
 
@@ -2117,7 +2206,7 @@ function JobAttachmentsList({
           </div>
         ) : staged.length === 0 ? (
           <p className="text-xs text-muted-foreground mb-3">
-            No photos yet. Add 1–4 scope photos to help the quoting assistant price similar jobs. Tap <strong>Add photos</strong> or drag files in.
+            Nothing attached yet. Drag &amp; drop your <strong>quote</strong>, <strong>invoice</strong>, plans or photos here — or tap <strong>Add files</strong>. PDFs and images welcome.
           </p>
         ) : null}
 
@@ -2154,6 +2243,16 @@ function JobAttachmentsList({
                       <SelectItem value="other">Other</SelectItem>
                     </SelectContent>
                   </Select>
+                  {onRecordInvoice && /\.pdf$/i.test(s.file.name) && (
+                    <button
+                      type="button"
+                      onClick={() => { onRecordInvoice(s.file); removeStaged(s.id); }}
+                      className="shrink-0 inline-flex items-center gap-1 rounded-lg bg-amber-50 px-2 py-1 text-[11px] font-semibold text-amber-700 hover:bg-amber-100 transition-colors"
+                      title="Record this as an invoice — updates the money and keeps the PDF"
+                    >
+                      <FileText size={12} strokeWidth={2} /> Record invoice
+                    </button>
+                  )}
                   <button
                     type="button"
                     onClick={() => removeStaged(s.id)}
@@ -2227,7 +2326,7 @@ function guessKind(name: string): QuoteAttachmentKind {
   const lower = name.toLowerCase();
   if (lower.endsWith('.pdf')) {
     if (lower.includes('plan') || lower.includes('consent') || lower.includes('drawing')) return 'plan';
-    if (lower.startsWith('q-') || lower.includes('quote')) return 'quote_pdf';
+    if (lower.startsWith('q-') || lower.includes('quote') || lower.includes('quo-')) return 'quote_pdf';
     return 'other';
   }
   if (lower.includes('before') || lower.includes('start')) return 'before_photo';

@@ -45,6 +45,7 @@ import { findMatchingBillIndex } from '@/lib/bill-dedupe';
 import { extractPdfTextServer } from '@/lib/pdf/extract-text-server';
 import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import { followBillDownloadLink, type LinkFollowResult } from '@/lib/bill-link-follower';
+import { parseDuluxSecureLinkEmail } from '@/lib/dulux-email-parser';
 import { rankJobs } from '@/lib/job-match';
 import { rowToJob, entryToRow } from '@/lib/supabase/mappers';
 import type { Entry, Job, ParsedBill } from '@/lib/types';
@@ -56,6 +57,12 @@ export const dynamic = 'force-dynamic';
 // is identical between manual and webhook paths.
 const JOB_MATCH_MIN_SCORE = 10;
 const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10MB sanity cap
+
+// Where a bill's data came from. 'attachment' = PDF on the email;
+// 'link' = PDF fetched via the link-follower; 'email-body' = parsed
+// straight out of the email text (Dulux secure-link emails, whose PDF is
+// gated — see lib/dulux-email-parser.ts).
+type PdfSource = 'attachment' | 'link' | 'email-body';
 
 // CloudMailin v0.4 attachment shape (which is what the inbound-mail JSON
 // format uses). We narrow defensively because email payloads are sent
@@ -260,8 +267,50 @@ export async function POST(req: Request) {
     }
   }
 
-  // No PDF at all → record a "needs attention" placeholder draft and return.
+  // No PDF at all. Before recording a "needs attention" draft, try parsing
+  // the bill straight out of the email body — Dulux's secure-link emails
+  // carry the invoice number, date, amount and PO in the text, and their
+  // PDF is gated so the link-follower can't reach it. We create the bill
+  // from those fields (correct money + job) flagged "line items pending",
+  // and stash the secure link so dropping the PDF later merges line items
+  // in. Anything that isn't a recognisable Dulux invoice returns null and
+  // falls through to the failure draft, exactly as before.
   if (pdfBuffers.length === 0) {
+    const bodyParsed = parseDuluxSecureLinkEmail({
+      from: fromAddress,
+      subject,
+      plain: asString(body.plain),
+      html: asString(body.html),
+    });
+    if (bodyParsed) {
+      const { jobs, existingBills } = await fetchCaches(admin, businessId);
+      const r = await createOrMergeBill(
+        admin,
+        bodyParsed.parsed,
+        { businessId, messageId, index: 0, pdfSource: 'email-body', jobs, existingBills },
+        undefined,
+        { lineItemsPending: true, duluxSecureLink: bodyParsed.secureLink },
+      );
+      if (r.status === 'created' || r.status === 'merged') {
+        console.info('[inbound-bill] created bill from email body (Dulux secure link)', {
+          messageId, invoice: bodyParsed.parsed.invoiceNumber, status: r.status,
+        });
+        return NextResponse.json({
+          ok: true,
+          created: r.status === 'created' ? 1 : 0,
+          merged: r.status === 'merged' ? 1 : 0,
+          failed: 0,
+          entryIds: [r.entryId],
+          source: 'email-body',
+        });
+      }
+      // Body-parse matched but the insert/merge failed → record the failure
+      // so the email still surfaces.
+      return insertFailureDraft(admin, {
+        businessId, messageId, subject, fromAddress,
+        failureReason: r.reason, failureDetail: r.detail, pdfSource: 'email-body',
+      });
+    }
     return insertFailureDraft(admin, {
       businessId,
       messageId,
@@ -273,25 +322,9 @@ export async function POST(req: Request) {
     });
   }
 
-  // Fetch jobs once for fuzzy job-matching across all the PDFs.
-  let jobsCache: Job[] = [];
-  {
-    const { data: jobRows } = await admin.from('jobs').select('*').eq('business_id', businessId);
-    if (jobRows) jobsCache = jobRows.map(rowToJob);
-  }
-
-  // Fetch existing bills once for create-or-merge matching, so re-forwarding
-  // (or overlap with a backfilled amount-only stub) enriches the existing
-  // bill rather than duplicating it.
-  let existingBills: ExistingBillRow[] = [];
-  {
-    const { data: billRows } = await admin
-      .from('entries')
-      .select('id, payment_ref, amount, supplier, company, parser_raw, bill_pdf_url, source_message_id')
-      .eq('business_id', businessId)
-      .eq('type', 'bill');
-    if (billRows) existingBills = billRows as ExistingBillRow[];
-  }
+  // Fetch jobs (fuzzy job-matching) + existing bills (create-or-merge) once
+  // for the whole email.
+  const { jobs: jobsCache, existingBills } = await fetchCaches(admin, businessId);
 
   // ── 6. Process each PDF → create-or-merge a bill ────────────────────────
   const created: string[] = [];
@@ -358,7 +391,7 @@ interface ProcessCtx {
   businessId: string;
   messageId: string;
   index: number;
-  pdfSource: 'attachment' | 'link';
+  pdfSource: PdfSource;
   linkFollowFinalUrl?: string;
   jobs: Job[];
   existingBills: ExistingBillRow[];
@@ -368,12 +401,33 @@ type ProcessResult =
   | { status: 'merged'; entryId: string }
   | { status: 'failed'; reason: string; detail: string };
 
+/** Fetch the per-email caches once: jobs (fuzzy job-matching) and existing
+ *  bills (create-or-merge). Shared by the PDF path and the body fallback. */
+async function fetchCaches(
+  admin: SupabaseClient,
+  businessId: string,
+): Promise<{ jobs: Job[]; existingBills: ExistingBillRow[] }> {
+  let jobs: Job[] = [];
+  const { data: jobRows } = await admin.from('jobs').select('*').eq('business_id', businessId);
+  if (jobRows) jobs = jobRows.map(rowToJob);
+
+  let existingBills: ExistingBillRow[] = [];
+  const { data: billRows } = await admin
+    .from('entries')
+    .select('id, payment_ref, amount, supplier, company, parser_raw, bill_pdf_url, source_message_id')
+    .eq('business_id', businessId)
+    .eq('type', 'bill');
+  if (billRows) existingBills = billRows as ExistingBillRow[];
+
+  return { jobs, existingBills };
+}
+
 async function processOnePdf(
   admin: SupabaseClient,
   pdfBuffer: Buffer,
   ctx: ProcessCtx,
 ): Promise<ProcessResult> {
-  const { businessId, messageId, index, pdfSource, linkFollowFinalUrl, jobs, existingBills } = ctx;
+  const { businessId } = ctx;
 
   // Parse: extract the text layer first (fast + exact); for image-only /
   // scanned PDFs with no text, vision-read the PDF instead.
@@ -410,7 +464,34 @@ async function processOnePdf(
     /* best-effort */
   }
 
-  // Job-guess from the parser's hint.
+  return createOrMergeBill(admin, parsed, ctx, billPdfUrl);
+}
+
+/**
+ * Create a new draft bill from a ParsedBill, or merge it into one already
+ * in the system (matched by per-invoice source id, then invoice number /
+ * amount+supplier). Shared by the PDF path (processOnePdf) and the email-
+ * body fallback.
+ *
+ *   billPdfUrl  stored PDF object path when we have one (undefined for the
+ *               body fallback — the Dulux PDF is gated).
+ *   extraRaw    extra parser_raw fields, e.g. { lineItemsPending: true,
+ *               duluxSecureLink } for body-parsed bills.
+ *
+ * "Line items pending" is cleared automatically the moment a PDF or line
+ * items land on the bill (e.g. when the user drops the downloaded Dulux
+ * PDF), so the flag always reflects reality.
+ */
+async function createOrMergeBill(
+  admin: SupabaseClient,
+  parsed: ParsedBill,
+  ctx: ProcessCtx,
+  billPdfUrl?: string,
+  extraRaw?: Record<string, unknown>,
+): Promise<ProcessResult> {
+  const { businessId, messageId, index, pdfSource, linkFollowFinalUrl, jobs, existingBills } = ctx;
+
+  // Job-guess from the parser's hint (PO / address).
   let guessedJobId: string | undefined;
   if (parsed.jobHint && jobs.length > 0) {
     const top = rankJobs(jobs, parsed.jobHint)[0];
@@ -443,6 +524,17 @@ async function processOnePdf(
       ? existing.parser_raw as Record<string, unknown> : {};
     const mergedRaw: Record<string, unknown> = { ...existingRaw };
     if (parsed.lineItems && parsed.lineItems.length > 0) mergedRaw.lineItems = parsed.lineItems;
+    if (extraRaw) {
+      for (const [k, v] of Object.entries(extraRaw)) {
+        if (v !== undefined) mergedRaw[k] = v;
+      }
+    }
+    // The flag must reflect reality: once a PDF or line items exist on the
+    // bill, line items are no longer pending — clear it regardless of source.
+    const hasPdfNow = Boolean(existing.bill_pdf_url || billPdfUrl);
+    const hasLineItemsNow = Array.isArray(mergedRaw.lineItems) && (mergedRaw.lineItems as unknown[]).length > 0;
+    if (hasPdfNow || hasLineItemsNow) mergedRaw.lineItemsPending = false;
+
     const patch: Record<string, unknown> = { parser_raw: mergedRaw };
     if (!existing.bill_pdf_url && billPdfUrl) patch.bill_pdf_url = billPdfUrl;
     const { error } = await admin.from('entries').update(patch).eq('id', existing.id);
@@ -466,7 +558,7 @@ async function processOnePdf(
     isDraft: true,
     billPdfUrl,
     parserConfidence: parsed.confidence,
-    parserRaw: { ...parsed, dueDateSource, pdfSource, linkFollowFinalUrl },
+    parserRaw: { ...parsed, dueDateSource, pdfSource, linkFollowFinalUrl, ...(extraRaw ?? {}) },
     sourceMessageId: sourceId,
     company: parsed.supplier,
     supplier: parsed.supplier,
@@ -525,9 +617,9 @@ interface FailureContext {
   fromAddress?: string;
   failureReason: string;
   failureDetail: string;
-  /** 'attachment' if we got the bytes from the email, 'link' if from a
-   *  download URL; omitted when no PDF was located at all. */
-  pdfSource?: 'attachment' | 'link';
+  /** Where we tried to source the bill from; omitted when no PDF/body was
+   *  usable at all. */
+  pdfSource?: PdfSource;
 }
 
 async function insertFailureDraft(

@@ -1434,17 +1434,23 @@ function DraftBillRow({
       jobHint?: string;
       dueDateSource?: 'pdf' | 'computed' | 'manual';
       lineItems?: unknown;
+      // Set when the bill was parsed from the email body (Dulux secure-link
+      // emails). The figures are right, but line items only live in the
+      // gated PDF — duluxSecureLink is where Brad fetches it.
+      lineItemsPending?: boolean;
+      duluxSecureLink?: string;
       failure?: {
         reason?: string;
         detail?: string;
         subject?: string;
         fromAddress?: string;
-        pdfSource?: 'attachment' | 'link';
+        pdfSource?: 'attachment' | 'link' | 'email-body';
       };
     } | null;
   const failure = parserRaw?.failure;
   const hint = parserRaw?.jobHint;
   const dueDateSource = parserRaw?.dueDateSource;
+  const duluxSecureLink = parserRaw?.duluxSecureLink;
   const ranked = useMemo(() => rankJobs(jobs, hint), [jobs, hint]);
 
   // ── Line items ──────────────────────────────────────────────────────────
@@ -1747,6 +1753,22 @@ function DraftBillRow({
           ))}
         </select>
       </div>
+
+      {/* Dulux secure-link bills: the figures came from the email, but the
+          line-item PDF is gated behind Dulux's account-number check. Point
+          Brad straight at the secure link so he can fetch the PDF, then the
+          drop-zone below reads its items in. */}
+      {lineItems.length === 0 && duluxSecureLink && (
+        <a
+          href={duluxSecureLink}
+          target="_blank"
+          rel="noopener noreferrer"
+          className="flex items-center gap-2 px-3 h-9 rounded-lg bg-blue-50 dark:bg-blue-950/30 border border-blue-200 dark:border-blue-900 text-blue-700 dark:text-blue-300 text-xs font-medium hover:bg-blue-100 dark:hover:bg-blue-950/50 transition-colors"
+        >
+          <ExternalLink size={13} strokeWidth={1.8} className="shrink-0" />
+          Get the PDF from Dulux&apos;s secure link, then drop it below for line items
+        </a>
+      )}
 
       {/* No line items yet (e.g. a backfilled bill) — let Brad drop the
           document to read them in, which unlocks the per-line split. */}

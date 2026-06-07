@@ -23,6 +23,9 @@ interface InvoiceActionProps {
   onClose: () => void;
   /** When provided, the form edits this invoice rather than creating a new one. */
   invoice?: Invoice;
+  /** When provided (create mode), the sheet opens pre-loaded from this PDF —
+   *  used when recording an invoice dropped on the job's documents panel. */
+  initialFile?: File;
 }
 
 /**
@@ -42,8 +45,8 @@ interface InvoiceActionProps {
  *     income entry). Going paid → unpaid would need a separate "unmark paid"
  *     action; not built tonight.
  */
-export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProps) {
-  const { invoices, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId } = useStore();
+export function InvoiceAction({ job, open, onClose, invoice, initialFile }: InvoiceActionProps) {
+  const { invoices, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId, ensureJobHasQuote, addQuoteAttachments } = useStore();
   const isEdit = invoice != null;
 
   // Existing invoices on this job
@@ -130,6 +133,9 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
   // How many fields the most recent extraction actually filled. Drives
   // the "Filled N fields from PDF" banner copy.
   const [filledCount, setFilledCount] = useState(0);
+  // The dropped invoice PDF, kept so we can store it on the job when the
+  // invoice is saved (the parse above only reads it for the numbers).
+  const [attachFile, setAttachFile] = useState<File | null>(null);
 
   const handleExtractFile = useCallback(async (file: File) => {
     setExtractMsg(null);
@@ -152,6 +158,9 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
       setExtractMsg('Not a PDF file.');
       return;
     }
+
+    // Keep the file so saving the invoice also stores the PDF on the job.
+    setAttachFile(file);
 
     // 2. Extract text client-side.
     setExtractStage('reading');
@@ -293,6 +302,18 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
     : null;
 
   // Re-seed when re-opened or job/invoice changes
+  // When opened from the job's documents drop (initialFile passed in create
+  // mode), parse it straight away to auto-fill the form. The ref stops it
+  // re-running on every render while the sheet is open, and resets on close.
+  const handledInitialFileRef = useRef<File | null>(null);
+  useEffect(() => {
+    if (!open) { handledInitialFileRef.current = null; return; }
+    if (isEdit || !initialFile) return;
+    if (handledInitialFileRef.current === initialFile) return;
+    handledInitialFileRef.current = initialFile;
+    void handleExtractFile(initialFile);
+  }, [open, isEdit, initialFile, handleExtractFile]);
+
   useEffect(() => {
     if (!open) return;
     if (invoice) {
@@ -417,6 +438,17 @@ export function InvoiceAction({ job, open, onClose, invoice }: InvoiceActionProp
       status: 'invoiced',
       invoiceAmount: newTotal,
     });
+
+    // Keep the dropped invoice PDF on the job as a document (best-effort —
+    // the invoice record itself is what drives the money; this is the file).
+    if (attachFile) {
+      const pdf = attachFile;
+      setAttachFile(null);
+      (async () => {
+        const quoteId = await ensureJobHasQuote(job.id);
+        if (quoteId) await addQuoteAttachments(quoteId, [{ file: pdf, kind: 'other' }]);
+      })();
+    }
 
     if (markPaid) {
       setTimeout(() => markInvoicePaid(tempId, paidDate), 0);

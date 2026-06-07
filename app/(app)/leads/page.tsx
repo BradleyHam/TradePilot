@@ -31,7 +31,7 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useStore } from '@/lib/store';
-import { Job, LeadSource } from '@/lib/types';
+import { Job, LeadSource, ScheduleItem } from '@/lib/types';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { JobDetailSheet } from '@/components/jobs/job-detail-sheet';
@@ -41,7 +41,7 @@ import { Button } from '@/components/ui/button';
 import {
   Phone, Mail, MapPin, MessageCircle, Sparkles, Snowflake, Flame, Clock,
   ChevronRight, Globe, Search, UserPlus, Inbox, CalendarPlus, CalendarDays,
-  FileText, Send,
+  CalendarCheck, FileText, Send,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 
@@ -90,7 +90,7 @@ const SOURCE_PILL: Record<LeadSource, { label: string; Icon: typeof Globe } | nu
 };
 
 export default function LeadsPage() {
-  const { jobs, updateJob } = useStore();
+  const { jobs, updateJob, scheduleItems } = useStore();
   const [openJob, setOpenJob] = useState<Job | null>(null);
   // When set, the BookVisitSheet opens for this lead.
   const [visitForJob, setVisitForJob] = useState<Job | null>(null);
@@ -144,6 +144,27 @@ export default function LeadsPage() {
     };
   }
 
+  // Local YYYY-MM-DD for "is this visit still upcoming?" comparisons.
+  const todayISO = useMemo(() => {
+    const d = today;
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }, [today]);
+
+  // jobId → the soonest upcoming quote_visit (not completed, not skipped,
+  // today or later). Drives the "Visit booked" section + card badge so a
+  // lead with a scheduled visit no longer looks identical to a fresh one.
+  const nextVisitByJob = useMemo(() => {
+    const map = new Map<string, ScheduleItem>();
+    for (const s of scheduleItems) {
+      if (s.type !== 'quote_visit' || !s.jobId) continue;
+      if (s.completed || s.skipReasonKind) continue;
+      if (s.date < todayISO) continue;
+      const existing = map.get(s.jobId);
+      if (!existing || s.date < existing.date) map.set(s.jobId, s);
+    }
+    return map;
+  }, [scheduleItems, todayISO]);
+
   const toQuote = useMemo<RankedLead[]>(() => {
     return jobs
       .filter((j) => j.status === 'lead' && hasWrapUpData(j))
@@ -169,19 +190,34 @@ export default function LeadsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, today]);
 
+  // "Visit booked": a fresh lead (no wrap-up data yet) that has an upcoming
+  // quote_visit. Carved out of New enquiries so it doesn't look un-actioned.
+  // Sorted soonest-visit-first — the next thing on the calendar is top.
+  const visitBooked = useMemo<RankedLead[]>(() => {
+    return jobs
+      .filter((j) => j.status === 'lead' && !hasWrapUpData(j) && nextVisitByJob.has(j.id))
+      .map((j) => rankBy(j, 'lastContactedDate'))
+      .sort((a, b) => {
+        const av = nextVisitByJob.get(a.job.id)!;
+        const bv = nextVisitByJob.get(b.job.id)!;
+        return `${av.date}${av.startTime ?? ''}`.localeCompare(`${bv.date}${bv.startTime ?? ''}`);
+      });
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, today, nextVisitByJob]);
+
   const newEnquiries = useMemo<RankedLead[]>(() => {
     return jobs
-      .filter((j) => j.status === 'lead' && !hasWrapUpData(j))
+      .filter((j) => j.status === 'lead' && !hasWrapUpData(j) && !nextVisitByJob.has(j.id))
       .map((j) => rankBy(j, 'lastContactedDate'))
       .sort((a, b) => b.daysSinceContact - a.daysSinceContact);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [jobs, today]);
+  }, [jobs, today, nextVisitByJob]);
 
   // Top-strip stats summarise across all three buckets. Pipeline value
   // is still useful as a single rolled-up number; coldOrDead now counts
   // anything (in any bucket) that's been waiting too long.
   const stats = useMemo(() => {
-    const all = [...toQuote, ...awaitingReply, ...newEnquiries];
+    const all = [...toQuote, ...visitBooked, ...awaitingReply, ...newEnquiries];
     const openCount = all.length;
     const pipelineValue = all.reduce((sum, r) => {
       // Use quoteAmount when we have it (more reliable); otherwise the
@@ -190,7 +226,7 @@ export default function LeadsPage() {
     }, 0);
     const coldOrDead = all.filter((r) => r.temperature === 'cold' || r.temperature === 'dead').length;
     return { openCount, pipelineValue, coldOrDead };
-  }, [toQuote, awaitingReply, newEnquiries]);
+  }, [toQuote, visitBooked, awaitingReply, newEnquiries]);
 
   function markContacted(jobId: string) {
     // Stamp "now" as the last contact moment. The chase-list re-ranks
@@ -269,6 +305,26 @@ export default function LeadsPage() {
               onMarkContacted={() => markContacted(r.job.id)}
               onBookVisit={() => setVisitForJob(r.job)}
               onMarkQuoted={() => setMarkQuotedForJob(r.job)}
+              onOpen={() => setOpenJob(r.job)}
+            />
+          )}
+        />
+
+        <FunnelSection
+          icon={CalendarCheck}
+          iconClass="text-emerald-600 bg-emerald-50"
+          title="Visit booked"
+          subtitle="Site visit scheduled — turn up, then quote"
+          items={visitBooked}
+          emptyHint={null}
+          renderItem={(r) => (
+            <LeadCard
+              key={r.job.id}
+              ranked={r}
+              variant="visit-booked"
+              bookedVisit={nextVisitByJob.get(r.job.id)}
+              onMarkContacted={() => markContacted(r.job.id)}
+              onBookVisit={() => setVisitForJob(r.job)}
               onOpen={() => setOpenJob(r.job)}
             />
           )}
@@ -362,19 +418,22 @@ interface LeadCardProps {
    * hasn't been updated yet. The other action buttons stay available
    * across all variants — only the primary changes.
    */
-  variant?: 'to-quote' | 'awaiting-reply' | 'new-enquiry';
+  variant?: 'to-quote' | 'awaiting-reply' | 'new-enquiry' | 'visit-booked';
   onMarkContacted: () => void;
   onBookVisit: () => void;
   /** Open the inline 'Mark as quoted' sheet. Only meaningful for
    *  to-quote variant — others ignore it. Optional so existing
    *  awaiting-reply / new-enquiry callers don't have to pass it. */
   onMarkQuoted?: () => void;
+  /** The upcoming quote_visit for this lead — only passed for the
+   *  'visit-booked' variant. Drives the date badge + 'Reschedule' label. */
+  bookedVisit?: ScheduleItem;
   onOpen: () => void;
 }
 
 function LeadCard({
   ranked, variant = 'awaiting-reply',
-  onMarkContacted, onBookVisit, onMarkQuoted, onOpen,
+  onMarkContacted, onBookVisit, onMarkQuoted, onOpen, bookedVisit,
 }: LeadCardProps) {
   const { job, daysSinceContact, temperature } = ranked;
   const value = job.quoteAmount ?? job.estimatedValue;
@@ -420,8 +479,14 @@ function LeadCard({
         {/* Pills row — source + value if we have either. Plus a
             quoteReadyBy chip on to-quote rows so Brad sees the
             promised delivery date inline. */}
-        {(sourceCfg || value || quoteReadyBy) && (
+        {(sourceCfg || value || quoteReadyBy || bookedVisit) && (
           <div className="flex items-center gap-1.5 flex-wrap mt-2.5">
+            {bookedVisit && (
+              <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[11px] text-emerald-700 font-medium">
+                <CalendarCheck size={11} strokeWidth={2} />
+                Visit {formatDueDate(bookedVisit.date)}{bookedVisit.startTime ? `, ${bookedVisit.startTime}` : ''}
+              </span>
+            )}
             {quoteReadyBy && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-amber-50 text-[11px] text-amber-700 font-medium">
                 <CalendarDays size={11} strokeWidth={2} />
@@ -493,9 +558,9 @@ function LeadCard({
                   onBookVisit();
                 }}
                 className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 transition-colors"
-                title="Book a site visit and download a calendar invite"
+                title={variant === 'visit-booked' ? 'Reschedule the site visit' : 'Book a site visit and download a calendar invite'}
               >
-                <CalendarPlus size={13} strokeWidth={2} /> Book visit
+                <CalendarPlus size={13} strokeWidth={2} /> {variant === 'visit-booked' ? 'Reschedule' : 'Book visit'}
               </button>
               {job.clientPhone && (
                 <a
