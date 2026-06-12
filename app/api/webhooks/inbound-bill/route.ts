@@ -46,6 +46,7 @@ import { extractPdfTextServer } from '@/lib/pdf/extract-text-server';
 import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import { followBillDownloadLink, type LinkFollowResult } from '@/lib/bill-link-follower';
 import { parseDuluxSecureLinkEmail } from '@/lib/dulux-email-parser';
+import { extractDuluxShortLink, fetchDuluxSecurePdf } from '@/lib/dulux-secure-fetch';
 import { rankJobs } from '@/lib/job-match';
 import { rowToJob, entryToRow } from '@/lib/supabase/mappers';
 import type { Entry, Job, ParsedBill } from '@/lib/types';
@@ -62,7 +63,7 @@ const MAX_PDF_BYTES = 10 * 1024 * 1024; // 10MB sanity cap
 // 'link' = PDF fetched via the link-follower; 'email-body' = parsed
 // straight out of the email text (Dulux secure-link emails, whose PDF is
 // gated — see lib/dulux-email-parser.ts).
-type PdfSource = 'attachment' | 'link' | 'email-body';
+type PdfSource = 'attachment' | 'link' | 'email-body' | 'dulux-secure';
 
 // CloudMailin v0.4 attachment shape (which is what the inbound-mail JSON
 // format uses). We narrow defensively because email payloads are sent
@@ -251,7 +252,7 @@ export async function POST(req: Request) {
     pdfBuffers.push(buf);
   }
 
-  let pdfSource: 'attachment' | 'link' = 'attachment';
+  let pdfSource: 'attachment' | 'link' | 'dulux-secure' = 'attachment';
   let linkFollowResult: LinkFollowResult | undefined;
   if (pdfBuffers.length === 0) {
     linkFollowResult = await followBillDownloadLink({
@@ -264,6 +265,33 @@ export async function POST(req: Request) {
       console.info('[inbound-bill] fetched PDF via download link', {
         messageId, finalUrl: linkFollowResult.finalUrl, bytes: linkFollowResult.pdf.length,
       });
+    }
+  }
+
+  // Dulux secure-link unlock. Dulux's "click here to securely download" emails
+  // gate the PDF behind the customer's account number, so the generic
+  // link-follower above gets HTML, not a PDF. But the gate is a plain
+  // two-request exchange (resolve token cookie → GET documentV5/<token>/<acct>),
+  // so with DULUX_ACCOUNT_NUMBER configured we can fetch the REAL PDF
+  // server-side — line items and all — and run it through the normal parser.
+  // If anything fails (token expired, account changed, Dulux altered the
+  // gate), we fall through to the email-body parser below, exactly as before.
+  if (pdfBuffers.length === 0) {
+    const shortLink = extractDuluxShortLink({ plain: asString(body.plain), html: asString(body.html) });
+    const account = process.env.DULUX_ACCOUNT_NUMBER;
+    if (shortLink && account) {
+      const dx = await fetchDuluxSecurePdf(shortLink, account);
+      if (dx.pdf) {
+        pdfBuffers.push(dx.pdf);
+        pdfSource = 'dulux-secure';
+        console.info('[inbound-bill] fetched PDF via Dulux secure link', {
+          messageId, finalUrl: dx.finalUrl, bytes: dx.pdf.length,
+        });
+      } else {
+        console.warn('[inbound-bill] Dulux secure fetch failed; falling back to body parse', {
+          messageId, reason: dx.reason, detail: dx.detail,
+        });
+      }
     }
   }
 
