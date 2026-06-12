@@ -22,7 +22,7 @@ import { supabase } from '@/lib/supabase/client';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { rankJobs } from '@/lib/job-match';
 import type { Entry } from '@/lib/types';
-import { ExternalLink, Plus, X, Split, Pencil } from 'lucide-react';
+import { ExternalLink, Plus, X, Split, Pencil, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 // BillItemsAttacher's prop is named `draft` for historical reasons but it
 // works on any bill entry — it just merges parsed line items into
@@ -84,7 +84,7 @@ function parseAmount(s: string): number | undefined {
 }
 
 export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps) {
-  const { entries, jobs, reallocateBill, updateEntry } = useStore();
+  const { entries, jobs, reallocateBill, updateEntry, deleteEntry } = useStore();
 
   // Live records from the store — never trust a prop snapshot (stale-prop
   // trap, see AGENTS.md). The sheet re-renders as the store mutates.
@@ -195,6 +195,25 @@ export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps
     // Flip the whole group together — a split bill is never half-paid.
     for (const e of group) updateEntry(e.id, { paid: true, paidDate: payDate });
     setPayOpen(false);
+  }
+
+  function handleDeleteBill() {
+    // Deletes the WHOLE bill (all split siblings) after a confirm. Used to
+    // clear duplicates or a wrongly-recorded bill. Irreversible, so we name
+    // the supplier + amount in the prompt and require an explicit OK.
+    const label = `${bill!.company ?? bill!.supplier ?? 'this bill'}`
+      + (bill!.paymentRef ? ` #${bill!.paymentRef}` : '')
+      + ` (${fmtMoney(exTotal)} ex-GST`
+      + (group.length > 1 ? `, ${group.length} split parts` : '')
+      + ')';
+    if (typeof window !== 'undefined'
+      && !window.confirm(`Delete ${label}? This can't be undone.`)) {
+      return;
+    }
+    // deleteEntry handles the optimistic remove, the Supabase delete, and
+    // the shared-PDF cleanup. Looping over the group removes every sibling.
+    for (const e of group) deleteEntry(e.id);
+    onClose();
   }
 
   async function handleViewPdf() {
@@ -456,6 +475,21 @@ export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps
                 </div>
               )}
             </div>
+
+            {/* Delete — for duplicates or a wrongly-recorded bill. Subtle by
+                design (destructive, rarely used); confirms before deleting. */}
+            {!editing && (
+              <div className="pt-1">
+                <button
+                  type="button"
+                  onClick={handleDeleteBill}
+                  className="inline-flex items-center gap-1.5 text-xs font-medium text-red-600 hover:text-red-700 hover:underline min-h-[44px]"
+                >
+                  <Trash2 size={13} strokeWidth={1.8} />
+                  Delete this bill{group.length > 1 ? ` (all ${group.length} parts)` : ''}
+                </button>
+              </div>
+            )}
           </div>
 
           {/* Footer actions */}
