@@ -693,6 +693,8 @@ export interface QuoteTemplate {
     email?: string;
     /** Physical address — appears under the header. */
     address?: string;
+    /** Website shown in the invoice/quote FROM block, e.g. lakesidepainting.co.nz. */
+    website?: string;
     /**
      * Storage path of the logo in the `business-logos` bucket,
      * e.g. "<businessId>/logo.png". The UI resolves this to a
@@ -725,6 +727,15 @@ export interface QuoteTemplate {
    * newlines to render a list.
    */
   defaultTerms?: string;
+  /**
+   * Bank account shown in the PAYMENT DETAILS box on invoices. Optional —
+   * invoices render a "set this in Settings" prompt until it's filled in.
+   */
+  bankDetails?: {
+    accountName?: string;
+    bankName?: string;
+    accountNumber?: string;
+  };
 }
 
 export type InvoiceKind = 'deposit' | 'progress' | 'final';
@@ -876,6 +887,13 @@ export interface JobFacebook {
 }
 
 /**
+ * Instagram channel state — same shape as JobFacebook (caption, ordered photo
+ * ids, posted status + permalink), nested inside the same JobMarketing blob.
+ * `postId` here is the IG media id returned by /media_publish.
+ */
+export type JobInstagram = JobFacebook;
+
+/**
  * Marketing/portfolio metadata for a completed job — the bits that turn a
  * finished job into a website project + (later) a social post.
  *
@@ -913,6 +931,8 @@ export interface JobMarketing {
   heroAfterId?: string;
   /** Facebook channel: caption + post status/link. See JobFacebook. */
   facebook?: JobFacebook;
+  /** Instagram channel: caption + post status/link. See JobInstagram. */
+  instagram?: JobInstagram;
   /** ISO timestamp of the last save. */
   updatedAt?: string;
 }

@@ -26,7 +26,9 @@ import { rankJobs } from '@/lib/job-match';
 import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
 import { BillItemsAttacher } from '@/components/bills/bill-items-attacher';
+import { BillDetailSheet } from '@/components/bills/bill-detail-sheet';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
+import { InvoiceAction } from '@/components/jobs/invoice-action';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 
@@ -50,7 +52,7 @@ type MaterialInit = Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId'
 import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
-  Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck,
+  Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 
@@ -146,6 +148,9 @@ export default function HomePage() {
   //   bookVisitJob   — lead whose booking form is open (after "Yes").
   const [visitPromptJob, setVisitPromptJob] = useState<Job | null>(null);
   const [bookVisitJob, setBookVisitJob] = useState<Job | null>(null);
+  // When set, the InvoiceAction sheet opens in create mode for this job —
+  // pre-filled as a deposit. Driven by the "Deposits to send" Home flag.
+  const [depositForJob, setDepositForJob] = useState<Job | null>(null);
   const wrapUpItem = wrapUpScheduleItemId
     ? scheduleItems.find((s) => s.id === wrapUpScheduleItemId) ?? null
     : null;
@@ -276,9 +281,25 @@ export default function HomePage() {
       .sort((a, b) => new Date(b.createdAt).getTime() - new Date(a.createdAt).getTime());
   }, [entries]);
 
+  // Accepted jobs that still have no deposit invoice — the quote's been won
+  // but the deposit that secures the booking hasn't gone out. Issuing any
+  // invoice flips a job to 'invoiced', so scoping to 'accepted' makes this
+  // list self-clearing the moment the deposit is sent (or the job moves on).
+  // Oldest-accepted first: the one most likely to have been forgotten floats
+  // to the top.
+  const depositsToSend = useMemo(() => {
+    return jobs
+      .filter((j) =>
+        j.status === 'accepted'
+        && !invoices.some((i) => i.jobId === j.id && i.kind === 'deposit'),
+      )
+      .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
+  }, [jobs, invoices]);
+
   const showMoneyFlags = overdueInvoices.length > 0
     || billsDueSoon.length > 0
     || billDrafts.length > 0
+    || depositsToSend.length > 0
     || jobImports.length > 0;
 
   // ── Coming up (next 7 days, not including today) ───────────────────────
@@ -414,9 +435,11 @@ export default function HomePage() {
             overdueInvoices={overdueInvoices}
             billsDueSoon={billsDueSoon}
             billDrafts={billDrafts}
+            depositsToSend={depositsToSend}
             jobImports={jobImports}
             jobs={jobs}
             todayISO={todayISO}
+            onIssueDeposit={(job) => setDepositForJob(job)}
             onMarkInvoicePaid={(id, paidDate) => markInvoicePaid(id, paidDate)}
             onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
             onConfirmDraft={(id, { jobId, materials }) =>
@@ -486,6 +509,18 @@ export default function HomePage() {
         onSaved={() => setBookVisitJob(null)}
         onCancel={() => setBookVisitJob(null)}
       />
+
+      {/* Deposit invoice sheet — opened from the "Deposits to send" flag.
+          Create mode pre-fills a deposit from the job's quote + template;
+          InvoiceAction calls onClose after a successful save, at which point
+          the job is 'invoiced' and the flag clears itself. */}
+      {depositForJob && (
+        <InvoiceAction
+          job={depositForJob}
+          open
+          onClose={() => setDepositForJob(null)}
+        />
+      )}
     </div>
   );
 }
@@ -973,16 +1008,18 @@ function WeekStatsSection({
 // which collapses any open state automatically (correct behaviour).
 
 function MoneyFlagsCard({
-  overdueInvoices, billsDueSoon, billDrafts, jobImports, jobs, todayISO,
+  overdueInvoices, billsDueSoon, billDrafts, depositsToSend, jobImports, jobs, todayISO,
   onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onConfirmDraftSplit, onDeleteDraft,
-  onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip,
+  onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip, onIssueDeposit,
 }: {
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
   billDrafts: Entry[];
+  depositsToSend: Job[];
   jobImports: JobImport[];
   jobs: Job[];
   todayISO: string;
+  onIssueDeposit: (job: Job) => void;
   onMarkInvoicePaid: (invoiceId: string, paidDate: string) => void;
   onMarkBillPaid: (entryId: string, paidDate: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
@@ -1019,6 +1056,12 @@ function MoneyFlagsCard({
             onSkip={onCommitImportAsSkip}
           />
         )}
+        {depositsToSend.length > 0 && (
+          <DepositToSendFlag
+            jobs={depositsToSend}
+            onIssueDeposit={onIssueDeposit}
+          />
+        )}
         {overdueInvoices.length > 0 && (
           <OverdueInvoicesFlag
             invoices={overdueInvoices}
@@ -1030,12 +1073,85 @@ function MoneyFlagsCard({
         {billsDueSoon.length > 0 && (
           <BillsDueFlag
             bills={billsDueSoon}
+            jobs={jobs}
             todayISO={todayISO}
             onMarkPaid={onMarkBillPaid}
           />
         )}
       </div>
     </section>
+  );
+}
+
+// ── Flag: Deposits to send ─────────────────────────────────────────────────
+// Accepted jobs with no deposit invoice yet. Tapping "Issue deposit" opens the
+// invoice sheet pre-filled as a deposit (amount/number/date derived from the
+// job's quote + the quote template), so the booking-securing invoice is one
+// review-and-save away — matching the rest of the dashboard's keep-it-on-Home
+// action loop.
+function DepositToSendFlag({
+  jobs, onIssueDeposit,
+}: {
+  jobs: Job[];
+  onIssueDeposit: (job: Job) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-3 px-4 py-3 min-h-[56px] hover:bg-accent transition-colors text-left"
+      >
+        <div className="w-8 h-8 rounded-xl bg-violet-50 flex items-center justify-center shrink-0">
+          <FilePlus size={16} className="text-violet-600" strokeWidth={1.8} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground">
+            {jobs.length} deposit{jobs.length === 1 ? '' : 's'} to send
+          </p>
+          <p className="text-xs text-muted-foreground">
+            Accepted — send the deposit to secure the booking
+          </p>
+        </div>
+        <ChevronDown
+          size={16}
+          className={cn(
+            'text-muted-foreground shrink-0 transition-transform',
+            open && 'rotate-180',
+          )}
+        />
+      </button>
+      {open && (
+        <ul className="px-2 pb-2 space-y-2 bg-muted/30">
+          {jobs.map((job) => (
+            <li
+              key={job.id}
+              className="bg-card border border-border rounded-xl flex items-center gap-3 px-3 py-2 min-h-[56px]"
+            >
+              <div className="flex-1 min-w-0">
+                <p className="text-sm font-semibold text-foreground truncate">
+                  {job.name}
+                </p>
+                <p className="text-xs text-muted-foreground truncate">
+                  {job.clientName}
+                  {job.quoteAmount ? ` · quote ${fmtMoney(job.quoteAmount)}` : ''}
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onIssueDeposit(job); }}
+                className="shrink-0 h-11 px-4 rounded-full bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold transition-colors active:scale-95"
+              >
+                Issue deposit
+              </button>
+            </li>
+          ))}
+        </ul>
+      )}
+    </div>
   );
 }
 
@@ -1191,15 +1307,71 @@ function OverdueInvoicesFlag({
 }
 
 // ── Flag: Bills due in next 7 days ─────────────────────────────────────────
+/** One row in the bills-due list. Split bills (sibling entries sharing a
+ *  bill_group_id) collapse into a single row so the list shows invoices,
+ *  not allocation slices — the slice detail lives in the tap-through sheet. */
+interface BillDueRowVM {
+  key: string;
+  /** Every entry in this row's group (1 for a normal bill, N for a split). */
+  entryIds: string[];
+  /** The entry to open the detail sheet on. */
+  primaryId: string;
+  company: string;
+  ref?: string;
+  exGst: number;
+  issuedDate?: string;
+  dueDate?: string;
+  /** Distinct jobIds across the group (undefined = overhead / no job). */
+  jobIds: (string | undefined)[];
+  itemsPending: boolean;
+}
+
 function BillsDueFlag({
-  bills, todayISO, onMarkPaid,
+  bills, jobs, todayISO, onMarkPaid,
 }: {
   bills: Entry[];
+  jobs: Job[];
   todayISO: string;
   onMarkPaid: (id: string, paidDate: string) => void;
 }) {
   const [open, setOpen] = useState(false);
+  const [detailId, setDetailId] = useState<string | null>(null);
   const total = bills.reduce((s, b) => s + billExGst(b), 0);
+
+  // Collapse split siblings into one row per invoice. Group key is the
+  // bill_group_id when present, else the entry's own id.
+  const rows = useMemo<BillDueRowVM[]>(() => {
+    const byKey = new Map<string, Entry[]>();
+    for (const b of bills) {
+      const key = b.billGroupId ?? b.id;
+      const list = byKey.get(key);
+      if (list) list.push(b); else byKey.set(key, [b]);
+    }
+    return [...byKey.entries()].map(([key, group]) => {
+      const primary = group.find((g) => g.sourceMessageId) ?? group[0];
+      const raw = (primary.parserRaw && typeof primary.parserRaw === 'object')
+        ? primary.parserRaw as { lineItems?: unknown; lineItemsPending?: boolean } : null;
+      const hasItems = Array.isArray(raw?.lineItems) && (raw.lineItems as unknown[]).length > 0;
+      return {
+        key,
+        entryIds: group.map((g) => g.id),
+        primaryId: primary.id,
+        company: primary.company ?? primary.supplier ?? primary.description ?? 'Bill',
+        ref: primary.paymentRef,
+        exGst: group.reduce((s, g) => s + billExGst(g), 0),
+        issuedDate: primary.entryDate,
+        dueDate: primary.dueDate,
+        jobIds: [...new Set(group.map((g) => g.jobId))],
+        itemsPending: raw?.lineItemsPending === true && !hasItems,
+      };
+    });
+  }, [bills]);
+
+  // "McLeod Ave" / "Overhead" / "McLeod Ave + Overhead" — keeps the job
+  // story visible without opening the sheet.
+  const jobLabel = (jobIds: (string | undefined)[]): string => jobIds
+    .map((id) => (id ? (jobs.find((j) => j.id === id)?.name ?? 'Job') : 'Overhead'))
+    .join(' + ');
 
   // Build a more honest heading: if every bill shares the same dueDate
   // (very common with on-the-20th suppliers — every April invoice from
@@ -1215,9 +1387,9 @@ function BillsDueFlag({
         if (iso === tomorrowISO) return 'tomorrow';
         return `on ${fmtDueDate(iso)}`;
       };
-      return `${bills.length} bill${bills.length === 1 ? '' : 's'} due ${labelFor(bills[0].dueDate!)}`;
+      return `${rows.length} bill${rows.length === 1 ? '' : 's'} due ${labelFor(bills[0].dueDate!)}`;
     }
-    return `${bills.length} bill${bills.length === 1 ? '' : 's'} due in ${BILLS_DUE_LOOKAHEAD_DAYS} days`;
+    return `${rows.length} bill${rows.length === 1 ? '' : 's'} due in ${BILLS_DUE_LOOKAHEAD_DAYS} days`;
   })();
 
   return (
@@ -1249,35 +1421,61 @@ function BillsDueFlag({
       </button>
       {open && (
         <ul className="px-2 pb-2 space-y-2 bg-muted/30">
-          {bills.map((b) => (
+          {rows.map((r) => (
             <li
-              key={b.id}
-              className="bg-card border border-border rounded-xl flex items-center gap-3 px-3 py-2 min-h-[56px]"
+              key={r.key}
+              role="button"
+              tabIndex={0}
+              onClick={() => setDetailId(r.primaryId)}
+              onKeyDown={(e) => { if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setDetailId(r.primaryId); } }}
+              className="bg-card border border-border rounded-xl flex items-center gap-3 px-3 py-2 min-h-[56px] cursor-pointer hover:border-primary/40 transition-colors"
             >
               <div className="flex-1 min-w-0">
                 <div className="flex items-center gap-2 min-w-0">
                   <p className="text-sm font-semibold text-foreground truncate">
-                    {b.company ?? b.supplier ?? b.description ?? 'Bill'}
+                    {r.company}
                   </p>
                   <span className="text-sm font-semibold text-foreground tabular-nums shrink-0">
-                    {fmtMoney(billExGst(b))}
+                    {fmtMoney(r.exGst)}
                   </span>
                 </div>
-                {b.description && b.company && (
-                  <p className="text-xs text-muted-foreground truncate">{b.description}</p>
-                )}
-                <p className="text-xs text-amber-700 font-medium mt-0.5">
-                  Due {b.dueDate ? fmtDueDate(b.dueDate) : '—'}
+                <p className="text-xs text-muted-foreground truncate">
+                  {r.ref && <span>#{r.ref}</span>}
+                  {r.issuedDate && <span>{r.ref ? ' · ' : ''}Issued {fmtDueDate(r.issuedDate)}</span>}
+                </p>
+                <p className="text-xs truncate mt-0.5">
+                  <span className="text-amber-700 font-medium">
+                    Due {r.dueDate ? fmtDueDate(r.dueDate) : '—'}
+                  </span>
+                  <span className={cn(
+                    'ml-2',
+                    r.jobIds.length === 1 && !r.jobIds[0]
+                      ? 'text-muted-foreground'
+                      : 'text-foreground/80 font-medium',
+                  )}>
+                    {r.jobIds.length > 1 && <Split size={11} className="inline -mt-0.5 mr-0.5 rotate-90" aria-hidden="true" />}
+                    {jobLabel(r.jobIds)}
+                  </span>
+                  {r.itemsPending && (
+                    <span className="ml-2 text-blue-700">Items pending</span>
+                  )}
                 </p>
               </div>
               <MarkPaidControl
                 todayISO={todayISO}
-                onConfirm={(paidDate) => onMarkPaid(b.id, paidDate)}
+                onConfirm={(paidDate) => r.entryIds.forEach((id) => onMarkPaid(id, paidDate))}
               />
             </li>
           ))}
         </ul>
       )}
+      {/* Tap-through detail: everything we know about the bill + change its
+          job allocation (incl. splitting to overhead) after confirmation. */}
+      <BillDetailSheet
+        entryId={detailId}
+        open={detailId !== null}
+        onClose={() => setDetailId(null)}
+      />
     </div>
   );
 }

@@ -56,11 +56,16 @@ function getAdminClient(): SupabaseClient | { error: string } {
 }
 
 function todayISO(): string {
-  const d = new Date();
-  const y = d.getFullYear();
-  const m = String(d.getMonth() + 1).padStart(2, '0');
-  const day = String(d.getDate()).padStart(2, '0');
-  return `${y}-${m}-${day}`;
+  // NZ-local "today", not server-local. Vercel functions run in UTC,
+  // which sits 12-13 hours behind NZ — using the server clock means
+  // every NZ morning the endpoint computes availability for
+  // *yesterday*. en-CA locale formats as YYYY-MM-DD directly.
+  return new Intl.DateTimeFormat('en-CA', {
+    timeZone: 'Pacific/Auckland',
+    year: 'numeric',
+    month: '2-digit',
+    day: '2-digit',
+  }).format(new Date());
 }
 
 function corsHeaders(): Record<string, string> {

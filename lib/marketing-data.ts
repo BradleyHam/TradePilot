@@ -71,6 +71,7 @@ export async function loadJobMarketingContext(jobId: string): Promise<JobMarketi
         heroBeforeId: parsed.heroBeforeId,
         heroAfterId: parsed.heroAfterId,
         facebook: parsed.facebook,
+        instagram: parsed.instagram,
         updatedAt: parsed.updatedAt,
       };
     } catch {
@@ -98,6 +99,7 @@ export async function markJobMarketingPublished(
     heroBeforeId: prev?.heroBeforeId,
     heroAfterId: prev?.heroAfterId,
     facebook: prev?.facebook,
+    instagram: prev?.instagram,
     updatedAt: new Date().toISOString(),
   });
   const { error } = await supabaseAdmin.from('settings').upsert(
@@ -121,6 +123,24 @@ export async function saveJobFacebook(
   prev: JobMarketing | null,
   facebook: JobMarketing['facebook'],
 ): Promise<void> {
+  await saveJobChannel(job, prev, { facebook }, 'facebook-publish');
+}
+
+/** Instagram twin of saveJobFacebook — same blob, same best-effort policy. */
+export async function saveJobInstagram(
+  job: Pick<Job, 'id' | 'businessId'>,
+  prev: JobMarketing | null,
+  instagram: JobMarketing['instagram'],
+): Promise<void> {
+  await saveJobChannel(job, prev, { instagram }, 'instagram-publish');
+}
+
+async function saveJobChannel(
+  job: Pick<Job, 'id' | 'businessId'>,
+  prev: JobMarketing | null,
+  channel: Partial<Pick<JobMarketing, 'facebook' | 'instagram'>>,
+  logTag: string,
+): Promise<void> {
   const value = JSON.stringify({
     jobId: job.id,
     title: prev?.title,
@@ -132,7 +152,8 @@ export async function saveJobFacebook(
     heroMode: prev?.heroMode,
     heroBeforeId: prev?.heroBeforeId,
     heroAfterId: prev?.heroAfterId,
-    facebook,
+    facebook: channel.facebook ?? prev?.facebook,
+    instagram: channel.instagram ?? prev?.instagram,
     updatedAt: new Date().toISOString(),
   });
   const { error } = await supabaseAdmin.from('settings').upsert(
@@ -140,6 +161,6 @@ export async function saveJobFacebook(
     { onConflict: 'business_id,key' },
   );
   if (error) {
-    console.warn('[facebook-publish] could not save facebook state:', error.message);
+    console.warn(`[${logTag}] could not save channel state:`, error.message);
   }
 }

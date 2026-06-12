@@ -368,6 +368,78 @@ export async function generateFacebookPost(input: FacebookPostInput): Promise<Fa
   return { caption };
 }
 
+// ── Instagram post caption ──────────────────────────────────────────────────
+
+export interface InstagramPost {
+  /** The full caption to post, hashtags included — posted verbatim. */
+  caption: string;
+}
+
+const IG_TOOL: Tool = {
+  name: 'emit_instagram_post',
+  description: 'Emit a ready-to-post Instagram caption for a completed painting job.',
+  input_schema: {
+    type: 'object',
+    properties: {
+      caption: {
+        type: 'string',
+        description:
+          'The complete Instagram caption, ready to post as-is. Structure: 1–3 short, ' +
+          'warm sentences about the job (what was done + where), then a light ' +
+          'call-to-action ("DM us or get in touch via the link in our bio"), then ' +
+          '8–15 relevant lowercase hashtags on the final lines. NEVER include a URL — ' +
+          'links are not clickable on Instagram. Plain text, a tasteful emoji or two ' +
+          'is fine. Always include #lakesidepainting, #wanaka and a service hashtag.',
+      },
+    },
+    required: ['caption'],
+  },
+};
+
+const IG_SYSTEM = [
+  'You write Instagram captions for Lakeside Painting / Painters Wanaka, a small',
+  'painting business in Wānaka, Central Otago, New Zealand. The audience is local',
+  'homeowners, builders and property managers scrolling their feed.',
+  'Voice: warm, friendly, first-person plural ("we"), proud of the work but not',
+  'salesy. Even shorter and more visual-first than Facebook — the photos do the',
+  'talking. NZ English.',
+  'Keep it tight: roughly 20–50 words before the hashtags. Hashtags carry the',
+  'reach on Instagram, so include a solid block of relevant ones (8–15).',
+  'NEVER include a URL (not clickable on Instagram) and never invent specifics',
+  '(colours, brands, m², client names) that are not in the inputs.',
+].join('\n');
+
+/**
+ * Instagram twin of generateFacebookPost: same approved facts, reshaped for
+ * IG — shorter copy, no link, heavier hashtags.
+ */
+export async function generateInstagramPost(input: FacebookPostInput): Promise<InstagramPost> {
+  const client = getClient();
+  const facts = [
+    `Job: ${input.jobName}`,
+    input.location ? `Location: ${input.location}` : '',
+    input.services && input.services.length ? `Services: ${input.services.join(', ')}` : '',
+    input.stainProduct ? `Product used: ${input.stainProduct}` : '',
+    input.scopeNotes ? `Scope notes: ${input.scopeNotes}` : '',
+    input.description ? `Website lead paragraph (the approved facts to draw on): ${input.description}` : '',
+    input.overview && input.overview.length ? `Website detail:\n${input.overview.join('\n')}` : '',
+  ].filter(Boolean).join('\n');
+
+  const raw = await callTool(client, {
+    system: IG_SYSTEM,
+    tool: IG_TOOL,
+    maxTokens: 600,
+    content:
+      'Write ONE Instagram caption for this finished painting job, reshaping the ' +
+      'approved website facts below into something short, warm and feed-ready. ' +
+      'Call emit_instagram_post.\n\n=== THIS JOB ===\n' + facts,
+  });
+
+  const caption = typeof raw.caption === 'string' ? raw.caption.trim() : '';
+  if (!caption) throw new Error('AI returned an empty Instagram caption');
+  return { caption };
+}
+
 // ── Image labelling (vision) ────────────────────────────────────────────────
 
 export type VisionImageMediaType = 'image/jpeg' | 'image/png' | 'image/webp' | 'image/gif';

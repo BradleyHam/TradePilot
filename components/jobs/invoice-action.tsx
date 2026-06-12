@@ -3,11 +3,12 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import type { Job, Invoice, InvoiceKind, ParsedInvoice } from '@/lib/types';
 import { useStore } from '@/lib/store';
+import { buildInvoicePdfData } from '@/lib/invoice-pdf-data';
 import { supabase } from '@/lib/supabase/client';
 import { extractPdfText } from '@/lib/pdf/extract-text';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
-import { Receipt, Upload, Undo2 } from 'lucide-react';
+import { Receipt, Upload, Undo2, Download } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const NZ_GST_RATE = 0.15;
@@ -46,8 +47,12 @@ interface InvoiceActionProps {
  *     action; not built tonight.
  */
 export function InvoiceAction({ job, open, onClose, invoice, initialFile }: InvoiceActionProps) {
-  const { invoices, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId, ensureJobHasQuote, addQuoteAttachments } = useStore();
+  const { invoices, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId, ensureJobHasQuote, addQuoteAttachments, getQuoteTemplate, quotes, resolveLogoUrl } = useStore();
   const isEdit = invoice != null;
+
+  // Invoice-PDF generation state (the "Download invoice PDF" button).
+  const [pdfBusy, setPdfBusy] = useState(false);
+  const [pdfError, setPdfError] = useState<string | null>(null);
 
   // Existing invoices on this job
   const jobInvoices = useMemo(
@@ -78,14 +83,19 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
   // to 30% of quote for a deposit, or full quote for a final.
   const suggestedAmount = useMemo(() => {
     if (defaultKind === 'deposit' && quote > 0) {
-      return Math.round(quote * 0.3 * 100) / 100;
+      // Deposit % comes from the quote template (Settings → Quote template),
+      // falling back to the NZ-standard 30% when it's unset. Keeps the
+      // auto-filled deposit in step with whatever Brad set there.
+      const pct = getQuoteTemplate()?.paymentTerms?.depositPercent;
+      const fraction = typeof pct === 'number' && pct > 0 ? pct / 100 : 0.3;
+      return Math.round(quote * fraction * 100) / 100;
     }
     if (defaultKind === 'final') {
       const total = totalWorkValue > 0 ? totalWorkValue : quote;
       return Math.max(0, Math.round((total - totalInvoicedSoFar) * 100) / 100);
     }
     return 0;
-  }, [defaultKind, quote, totalWorkValue, totalInvoicedSoFar]);
+  }, [defaultKind, quote, totalWorkValue, totalInvoicedSoFar, getQuoteTemplate]);
 
   // Form state
   const defaultNumber = useMemo(() => {
@@ -458,6 +468,61 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
     onClose();
   }
 
+  // Build the branded invoice PDF from the current form values + job +
+  // template, render it to a blob, and download it. Works before the
+  // invoice is saved — it reads the live form state, not the DB record.
+  async function handleDownloadPdf() {
+    setPdfError(null);
+    const template = getQuoteTemplate();
+    if (!template) {
+      setPdfError('Set up your quote template first (Settings → Quote template).');
+      return;
+    }
+    if (!invoiceNumber.trim()) {
+      setPdfError('Add an invoice number first.');
+      return;
+    }
+    setPdfBusy(true);
+    try {
+      const logoUrl = resolveLogoUrl(template.header.logoStoragePath);
+      const jobQuote = quotes.find((q) => q.jobId === job.id);
+
+      const depPct = template.paymentTerms?.depositPercent ?? 30;
+      const jobTotalExGst = totalWorkValue > 0 ? totalWorkValue : quote;
+      const jobTotalInclGst = jobTotalExGst * (1 + NZ_GST_RATE);
+      const balanceInclGst = Math.max(0, Math.round((jobTotalInclGst - inclGst) * 100) / 100);
+
+      const pdfData = buildInvoicePdfData({
+        kind,
+        invoiceNumber: invoiceNumber.trim(),
+        invoiceDateISO: invoiceDate,
+        amountExGst, gst, inclGst,
+        job, quote: jobQuote, balanceInclGst, depositPercent: depPct,
+      });
+
+      const { pdf } = await import('@react-pdf/renderer');
+      const { InvoicePdfDocument } = await import('@/components/invoices/invoice-pdf');
+      const doc = (
+        <InvoicePdfDocument template={template} job={job} logoUrl={logoUrl} data={pdfData} />
+      );
+      const blob = await pdf(doc).toBlob();
+
+      const slug = job.name.toLowerCase().replace(/[^a-z0-9]+/g, '-').replace(/^-+|-+$/g, '').slice(0, 40) || 'invoice';
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement('a');
+      a.href = url;
+      a.download = `Invoice-${slug}-${invoiceNumber.trim()}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+    } catch (err) {
+      setPdfError(`Couldn't generate the PDF: ${(err as Error)?.message ?? 'unknown error'}`);
+    } finally {
+      setPdfBusy(false);
+    }
+  }
+
   const allInvoiced = totalInvoicedSoFar >= totalWorkValue && totalWorkValue > 0;
 
   return (
@@ -686,15 +751,31 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
           </div>
 
           {/* Footer */}
-          <div className="shrink-0 px-4 py-3 border-t border-border bg-card flex gap-2">
-            <Button variant="outline" className="flex-1" onClick={onClose} disabled={submitting}>
-              Cancel
+          <div className="shrink-0 px-4 py-3 border-t border-border bg-card flex flex-col gap-2">
+            {pdfError && (
+              <p className="text-[11px] px-3 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200">
+                {pdfError}
+              </p>
+            )}
+            <Button
+              variant="outline"
+              className="w-full"
+              onClick={handleDownloadPdf}
+              disabled={pdfBusy || !invoiceNumber.trim()}
+            >
+              <Download size={15} strokeWidth={1.8} className="mr-1.5" />
+              {pdfBusy ? 'Generating PDF…' : 'Download invoice PDF'}
             </Button>
-            <Button className={cn('flex-1 bg-primary')} onClick={handleSave} disabled={!canSave}>
-              {isEdit
-                ? (markPaid && !invoice.paid ? 'Save & mark paid' : 'Save changes')
-                : (markPaid ? 'Save & mark paid' : 'Save invoice')}
-            </Button>
+            <div className="flex gap-2">
+              <Button variant="outline" className="flex-1" onClick={onClose} disabled={submitting}>
+                Cancel
+              </Button>
+              <Button className={cn('flex-1 bg-primary')} onClick={handleSave} disabled={!canSave}>
+                {isEdit
+                  ? (markPaid && !invoice.paid ? 'Save & mark paid' : 'Save changes')
+                  : (markPaid ? 'Save & mark paid' : 'Save invoice')}
+              </Button>
+            </div>
           </div>
         </div>
       </SheetContent>

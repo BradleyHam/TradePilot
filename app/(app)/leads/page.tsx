@@ -411,7 +411,8 @@ interface LeadCardProps {
    * Which funnel bucket this card lives in. Drives which primary
    * action shows up in the action row:
    *   to-quote       → 'Prep quote' + 'Mark quoted' (side-by-side)
-   *   awaiting-reply → 'Mark contacted' (the chase-list default)
+   *   awaiting-reply → Call / Email (chase the already-sent quote; no
+   *                    'Book visit' since the site visit is already done)
    *   new-enquiry    → 'Book visit' is the primary CTA
    *
    * Defaults to 'awaiting-reply' for backward compat in case a caller
@@ -515,7 +516,8 @@ function LeadCard({
           The primary CTA varies by variant:
             to-quote       → 'Prep quote' (opens the job detail; AI in S3)
             new-enquiry    → 'Book visit' (the original chase-list flow)
-            awaiting-reply → 'Mark contacted' (just a stale-ness reset) */}
+            awaiting-reply → Call / Email (chase the sent quote; no
+                             'Book visit' — the site visit's already done) */}
       <div className="border-t border-border/60 px-2 py-1.5 space-y-1">
         <div className="flex items-center gap-1">
           {variant === 'to-quote' ? (
@@ -551,17 +553,24 @@ function LeadCard({
             </>
           ) : (
             <>
-              <button
-                type="button"
-                onClick={(e) => {
-                  e.stopPropagation();
-                  onBookVisit();
-                }}
-                className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 transition-colors"
-                title={variant === 'visit-booked' ? 'Reschedule the site visit' : 'Book a site visit and download a calendar invite'}
-              >
-                <CalendarPlus size={13} strokeWidth={2} /> {variant === 'visit-booked' ? 'Reschedule' : 'Book visit'}
-              </button>
+              {/* Book visit — only for variants where a site visit is still
+                  ahead (new-enquiry books one, visit-booked reschedules).
+                  Deliberately omitted for awaiting-reply: the quote is sent
+                  AFTER the visit, so offering to book one then is backwards.
+                  Call / Email below become the primary chase actions. */}
+              {variant !== 'awaiting-reply' && (
+                <button
+                  type="button"
+                  onClick={(e) => {
+                    e.stopPropagation();
+                    onBookVisit();
+                  }}
+                  className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 transition-colors"
+                  title={variant === 'visit-booked' ? 'Reschedule the site visit' : 'Book a site visit and download a calendar invite'}
+                >
+                  <CalendarPlus size={13} strokeWidth={2} /> {variant === 'visit-booked' ? 'Reschedule' : 'Book visit'}
+                </button>
+              )}
               {job.clientPhone && (
                 <a
                   href={`tel:${job.clientPhone}`}

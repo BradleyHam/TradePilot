@@ -257,6 +257,31 @@ interface StoreState {
   ) => Promise<void>;
 
   /**
+   * Re-allocate a CONFIRMED bill across jobs after the fact — the
+   * post-confirm sibling of confirmBillDraftAsSplit. Operates on the whole
+   * bill_group (the entry plus any split siblings), replacing the current
+   * allocation with `slices`:
+   *
+   *   - 1 slice  → collapse back to a single entry on that job (siblings
+   *                deleted, bill_group_id cleared, full amount restored).
+   *   - N slices → primary entry becomes slice #1; siblings are recreated
+   *                to match slices 2..N (shared bill_group_id).
+   *
+   * The primary entry (the one carrying source_message_id / materials /
+   * parser_raw) is always KEPT — only derived siblings are deleted and
+   * re-inserted, so idempotency and line-item provenance survive any
+   * number of re-allocations. Slices must sum to the group's ex-GST total
+   * (±$0.02; drift is pinned to the last slice). If the bill is already
+   * paid, paid + paid_date are copied onto every slice so GST timing and
+   * expense totals are unchanged — re-allocation only ever moves cost
+   * BETWEEN jobs, never in or out of the books.
+   */
+  reallocateBill: (
+    billId: string,
+    slices: { jobId: string | null; exGst: number }[],
+  ) => Promise<{ ok: boolean; error?: string }>;
+
+  /**
    * Generic bulk-insert for materials rows. Reusable beyond bill confirms
    * (e.g. future "log a material I bought in person" flow). Returns
    * counts so callers can report partial success.
@@ -422,7 +447,7 @@ interface StoreState {
    */
   saveJobMarketing: (
     jobId: string,
-    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook'>>,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook' | 'instagram'>>,
   ) => Promise<{ ok: boolean; error?: string }>;
 
   // Re-fetch everything from Supabase (useful after a write succeeds).
@@ -1637,6 +1662,200 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [businessId, entries, confirmBillDraftWithMaterials, addMaterials]);
 
+  const reallocateBill = useCallback(async (
+    billId: string,
+    slices: { jobId: string | null; exGst: number }[],
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business loaded yet.' };
+    if (slices.length === 0) return { ok: false, error: 'Nothing to allocate.' };
+    if (billId.startsWith('ent_')) {
+      const msg = 'Still saving the bill — give it a moment and try again.';
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+
+    const target = entries.find((e) => e.id === billId);
+    if (!target || target.type !== 'bill') {
+      const msg = 'Could not find the bill to re-allocate.';
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+    if (target.isDraft) {
+      // Drafts go through the confirm flow — this mutator is post-confirm only.
+      const msg = 'Confirm the bill first, then re-allocate it.';
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+
+    // The whole group: the entry plus any split siblings.
+    const group = target.billGroupId
+      ? entries.filter((e) => e.type === 'bill' && e.billGroupId === target.billGroupId)
+      : [target];
+    // Primary = the row carrying provenance (source_message_id, parser_raw,
+    // materials links). Falls back to oldest row. Always kept, never deleted.
+    const primary = group.find((g) => g.sourceMessageId)
+      ?? [...group].sort((a, b) => a.createdAt.localeCompare(b.createdAt))[0];
+    const siblings = group.filter((g) => g.id !== primary.id);
+    if (siblings.some((s) => s.id.startsWith('ent_'))) {
+      const msg = 'Still saving a previous split — give it a moment and try again.';
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+
+    const NZ_GST_RATE = 0.15;
+    const r2 = (n: number) => Math.round(n * 100) / 100;
+    const gstApplies = primary.gstApplies;
+    const exOf = (e: Entry): number => {
+      if (e.amountExGst != null) return e.amountExGst;
+      if (e.amount == null) return 0;
+      return e.gstApplies ? e.amount / (1 + NZ_GST_RATE) : e.amount;
+    };
+    const exTotal = r2(group.reduce((s, e) => s + exOf(e), 0));
+    const grossTotal = r2(group.reduce((s, e) => s + (e.amount ?? 0), 0));
+
+    // Slices must replace the full bill — same tolerance as the SplitForm.
+    const sliceSum = r2(slices.reduce((s, x) => s + x.exGst, 0));
+    if (Math.abs(sliceSum - exTotal) > 0.02) {
+      const msg = `Split must add up to the bill total (${exTotal.toFixed(2)} ex-GST).`;
+      setError(msg);
+      return { ok: false, error: msg };
+    }
+
+    // Derive gross + GST per slice; pin rounding drift to the last slice so
+    // the group still sums to the invoice total to the cent.
+    const computed = slices.map((s) => {
+      const ex = r2(s.exGst);
+      const gross = gstApplies ? r2(ex * (1 + NZ_GST_RATE)) : ex;
+      return { jobId: s.jobId, ex, gross, gst: r2(gross - ex) };
+    });
+    const drift = r2(grossTotal - computed.reduce((s, x) => s + x.gross, 0));
+    if (drift !== 0) {
+      const last = computed[computed.length - 1];
+      last.gross = r2(last.gross + drift);
+      last.gst = r2(last.gross - last.ex);
+      last.ex = r2(last.gross - last.gst);
+    }
+
+    const isSplit = computed.length >= 2;
+    const groupId: string | null = isSplit
+      ? (primary.billGroupId
+        ?? ((typeof crypto !== 'undefined' && crypto.randomUUID)
+          ? crypto.randomUUID() : `grp_${Date.now()}`))
+      : null;
+    const [first, ...rest] = computed;
+    const nowISO = new Date().toISOString();
+
+    // New sibling rows for slices 2..N. They inherit paid/paid_date from the
+    // primary so a paid bill stays fully paid (GST timing unchanged), and
+    // deliberately do NOT carry source_message_id (unique index) or
+    // parser_raw (provenance lives on the primary).
+    const siblingLocal: Entry[] = rest.map((s, i) => ({
+      id: `ent_${Date.now()}_realloc_${i}`,
+      businessId,
+      jobId: s.jobId ?? undefined,
+      type: 'bill',
+      isDraft: false,
+      paid: primary.paid,
+      paidDate: primary.paidDate,
+      bankTransactionId: primary.bankTransactionId,
+      company: primary.company,
+      supplier: primary.supplier,
+      description: primary.description,
+      amount: s.gross,
+      gstApplies,
+      amountExGst: s.ex,
+      gstComponent: s.gst,
+      entryDate: primary.entryDate,
+      dueDate: primary.dueDate,
+      paymentRef: primary.paymentRef,
+      billPdfUrl: primary.billPdfUrl,
+      parserConfidence: primary.parserConfidence,
+      billGroupId: groupId ?? undefined,
+      createdAt: nowISO,
+    }));
+    const tempIds = siblingLocal.map((s) => s.id);
+    const removedSiblingIds = siblings.map((s) => s.id);
+
+    // Optimistic: primary becomes slice #1, old siblings vanish, new ones
+    // (if any) prepend. Snapshot for rollback.
+    const prevEntries = entries;
+    setEntries((list) => {
+      const withoutOld = list.filter((e) => !removedSiblingIds.includes(e.id));
+      const updated = withoutOld.map((e) => e.id === primary.id
+        ? {
+          ...e,
+          jobId: first.jobId ?? undefined,
+          amount: first.gross,
+          amountExGst: first.ex,
+          gstComponent: first.gst,
+          billGroupId: groupId ?? undefined,
+        }
+        : e);
+      return [...siblingLocal, ...updated];
+    });
+
+    // Persist. Raw column objects so job_id / bill_group_id can be set to
+    // null directly. Old siblings are deleted by id — NOT via deleteEntry,
+    // which would also remove the shared bill PDF from Storage.
+    const updatePrimary = supabase.from('entries').update({
+      job_id: first.jobId,
+      amount: first.gross,
+      amount_ex_gst: first.ex,
+      gst_component: first.gst,
+      bill_group_id: groupId,
+    }).eq('id', primary.id);
+    const deleteOld = removedSiblingIds.length > 0
+      ? supabase.from('entries').delete().in('id', removedSiblingIds)
+      : Promise.resolve({ error: null });
+    const siblingRows = rest.map((s) => ({
+      business_id: businessId,
+      job_id: s.jobId,
+      type: 'bill',
+      is_draft: false,
+      paid: primary.paid,
+      paid_date: primary.paidDate ?? null,
+      bank_transaction_id: primary.bankTransactionId ?? null,
+      company: primary.company ?? null,
+      supplier: primary.supplier ?? null,
+      description: primary.description,
+      amount: s.gross,
+      amount_ex_gst: s.ex,
+      gst_component: s.gst,
+      gst_applies: gstApplies,
+      entry_date: primary.entryDate,
+      due_date: primary.dueDate ?? null,
+      payment_ref: primary.paymentRef ?? null,
+      bill_pdf_url: primary.billPdfUrl ?? null,
+      parser_confidence: primary.parserConfidence ?? null,
+      bill_group_id: groupId,
+      created_at: nowISO,
+    }));
+    const insertNew = siblingRows.length > 0
+      ? supabase.from('entries').insert(siblingRows).select('*')
+      : Promise.resolve({ data: [] as Record<string, unknown>[], error: null });
+
+    const [updRes, delRes, insRes] = await Promise.all([updatePrimary, deleteOld, insertNew]);
+
+    if (updRes.error || delRes.error || insRes.error) {
+      const msg = describeError(updRes.error || delRes.error || insRes.error)
+        || 'Failed to re-allocate the bill';
+      console.error('[store] reallocateBill failed:', msg);
+      setError(msg);
+      setEntries(prevEntries);
+      return { ok: false, error: msg };
+    }
+
+    // Swap temp sibling ids for persisted rows.
+    if (insRes.data && insRes.data.length > 0) {
+      const persisted = (insRes.data as Record<string, unknown>[]).map(rowToEntry);
+      setEntries((list) => {
+        const withoutTemps = list.filter((e) => !tempIds.includes(e.id));
+        return [...persisted, ...withoutTemps];
+      });
+    }
+    return { ok: true };
+  }, [businessId, entries]);
+
   // ── job_imports commit flow ────────────────────────────────────────────
   // Three mutators (link / create / skip) for committing an "Imports to
   // review" row on Home. Shared logic lives in commitImportShared which
@@ -2631,6 +2850,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         heroBeforeId: parsed.heroBeforeId,
         heroAfterId: parsed.heroAfterId,
         facebook: parsed.facebook,
+        instagram: parsed.instagram,
         updatedAt: parsed.updatedAt ?? row.updatedAt,
       };
     } catch (e) {
@@ -2641,7 +2861,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const saveJobMarketing = useCallback(async (
     jobId: string,
-    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook'>>,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook' | 'instagram'>>,
   ): Promise<{ ok: boolean; error?: string }> => {
     if (!businessId) {
       return { ok: false, error: 'No business loaded — try refreshing.' };
@@ -2668,6 +2888,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       heroBeforeId: updates.heroBeforeId !== undefined ? updates.heroBeforeId : prevData.heroBeforeId,
       heroAfterId: updates.heroAfterId !== undefined ? updates.heroAfterId : prevData.heroAfterId,
       facebook: updates.facebook !== undefined ? updates.facebook : prevData.facebook,
+      instagram: updates.instagram !== undefined ? updates.instagram : prevData.instagram,
       updatedAt: now,
     };
     const valueJson = JSON.stringify(merged);
@@ -2766,7 +2987,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         addEntry, updateEntry, deleteEntry,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
-        confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
+        confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,
         addMaterials, addMaterialFromOverhead,
         addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment,
         updateQuote, deleteQuote,

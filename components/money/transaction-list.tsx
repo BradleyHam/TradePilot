@@ -64,6 +64,9 @@ function findDuplicateIds(entries: Entry[]): Set<string> {
     // Sort by date so we compare neighbours.
     const sorted = [...list].sort((a, b) => a.entryDate.localeCompare(b.entryDate));
     for (let i = 1; i < sorted.length; i++) {
+      // Split-bill siblings share supplier/date/ref by design (one invoice,
+      // N job slices linked by bill_group_id) — never flag them as dupes.
+      if (sorted[i - 1].billGroupId && sorted[i - 1].billGroupId === sorted[i].billGroupId) continue;
       const a = parseISO(sorted[i - 1].entryDate);
       const b = parseISO(sorted[i].entryDate);
       if (Math.abs(differenceInCalendarDays(a, b)) <= 7) {

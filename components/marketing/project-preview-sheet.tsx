@@ -13,7 +13,7 @@ import { useEffect, useRef, useState } from 'react';
 import { supabase } from '@/lib/supabase/client';
 import { useStore } from '@/lib/store';
 import { Sheet, SheetContent } from '@/components/ui/sheet';
-import { FacebookPanel } from './facebook-panel';
+import { SocialPanel } from './social-panel';
 import type { Job, QuoteAttachment } from '@/lib/types';
 import {
   Sparkles, Plus, Minus, Undo2, Loader2, Check, Globe, Pencil,
@@ -83,6 +83,9 @@ export function ProjectPreviewSheet({
 }) {
   const { getJobMarketing, saveJobMarketing, refresh } = useStore();
   const saved = getJobMarketing(job.id);
+
+  // Three screens: the website page preview, and a post composer per platform.
+  const [tab, setTab] = useState<'website' | 'facebook' | 'instagram'>('website');
 
   const defaultServices = job.workType ? (SERVICE_BY_WORKTYPE[job.workType] ?? ['Exterior Painting']) : ['Exterior Painting'];
   const sliderAvailable = beforeImages.length > 0 && afterImages.length > 0;
@@ -234,33 +237,78 @@ export function ProjectPreviewSheet({
         style={{ height: '94vh' }}
       >
         {/* Header (non-shrinking) */}
-        <div className="shrink-0 flex items-center justify-between gap-3 border-b border-border px-4 py-3">
-          <div className="min-w-0">
-            <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Project page preview</p>
-            <p className="text-sm font-medium truncate">{job.name}</p>
+        <div className="shrink-0 border-b border-border px-4 py-3">
+          <div className="flex items-center justify-between gap-3">
+            <div className="min-w-0">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">Marketing</p>
+              <p className="text-sm font-medium truncate">{job.name}</p>
+            </div>
+            <div className="flex items-center gap-2">
+              {tab === 'website' && (
+                <button
+                  type="button"
+                  onClick={() => runDraft('full')}
+                  disabled={drafting}
+                  className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 min-h-[36px] text-xs font-medium transition hover:bg-muted disabled:opacity-50"
+                >
+                  {drafting ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
+                  {hasCopy ? 'Regenerate copy' : 'Draft copy'}
+                </button>
+              )}
+              <button
+                type="button"
+                onClick={onClose}
+                className="inline-flex items-center rounded-lg border border-border bg-background px-3 min-h-[36px] text-sm font-medium transition hover:bg-muted"
+              >
+                Close
+              </button>
+            </div>
           </div>
-          <div className="flex items-center gap-2">
+          {/* Screen switcher — website page vs Facebook vs Instagram post */}
+          <div className="mt-2.5 grid grid-cols-3 rounded-lg border border-border bg-muted p-0.5 text-sm font-medium">
             <button
               type="button"
-              onClick={() => runDraft('full')}
-              disabled={drafting}
-              className="inline-flex items-center gap-1.5 rounded-lg border border-border bg-background px-2.5 min-h-[36px] text-xs font-medium transition hover:bg-muted disabled:opacity-50"
+              onClick={() => setTab('website')}
+              className={cn(
+                'inline-flex items-center justify-center gap-1.5 rounded-md min-h-[40px] transition',
+                tab === 'website' ? 'bg-background shadow-sm' : 'text-muted-foreground',
+              )}
             >
-              {drafting ? <Loader2 size={14} className="animate-spin" /> : <RefreshCw size={14} />}
-              {hasCopy ? 'Regenerate copy' : 'Draft copy'}
+              <Globe size={15} /> Website
             </button>
             <button
               type="button"
-              onClick={onClose}
-              className="inline-flex items-center rounded-lg border border-border bg-background px-3 min-h-[36px] text-sm font-medium transition hover:bg-muted"
+              onClick={() => setTab('facebook')}
+              className={cn(
+                'inline-flex items-center justify-center gap-1.5 rounded-md min-h-[40px] transition',
+                tab === 'facebook' ? 'bg-background shadow-sm' : 'text-muted-foreground',
+              )}
             >
-              Close
+              <span className="inline-flex h-[15px] w-[15px] items-center justify-center rounded bg-[#1877F2] text-[10px] font-bold leading-none text-white" aria-hidden>f</span>
+              Facebook
+            </button>
+            <button
+              type="button"
+              onClick={() => setTab('instagram')}
+              className={cn(
+                'inline-flex items-center justify-center gap-1.5 rounded-md min-h-[40px] transition',
+                tab === 'instagram' ? 'bg-background shadow-sm' : 'text-muted-foreground',
+              )}
+            >
+              <span
+                className="inline-flex h-[15px] w-[15px] items-center justify-center rounded text-[9px] font-bold leading-none text-white"
+                style={{ background: 'linear-gradient(45deg, #F58529, #DD2A7B 55%, #8134AF)' }}
+                aria-hidden
+              >
+                ◎
+              </span>
+              Instagram
             </button>
           </div>
         </div>
 
-        {/* Body (scrollable) — white "website" canvas */}
-        <div className="flex-1 overflow-y-auto bg-white">
+        {/* Body (scrollable) — white canvas for both screens */}
+        <div className={cn('flex-1 overflow-y-auto bg-white', tab !== 'website' && 'hidden')}>
           <div className="mx-auto max-w-3xl px-5 py-8 text-gray-900">
             {drafting && !hasCopy ? (
               <div className="flex items-center gap-2 py-20 justify-center text-gray-500">
@@ -430,23 +478,45 @@ export function ProjectPreviewSheet({
                   </div>
                 )}
 
-                {/* Facebook channel — same job + photos, reshaped for the feed. */}
-                <FacebookPanel
-                  job={job}
-                  afterImages={afterImages}
-                  beforeImages={beforeImages}
-                  signedUrls={signedUrls}
-                  websiteDescription={description}
-                  websiteOverview={overview}
-                  websiteServices={services}
-                />
               </>
             )}
           </div>
         </div>
 
-        {/* Footer (non-shrinking) */}
-        <div className="shrink-0 border-t border-border px-4 py-3 space-y-2">
+        {/* Social screens — kept mounted so captions/photo picks survive tab switches. */}
+        <div className={cn('flex-1 overflow-y-auto bg-white', tab !== 'facebook' && 'hidden')}>
+          <div className="mx-auto max-w-3xl px-5 py-6 text-gray-900">
+            <SocialPanel
+              platform="facebook"
+              job={job}
+              afterImages={afterImages}
+              beforeImages={beforeImages}
+              processImages={processImages}
+              signedUrls={signedUrls}
+              websiteDescription={description}
+              websiteOverview={overview}
+              websiteServices={services}
+            />
+          </div>
+        </div>
+        <div className={cn('flex-1 overflow-y-auto bg-white', tab !== 'instagram' && 'hidden')}>
+          <div className="mx-auto max-w-3xl px-5 py-6 text-gray-900">
+            <SocialPanel
+              platform="instagram"
+              job={job}
+              afterImages={afterImages}
+              beforeImages={beforeImages}
+              processImages={processImages}
+              signedUrls={signedUrls}
+              websiteDescription={description}
+              websiteOverview={overview}
+              websiteServices={services}
+            />
+          </div>
+        </div>
+
+        {/* Footer (non-shrinking) — website actions only */}
+        <div className={cn('shrink-0 border-t border-border px-4 py-3 space-y-2', tab !== 'website' && 'hidden')}>
           {publishMsg && (
             <p className="flex items-start gap-1.5 text-[12px] text-primary leading-snug">
               <Check size={14} className="mt-px shrink-0" /> {publishMsg}

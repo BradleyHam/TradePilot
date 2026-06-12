@@ -57,7 +57,7 @@ const DEEP_LINK_TYPES: ReadonlySet<EntryType> = new Set([
 ]);
 
 export default function EntryPage() {
-  const { addEntry, businessId } = useStore();
+  const { addEntry, addJob, businessId } = useStore();
   const searchParams = useSearchParams();
 
   // Honour `?type=expense|income|hours` deep-link from the Home screen's
@@ -74,12 +74,40 @@ export default function EntryPage() {
   const [formType, setFormType] = useState<EntryType>(deepLinkType ?? 'expense');
   const [saved, setSaved] = useState(false);
 
-  function handleFormSave(data: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) {
+  async function handleFormSave(data: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) {
+    const nowIso = new Date().toISOString();
+
+    // A new enquiry IS a lead — create the job alongside the entry so it
+    // shows up on the Leads tab immediately (mirrors the Tapi webhook, which
+    // also creates lead-status jobs). The entry is linked to the job so the
+    // two stay associated. If the job insert fails we still save the entry —
+    // never lose the logged enquiry over the bookkeeping half.
+    let enquiryJobId: string | undefined;
+    if (data.type === 'enquiry' && !data.jobId) {
+      const desc = data.description.trim();
+      const lead = await addJob({
+        id: crypto.randomUUID(),
+        businessId: businessId ?? '',
+        // Best name signal we have — the enquiry text, capped so job lists
+        // stay readable. Brad can rename when he writes up the job.
+        name: desc.length > 70 ? `${desc.slice(0, 67)}…` : desc,
+        clientName: '',
+        status: 'lead',
+        source: data.leadSource,
+        estimatedValue: data.amount,
+        notes: `From enquiry logged ${data.entryDate}: ${desc}`,
+        createdAt: nowIso,
+        updatedAt: nowIso,
+      });
+      enquiryJobId = lead?.id;
+    }
+
     const entry: Entry = {
       id: `ent_${Date.now()}`,
       businessId: businessId ?? '',
-      createdAt: new Date().toISOString(),
+      createdAt: nowIso,
       ...data,
+      jobId: data.jobId ?? enquiryJobId,
     };
     addEntry(entry);
     showSaved();

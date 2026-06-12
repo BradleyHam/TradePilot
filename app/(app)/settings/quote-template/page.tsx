@@ -350,6 +350,36 @@ export default function QuoteTemplateSettingsPage() {
               onChange={(v) => setHeader('address', v)}
               placeholder="e.g. 12 Aubrey Road, Wanaka 9305"
             />
+            <Field
+              label="Website"
+              value={template.header.website ?? ''}
+              onChange={(v) => setTemplate((t) => ({ ...t, header: { ...t.header, website: v } }))}
+              placeholder="e.g. lakesidepainting.co.nz"
+            />
+          </div>
+        </Section>
+
+        {/* Payment details — bank account shown on invoices */}
+        <Section title="Payment details" hint="Shown in the PAYMENT DETAILS box on every invoice.">
+          <div className="space-y-3">
+            <Field
+              label="Account name"
+              value={template.bankDetails?.accountName ?? ''}
+              onChange={(v) => setTemplate((t) => ({ ...t, bankDetails: { ...t.bankDetails, accountName: v } }))}
+              placeholder="e.g. Lakeside Painting Ltd"
+            />
+            <Field
+              label="Bank"
+              value={template.bankDetails?.bankName ?? ''}
+              onChange={(v) => setTemplate((t) => ({ ...t, bankDetails: { ...t.bankDetails, bankName: v } }))}
+              placeholder="e.g. ANZ"
+            />
+            <Field
+              label="Account number"
+              value={template.bankDetails?.accountNumber ?? ''}
+              onChange={(v) => setTemplate((t) => ({ ...t, bankDetails: { ...t.bankDetails, accountNumber: v } }))}
+              placeholder="e.g. 01-0123-0456789-00"
+            />
           </div>
         </Section>
 

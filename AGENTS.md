@@ -286,6 +286,10 @@ Human-readable copy for each reason lives in `describeFailureReason()` in `app/(
 
 **Gotcha — bills count as expenses only when `paid = true`.** A draft confirmed via Home creates `isDraft = false`, but the bill still doesn't hit money math until it's marked paid (matches Brad's payments-basis GST registration). If a confirmed bill is missing from Money, check `paid`.
 
+**Dulux secure-link bills (June 2026).** Dulux gates its invoice PDFs behind an account-number check, so the link-follower gets HTML, not a PDF. Fix: `lib/dulux-email-parser.ts` parses the bill straight from the email body (invoice number, issue date, amount, PO → job hint) and creates it flagged `parser_raw.lineItemsPending = true` with `duluxSecureLink` stashed. Line items merge in later when the downloaded PDF is dropped on the bill (matched by invoice number — `BillItemsAttacher`, the /entry upload card, or a re-forwarded email all do this; the merge clears `lineItemsPending`).
+
+**Bill detail sheet (June 2026).** Every row in Home's "bills due" flag is tappable → `components/bills/bill-detail-sheet.tsx`: issue date, due date, invoice #, the PO/job reference printed on the bill, GST split, line items (or the "items pending — get the PDF from Dulux" state with the drop-zone), and the job allocation — which is EDITABLE after confirmation via `store.reallocateBill(billId, slices)`. That mutator replaces the whole `bill_group` atomically (primary entry kept for provenance, siblings deleted/re-inserted, slices must sum to the invoice total ±$0.02, paid/paid_date copied to every slice so re-allocation never moves cost in or out of the books — only between jobs). Split siblings render as ONE row in the bills-due list (grouped by `bill_group_id`), and the Money tab's duplicate detector exempts entries sharing a `bill_group_id`. Mark-paid from the grouped row or the sheet flips every sibling together.
+
 ---
 
 ## Inbound Tapi lead webhook (Gmail → CloudMailin → Trade Pilot)

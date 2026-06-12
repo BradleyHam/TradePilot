@@ -28,6 +28,7 @@ import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
 import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
+import { InvoiceReviewSheet } from './invoice-review-sheet';
 import { CostEnginePreview } from './cost-engine-preview';
 import { PhotoLightbox, PhotoThumb, isImageName, type LightboxImage } from './photo-lightbox';
 
@@ -110,6 +111,10 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   // When true, the CompletionDateSheet opens to capture the actual finish
   // date so we can reconcile the calendar accurately.
   const [askCompletionDate, setAskCompletionDate] = useState(false);
+  // Accepted-job flow: prompt to send the deposit invoice, and if yes, open
+  // the review-and-send sheet (PDF preview + email draft).
+  const [acceptInvoicePromptOpen, setAcceptInvoicePromptOpen] = useState(false);
+  const [reviewInvoiceOpen, setReviewInvoiceOpen] = useState(false);
   // When true, the MarkAsQuotedSheet opens — collects total $, date
   // sent, and follow-up date, then flips the lead to status='quoted'.
   const [markAsQuotedOpen, setMarkAsQuotedOpen] = useState(false);
@@ -152,8 +157,10 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
     // change the status away and back to re-trigger.
     if (newStatus === 'lost' && !liveJob.lostReason) {
       setOutcomePrompt('lost');
-    } else if (newStatus === 'accepted' && !liveJob.wonReason) {
-      setOutcomePrompt('won');
+    } else if (newStatus === 'accepted') {
+      // Accepted → offer to send the deposit invoice that secures the
+      // booking. (The win reason is still capturable via the outcome panel.)
+      setAcceptInvoicePromptOpen(true);
     }
 
     // First time entering a "done" status (and not lost) → ask for the
@@ -916,6 +923,39 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
           setMarkAsQuotedOpen(true);
         }}
         onClose={() => setPrepWithAIOpen(false)}
+      />
+
+      {/* Accepted → "invoice them now?" prompt. Yes opens the review + send
+          screen; Not now just closes (the deposit still shows in the Home
+          "deposits to send" flag, so it won't be forgotten). */}
+      <Sheet open={acceptInvoicePromptOpen} onOpenChange={(o) => { if (!o) setAcceptInvoicePromptOpen(false); }}>
+        <SheetContent side="bottom" className="rounded-t-2xl">
+          <SheetHeader>
+            <SheetTitle>Job accepted — nice one</SheetTitle>
+            <p className="text-sm text-muted-foreground">
+              Send {liveJob.clientName || 'the client'} a deposit invoice now to secure the booking?
+            </p>
+          </SheetHeader>
+          <div className="mt-4 flex gap-2">
+            <Button variant="outline" className="flex-1" onClick={() => setAcceptInvoicePromptOpen(false)}>
+              Not now
+            </Button>
+            <Button
+              className="flex-1 bg-primary"
+              onClick={() => { setAcceptInvoicePromptOpen(false); setReviewInvoiceOpen(true); }}
+            >
+              Prepare invoice
+            </Button>
+          </div>
+        </SheetContent>
+      </Sheet>
+
+      {/* Review + send the deposit invoice — PDF preview + editable email,
+          then save the record + open Gmail pre-filled. */}
+      <InvoiceReviewSheet
+        job={reviewInvoiceOpen ? liveJob : null}
+        open={reviewInvoiceOpen}
+        onClose={() => setReviewInvoiceOpen(false)}
       />
     </Sheet>
   );
