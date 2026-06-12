@@ -131,42 +131,84 @@ export async function fetchDuluxSecurePdf(
   const timeout = setTimeout(() => controller.abort(), FETCH_TIMEOUT_MS);
   try {
     // Step 1: resolve the short link and capture the token cookie. The short
-    // link 30x-redirects to the SPA, and the token cookie is set on one of
-    // the redirect hops. fetch(redirect:'follow') only exposes the FINAL
-    // response's headers, so it would miss a cookie set on an intermediate
-    // hop. We follow redirects manually instead, accumulating Set-Cookie
-    // from every hop until we find the token (or run out of hops).
-    const collectedCookies: string[] = [];
+    // link 30x-redirects through the SPA, and the token cookie (drsToken)
+    // isn't handed over on the very first hop — Dulux sets a client-id cookie
+    // first, then issues the token cookie on a LATER hop only once that
+    // client-id is sent back. A browser does this automatically; a naive
+    // fetch loop does not. So we run our own cookie jar: accumulate every
+    // Set-Cookie, and replay the jar (as a Cookie header) on each subsequent
+    // hop. We follow redirects manually because fetch(redirect:'follow')
+    // hides intermediate Set-Cookie headers entirely.
+    //
+    // The token can show up two ways depending on Dulux's config — inside a
+    // Set-Cookie value, or inside a redirect Location/URL fragment — so we
+    // check both. We also keep following a few hops past the SPA landing
+    // because the token cookie sometimes lands on a same-origin request the
+    // SPA bootstrap triggers.
+    const jar = new Map<string, string>(); // name -> raw value (for replay)
+    const cookieBlobs: string[] = []; // raw Set-Cookie strings (for token scan)
+    const trail: string[] = []; // safe diagnostic breadcrumbs (no secrets)
     let url = shortLink;
+    let token: string | undefined;
     let lastStatus = 0;
-    for (let hop = 0; hop < 5; hop++) {
+
+    for (let hop = 0; hop < 6; hop++) {
+      const cookieHeader = [...jar.entries()].map(([k, v]) => `${k}=${v}`).join('; ');
       const r: Response = await fetch(url, {
         redirect: 'manual',
         signal: controller.signal,
         headers: {
           'User-Agent': 'TradePilot-InboundBill/1.0 (+bills@tradepilot.co.nz)',
           Accept: 'text/html,*/*;q=0.8',
+          ...(cookieHeader ? { Cookie: cookieHeader } : {}),
         },
       });
       lastStatus = r.status;
+
       const setCookies: string[] =
         typeof r.headers.getSetCookie === 'function'
           ? r.headers.getSetCookie()
           : (r.headers.get('set-cookie') ? [r.headers.get('set-cookie') as string] : []);
-      collectedCookies.push(...setCookies);
-      // Stop as soon as we have the token.
-      if (tokenFromSetCookie(collectedCookies)) break;
-      // Otherwise follow the redirect, if there is one.
-      const isRedirect = r.status >= 300 && r.status < 400;
+      for (const sc of setCookies) {
+        cookieBlobs.push(sc);
+        const eq = sc.indexOf('=');
+        if (eq > 0) {
+          const name = sc.slice(0, eq).trim();
+          const value = sc.slice(eq + 1).split(';')[0];
+          jar.set(name, value);
+        }
+      }
+
       const loc = r.headers.get('location');
-      if (!isRedirect || !loc) break;
-      url = new URL(loc, url).toString();
+      trail.push(`h${hop}:${r.status}:${setCookies.length}c${loc ? ':L' : ''}`);
+
+      // Token may be in a Set-Cookie value, or in the redirect Location / URL.
+      token = tokenFromSetCookie(cookieBlobs)
+        ?? (loc ? loc.match(TOKEN_RE)?.[0] : undefined)
+        ?? r.url.match(TOKEN_RE)?.[0];
+      if (token) break;
+
+      const isRedirect = r.status >= 300 && r.status < 400;
+      if (isRedirect && loc) {
+        url = new URL(loc, url).toString();
+      } else if (hop === 0) {
+        // First hop wasn't a redirect (or had no Location) — the bootstrap
+        // that mints the token cookie is the SPA shell itself; re-request it
+        // with the jar so the token cookie gets issued on the second call.
+        url = r.url || url;
+      } else {
+        break;
+      }
     }
-    if (collectedCookies.length === 0) {
-      return { reason: 'no-token-cookie', detail: `Short link returned ${lastStatus} with no Set-Cookie` };
+
+    const diag = trail.join(' ');
+    if (cookieBlobs.length === 0) {
+      return { reason: 'no-token-cookie', detail: `No Set-Cookie across chain [${diag}] (last ${lastStatus})` };
     }
-    const token = tokenFromSetCookie(collectedCookies);
-    if (!token) return { reason: 'token-not-found' };
+    if (!token) {
+      const names = [...jar.keys()].join(',');
+      return { reason: 'token-not-found', detail: `Cookies seen: ${names} [${diag}]` };
+    }
 
     // Step 2: fetch the document. The endpoint authenticates on the path
     // (token + account number); no cookie needed.
