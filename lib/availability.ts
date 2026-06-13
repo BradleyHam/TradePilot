@@ -214,14 +214,27 @@ export function computeAvailability(
   }
 
   // ── Derive the report fields ──────────────────────────────────────────────
-  const todayIsWorking = isWorkingDay(todayISO);
-  const todayIsOccupied = occupiedDates.has(todayISO);
-  const currentlyAvailable = todayIsWorking && !todayIsOccupied;
+  // Anchor availability to the next working day. On a weekend, "now" for
+  // availability purposes is the upcoming Monday — nobody starts a paint
+  // job on a Saturday, and an empty calendar on a Sunday means Brad is
+  // AVAILABLE, not "currently working". The old gate (today must itself be
+  // a working day) made currentlyAvailable read false every weekend, so
+  // consumers rendered "Currently working · free from <today>" over a
+  // completely free schedule — alongside a contradictory currentJobEnds=null.
+  let anchorISO = todayISO;
+  while (!isWorkingDay(anchorISO)) anchorISO = addDays(anchorISO, 1);
 
-  // currentJobEnds = last day of the first 'occupied' run if it starts today.
+  const anchorIsOccupied = occupiedDates.has(anchorISO);
+  const currentlyAvailable = !anchorIsOccupied;
+
+  // currentJobEnds = last day of the occupied stretch covering the anchor
+  // working day (the job Brad is in the middle of, or about to resume on
+  // Monday). Derived from the run that spans the anchor so it can never
+  // disagree with currentlyAvailable.
   let currentJobEnds: string | null = null;
-  if (todayIsOccupied && runs[0]?.kind === 'occupied') {
-    currentJobEnds = runs[0].end;
+  if (anchorIsOccupied) {
+    const anchorRun = runs.find((r) => r.start <= anchorISO && anchorISO <= r.end);
+    if (anchorRun?.kind === 'occupied') currentJobEnds = anchorRun.end;
   }
 
   // Find the next free window >= MIN_WORKING_DAYS_FOR_GAP working days.
