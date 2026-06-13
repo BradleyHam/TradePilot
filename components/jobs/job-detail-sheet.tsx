@@ -12,7 +12,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   Phone, Mail, MapPin, Clock, DollarSign, Receipt, FileText, MessageSquare,
   AlertCircle, StickyNote, TrendingUp, Edit3, Plus, Package, ExternalLink, X,
-  Camera, Trash2, Loader2, CalendarDays, Sparkles, Send,
+  Camera, Trash2, Loader2, CalendarDays, CalendarPlus, Sparkles, Send,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 import { formatEntryDate } from '@/lib/format-date';
@@ -26,6 +26,7 @@ import { InvoicesList } from './invoices-list';
 import { BookedDates } from './booked-dates';
 import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
+import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
 import { InvoiceReviewSheet } from './invoice-review-sheet';
@@ -127,6 +128,8 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const [aiSuggestedTotal, setAiSuggestedTotal] = useState<number | null>(null);
   // When true, the live AI quote drafter sheet opens.
   const [prepWithAIOpen, setPrepWithAIOpen] = useState(false);
+  // Book-a-site-visit sheet, opened from the lead-stage action strip.
+  const [bookVisitOpen, setBookVisitOpen] = useState(false);
 
   if (!job) return null;
 
@@ -322,25 +325,43 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                 with wrap-up data; and 'Mark as quoted' for jobs you've
                 handled outside the app. Both flip the funnel forward. */}
           {liveJob.status === 'lead' && (
-            <div className="flex flex-col sm:flex-row gap-2">
-              {hasWrapUpData(liveJob) && (
-                <button
-                  type="button"
-                  onClick={() => setPrepWithAIOpen(true)}
-                  className="flex-1 inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
-                >
-                  <Sparkles size={15} strokeWidth={2} />
-                  Prep quote with AI
-                </button>
-              )}
+            <div className="space-y-2">
+              {/* Book site visit — the natural first step for a fresh lead.
+                  Primary when no visit's been done yet (no wrap-up data),
+                  otherwise it steps back to let 'Prep quote with AI' lead. */}
               <button
                 type="button"
-                onClick={() => setMarkAsQuotedOpen(true)}
-                className="flex-1 inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl border border-border bg-background text-foreground text-sm font-semibold hover:bg-accent transition-colors"
+                onClick={() => setBookVisitOpen(true)}
+                className={cn(
+                  'w-full inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl text-sm font-semibold transition-colors',
+                  hasWrapUpData(liveJob)
+                    ? 'border border-border bg-background text-foreground hover:bg-accent'
+                    : 'bg-primary text-primary-foreground hover:bg-primary/90',
+                )}
               >
-                <Send size={15} strokeWidth={2} />
-                Mark as quoted
+                <CalendarPlus size={15} strokeWidth={2} />
+                Book site visit
               </button>
+              <div className="flex flex-col sm:flex-row gap-2">
+                {hasWrapUpData(liveJob) && (
+                  <button
+                    type="button"
+                    onClick={() => setPrepWithAIOpen(true)}
+                    className="flex-1 inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl bg-primary text-primary-foreground text-sm font-semibold hover:bg-primary/90 transition-colors"
+                  >
+                    <Sparkles size={15} strokeWidth={2} />
+                    Prep quote with AI
+                  </button>
+                )}
+                <button
+                  type="button"
+                  onClick={() => setMarkAsQuotedOpen(true)}
+                  className="flex-1 inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl border border-border bg-background text-foreground text-sm font-semibold hover:bg-accent transition-colors"
+                >
+                  <Send size={15} strokeWidth={2} />
+                  Mark as quoted
+                </button>
+              </div>
             </div>
           )}
 
@@ -941,6 +962,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
           setMarkAsQuotedOpen(true);
         }}
         onClose={() => setPrepWithAIOpen(false)}
+      />
+
+      {/* Book a site visit straight from the lead — schedules a quote_visit
+          and stamps the job's last-contacted so it stops looking stale. */}
+      <BookVisitSheet
+        job={bookVisitOpen ? liveJob : null}
+        open={bookVisitOpen}
+        onSaved={() => setBookVisitOpen(false)}
+        onCancel={() => setBookVisitOpen(false)}
       />
 
       {/* Accepted → "invoice them now?" prompt. Yes opens the review + send
