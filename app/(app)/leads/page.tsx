@@ -306,6 +306,7 @@ export default function LeadsPage() {
           onFilter={setWorkFilter}
           open={insightsOpen}
           onToggle={() => setInsightsOpen((v) => !v)}
+          onSelectJob={setOpenJob}
         />
 
         {/* Summary strip — quick stats. Only shown when there's data;

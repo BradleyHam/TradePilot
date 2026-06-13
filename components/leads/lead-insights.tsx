@@ -19,7 +19,7 @@
 
 import { useMemo, useState } from 'react';
 import type { Job, JobStatus, WorkType, LeadSource } from '@/lib/types';
-import { ChevronDown, BarChart3 } from 'lucide-react';
+import { ChevronDown, BarChart3, X, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 // ── Win / loss vocabulary ───────────────────────────────────────────────────
@@ -105,14 +105,26 @@ interface LeadInsightsProps {
   /** Controlled open/closed so the parent can remember it if it wants. */
   open: boolean;
   onToggle: () => void;
+  /** Open a job in the detail sheet — used by the per-week drill-down so a
+   *  lead can be tapped straight through to its full record. */
+  onSelectJob?: (job: Job) => void;
 }
 
-export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadInsightsProps) {
+/** Won / lost / open badge styling for a job, shared by the drill-down list. */
+function statusMeta(j: Job): { label: string; cls: string } {
+  if (isWon(j)) return { label: 'Won', cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' };
+  if (isLost(j)) return { label: 'Lost', cls: 'bg-red-100 text-red-800 border-red-200' };
+  return { label: 'Open', cls: 'bg-muted text-muted-foreground border-border' };
+}
+
+export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJob }: LeadInsightsProps) {
   // Timeframe is local to the panel (it scopes the insights only, NOT the
   // chase-list — that's the work-type filter's job). Default 'all'.
   const [timeframe, setTimeframe] = useState<TimeFrame>('all');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
+  // Per-week drill-down: which week-bar is expanded (Monday ISO), or null.
+  const [selectedWeek, setSelectedWeek] = useState<string | null>(null);
 
   // Resolve the timeframe to an inclusive [start, end] date window (local
   // YYYY-MM-DD). null = unbounded on that side.
@@ -199,6 +211,22 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
     const thisMonday = isoOf(lastMonday);
     return { data, max, total, thisMonday };
   }, [scoped, dateWindow]);
+
+  // The selected week is only "active" while it's still one of the visible
+  // bars — changing the timeframe/type filter can reshuffle the bars out from
+  // under it, in which case we just ignore the stale selection (no effect /
+  // setState-in-render needed). A fresh tap overwrites it.
+  const activeWeek = (selectedWeek && perWeek.data.some((d) => d.week === selectedWeek))
+    ? selectedWeek : null;
+
+  // Leads that landed in the drilled-into week (within the current scope),
+  // newest first. Drives the click-through list under the chart.
+  const weekLeads = useMemo(() => {
+    if (!activeWeek) return [];
+    return scoped
+      .filter((j) => j.createdAt && weekStartISO(new Date(j.createdAt)) === activeWeek)
+      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+  }, [scoped, activeWeek]);
 
   // ── Breakdown by work type (only shown when not already type-filtered) ─────
   // Uses `scoped`, which when filter==='all' is exactly the timeframe window
@@ -358,24 +386,89 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
               <div className="flex items-end gap-1.5 h-20">
                 {perWeek.data.map((d) => {
                   const isThisWeek = d.week === perWeek.thisMonday;
+                  const isSelected = d.week === activeWeek;
                   return (
-                    <div key={d.week} className="flex-1 flex flex-col items-center gap-1 min-w-0">
+                    <button
+                      key={d.week}
+                      type="button"
+                      onClick={() => setSelectedWeek(isSelected ? null : d.week)}
+                      aria-pressed={isSelected}
+                      className="flex-1 flex flex-col items-center gap-1 min-w-0 group cursor-pointer"
+                      title={`Week of ${shortWeekLabel(d.week)}: ${d.count} ${d.count === 1 ? 'lead' : 'leads'}`}
+                    >
                       <span className="text-[10px] text-muted-foreground tabular-nums leading-none">
                         {d.count > 0 ? d.count : ''}
                       </span>
                       <div
-                        className={cn('w-full rounded-t', isThisWeek ? 'bg-violet-600' : 'bg-violet-300 dark:bg-violet-800')}
+                        className={cn(
+                          'w-full rounded-t transition-colors',
+                          isSelected
+                            ? 'bg-violet-700 ring-2 ring-violet-400'
+                            : isThisWeek
+                              ? 'bg-violet-600 group-hover:bg-violet-700'
+                              : 'bg-violet-300 dark:bg-violet-800 group-hover:bg-violet-400 dark:group-hover:bg-violet-700',
+                        )}
                         style={{ height: `${Math.max(4, (d.count / perWeek.max) * 56)}px` }}
-                        title={`Week of ${shortWeekLabel(d.week)}: ${d.count}`}
-                        aria-label={`Week of ${shortWeekLabel(d.week)}: ${d.count} leads`}
+                        aria-hidden="true"
                       />
                       <span className="text-[9px] text-muted-foreground leading-none whitespace-nowrap">
-                        {shortWeekLabel(d.week).replace(/ /, ' ')}
+                        {shortWeekLabel(d.week)}
                       </span>
-                    </div>
+                    </button>
                   );
                 })}
               </div>
+
+              {activeWeek && (
+                <div className="rounded-lg border border-border bg-muted/30 p-2 space-y-1.5">
+                  <div className="flex items-center justify-between gap-2">
+                    <p className="text-xs font-medium text-foreground">
+                      Week of {shortWeekLabel(activeWeek)} · {weekLeads.length} {weekLeads.length === 1 ? 'lead' : 'leads'}
+                    </p>
+                    <button
+                      type="button"
+                      onClick={() => setSelectedWeek(null)}
+                      aria-label="Close week breakdown"
+                      className="w-7 h-7 -mr-1 flex items-center justify-center rounded-md text-muted-foreground hover:text-foreground"
+                    >
+                      <X size={14} strokeWidth={2} />
+                    </button>
+                  </div>
+                  {weekLeads.length === 0 ? (
+                    <p className="text-xs text-muted-foreground px-1 pb-1">No leads came in this week.</p>
+                  ) : (
+                    <ul className="space-y-1">
+                      {weekLeads.map((j) => {
+                        const st = statusMeta(j);
+                        return (
+                          <li key={j.id}>
+                            <button
+                              type="button"
+                              onClick={() => onSelectJob?.(j)}
+                              disabled={!onSelectJob}
+                              className={cn(
+                                'w-full flex items-center gap-2 px-2 py-2 min-h-[44px] rounded-lg bg-card border border-border text-left',
+                                onSelectJob && 'hover:border-primary/40 transition-colors',
+                              )}
+                            >
+                              <div className="flex-1 min-w-0">
+                                <p className="text-sm text-foreground truncate">{j.name}</p>
+                                {j.workType && (
+                                  <p className="text-[11px] text-muted-foreground capitalize">{j.workType}</p>
+                                )}
+                              </div>
+                              <span className={cn('shrink-0 px-2 py-0.5 rounded-md text-[11px] font-medium border', st.cls)}>
+                                {st.label}
+                              </span>
+                              {onSelectJob && <ChevronRight size={14} className="text-muted-foreground shrink-0" />}
+                            </button>
+                          </li>
+                        );
+                      })}
+                    </ul>
+                  )}
+                </div>
+              )}
             </section>
           )}
 
