@@ -17,7 +17,7 @@
 // chart-library weight, and they degrade to nothing when a section has no
 // data (no empty axes staring back at him — the golden UX rule).
 
-import { useMemo } from 'react';
+import { useMemo, useState } from 'react';
 import type { Job, JobStatus, WorkType, LeadSource } from '@/lib/types';
 import { ChevronDown, BarChart3 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -52,13 +52,43 @@ function moneyShort(n: number): string {
   return `$${Math.round(n)}`;
 }
 
-/** Monday-start week key (YYYY-MM-DD of that Monday) for a date. */
-function weekStartISO(d: Date): string {
+/** Local YYYY-MM-DD for a date (no UTC shift). */
+function isoOf(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** The Monday (local) of the week containing d, as a Date. */
+function mondayOf(d: Date): Date {
   const x = new Date(d.getFullYear(), d.getMonth(), d.getDate());
   const dow = (x.getDay() + 6) % 7; // 0 = Monday
   x.setDate(x.getDate() - dow);
-  return `${x.getFullYear()}-${String(x.getMonth() + 1).padStart(2, '0')}-${String(x.getDate()).padStart(2, '0')}`;
+  return x;
 }
+
+function addWeeks(d: Date, n: number): Date {
+  const x = new Date(d);
+  x.setDate(x.getDate() + n * 7);
+  return x;
+}
+
+/** Monday-start week key (YYYY-MM-DD of that Monday) for a date. */
+function weekStartISO(d: Date): string {
+  return isoOf(mondayOf(d));
+}
+
+// Cap how many week-bars we draw, so a wide custom range doesn't render 200
+// hair-thin bars. Beyond this we show the most recent N weeks in the window.
+const MAX_WEEK_BARS = 16;
+
+type TimeFrame = 'all' | '30d' | '90d' | 'year' | 'custom';
+
+const TIMEFRAME_OPTIONS: { value: TimeFrame; label: string }[] = [
+  { value: 'all', label: 'All time' },
+  { value: '30d', label: '30 days' },
+  { value: '90d', label: '90 days' },
+  { value: 'year', label: 'This year' },
+  { value: 'custom', label: 'Custom' },
+];
 
 function shortWeekLabel(iso: string): string {
   const [y, m, d] = iso.split('-').map(Number);
@@ -78,13 +108,41 @@ interface LeadInsightsProps {
 }
 
 export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadInsightsProps) {
-  // Jobs in scope for the metrics: the work-type filter applies to everything
-  // here. (We never count jobs with no work-type into a specific type — only
-  // into "All".)
-  const scoped = useMemo(
-    () => (filter === 'all' ? jobs : jobs.filter((j) => j.workType === filter)),
-    [jobs, filter],
-  );
+  // Timeframe is local to the panel (it scopes the insights only, NOT the
+  // chase-list — that's the work-type filter's job). Default 'all'.
+  const [timeframe, setTimeframe] = useState<TimeFrame>('all');
+  const [customFrom, setCustomFrom] = useState('');
+  const [customTo, setCustomTo] = useState('');
+
+  // Resolve the timeframe to an inclusive [start, end] date window (local
+  // YYYY-MM-DD). null = unbounded on that side.
+  const dateWindow = useMemo<{ start: string | null; end: string | null }>(() => {
+    const today = new Date();
+    const end = isoOf(today);
+    switch (timeframe) {
+      case '30d': return { start: isoOf(new Date(today.getTime() - 30 * 86400000)), end };
+      case '90d': return { start: isoOf(new Date(today.getTime() - 90 * 86400000)), end };
+      case 'year': return { start: `${today.getFullYear()}-01-01`, end };
+      case 'custom': return { start: customFrom || null, end: customTo || null };
+      default: return { start: null, end: null };
+    }
+  }, [timeframe, customFrom, customTo]);
+
+  // Jobs in scope for the metrics: work-type filter + timeframe window. (We
+  // never count jobs with no work-type into a specific type — only into "All".)
+  const scoped = useMemo(() => {
+    const { start, end } = dateWindow;
+    return jobs.filter((j) => {
+      if (filter !== 'all' && j.workType !== filter) return false;
+      if (start || end) {
+        const d = (j.createdAt || '').slice(0, 10);
+        if (!d) return false;
+        if (start && d < start) return false;
+        if (end && d > end) return false;
+      }
+      return true;
+    });
+  }, [jobs, filter, dateWindow]);
 
   // Which work-type chips to show — only types that actually appear in the
   // data, so a one-man painter isn't staring at empty "Roof" tabs.
@@ -103,18 +161,32 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
     return { won, lost, closed, rate };
   }, [scoped]);
 
-  // ── Leads per week (last 8 weeks, by createdAt) ─────────────────────────────
+  // ── Leads per week (by createdAt, spanning the timeframe window) ────────────
   const perWeek = useMemo(() => {
     const today = new Date();
-    const thisMonday = weekStartISO(today);
-    // Build the 8 week-buckets ending this week, oldest first.
-    const weeks: string[] = [];
-    const cursor = new Date(thisMonday);
-    for (let i = WEEKS_SHOWN - 1; i >= 0; i--) {
-      const d = new Date(cursor);
-      d.setDate(d.getDate() - i * 7);
-      weeks.push(weekStartISO(d));
+    const lastMonday = mondayOf(today);
+
+    // First week to show: the window start, else the earliest scoped lead,
+    // else 8 weeks back so a fresh account still draws a sensible axis.
+    let firstMonday: Date;
+    if (dateWindow.start) {
+      firstMonday = mondayOf(new Date(`${dateWindow.start}T12:00:00`));
+    } else {
+      const earliest = scoped.map((j) => j.createdAt).filter(Boolean).sort()[0];
+      firstMonday = earliest ? mondayOf(new Date(earliest)) : addWeeks(lastMonday, -(WEEKS_SHOWN - 1));
     }
+    // Last week to show: the window end (capped at this week), else this week.
+    let endMonday = dateWindow.end ? mondayOf(new Date(`${dateWindow.end}T12:00:00`)) : lastMonday;
+    if (endMonday > lastMonday) endMonday = lastMonday;
+    if (firstMonday > endMonday) firstMonday = endMonday;
+
+    const allWeeks: string[] = [];
+    for (let c = new Date(firstMonday); c <= endMonday && allWeeks.length < 200; c = addWeeks(c, 1)) {
+      allWeeks.push(isoOf(c));
+    }
+    // Cap: show the most recent MAX_WEEK_BARS weeks if the window is huge.
+    const weeks = allWeeks.length > MAX_WEEK_BARS ? allWeeks.slice(-MAX_WEEK_BARS) : allWeeks;
+
     const counts = new Map<string, number>(weeks.map((w) => [w, 0]));
     for (const j of scoped) {
       if (!j.createdAt) continue;
@@ -124,22 +196,26 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
     const data = weeks.map((w) => ({ week: w, count: counts.get(w) ?? 0 }));
     const max = Math.max(1, ...data.map((d) => d.count));
     const total = data.reduce((s, d) => s + d.count, 0);
-    return { data, max, total };
-  }, [scoped]);
+    const thisMonday = isoOf(lastMonday);
+    return { data, max, total, thisMonday };
+  }, [scoped, dateWindow]);
 
-  // ── Breakdown by work type (only meaningful when not already filtered) ─────
+  // ── Breakdown by work type (only shown when not already type-filtered) ─────
+  // Uses `scoped`, which when filter==='all' is exactly the timeframe window
+  // across all types — so the breakdown respects the selected period.
   const byType = useMemo(() => {
     return typesPresent
       .map((t) => {
-        const rows = jobs.filter((j) => j.workType === t);
+        const rows = scoped.filter((j) => j.workType === t);
         const won = rows.filter(isWon).length;
         const closed = rows.filter(isClosed).length;
         return { type: t, count: rows.length, won, closed, rate: closed > 0 ? Math.round((won / closed) * 100) : null };
       })
+      .filter((r) => r.count > 0)
       .sort((a, b) => b.count - a.count);
-  }, [jobs, typesPresent]);
+  }, [scoped, typesPresent]);
 
-  const untyped = useMemo(() => jobs.filter((j) => !j.workType).length, [jobs]);
+  const untyped = useMemo(() => scoped.filter((j) => !j.workType).length, [scoped]);
 
   // ── By source + avg quote value ────────────────────────────────────────────
   const bySource = useMemo(() => {
@@ -199,6 +275,39 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
 
       {open && (
         <div className="px-4 pb-4 space-y-5 border-t border-border pt-4">
+          {/* Timeframe — preset pills + a custom range. Scopes the insights
+              only (not the chase-list). Defaults to All time. */}
+          <div className="space-y-2">
+            <div className="flex flex-wrap gap-1.5">
+              {TIMEFRAME_OPTIONS.map((o) => (
+                <FilterChip key={o.value} active={timeframe === o.value} onClick={() => setTimeframe(o.value)}>
+                  {o.label}
+                </FilterChip>
+              ))}
+            </div>
+            {timeframe === 'custom' && (
+              <div className="flex items-center gap-2">
+                <input
+                  type="date"
+                  value={customFrom}
+                  max={customTo || undefined}
+                  onChange={(e) => setCustomFrom(e.target.value)}
+                  aria-label="From date"
+                  className="h-10 px-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+                <span className="text-xs text-muted-foreground">to</span>
+                <input
+                  type="date"
+                  value={customTo}
+                  min={customFrom || undefined}
+                  onChange={(e) => setCustomTo(e.target.value)}
+                  aria-label="To date"
+                  className="h-10 px-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+            )}
+          </div>
+
           {/* Work-type filter — drives this panel AND the chase-list below. */}
           {typesPresent.length > 0 && (
             <div className="flex flex-wrap gap-1.5">
@@ -211,8 +320,15 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
             </div>
           )}
 
+          {/* Empty period — one clear note instead of a stack of blank sections. */}
+          {scoped.length === 0 && (
+            <p className="text-xs text-muted-foreground">
+              No leads in this period{filter !== 'all' ? ` for ${WORK_TYPE_LABEL[filter]}` : ''}.
+            </p>
+          )}
+
           {/* Win / loss */}
-          {winLoss.closed > 0 ? (
+          {scoped.length > 0 && (winLoss.closed > 0 ? (
             <section className="space-y-2">
               <div className="flex items-baseline justify-between">
                 <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Win rate</h3>
@@ -229,19 +345,19 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle }: LeadIns
               </div>
             </section>
           ) : (
-            <p className="text-xs text-muted-foreground">No closed quotes yet for this view — win rate appears once you&apos;ve won or lost a quote.</p>
-          )}
+            <p className="text-xs text-muted-foreground">No closed quotes in this period yet — win rate appears once you&apos;ve won or lost a quote.</p>
+          ))}
 
           {/* Leads per week */}
           {perWeek.total > 0 && (
             <section className="space-y-2">
               <div className="flex items-baseline justify-between">
                 <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Leads per week</h3>
-                <span className="text-xs text-muted-foreground">{perWeek.total} in {WEEKS_SHOWN} wks</span>
+                <span className="text-xs text-muted-foreground">{perWeek.total} in {perWeek.data.length} {perWeek.data.length === 1 ? 'wk' : 'wks'}</span>
               </div>
               <div className="flex items-end gap-1.5 h-20">
-                {perWeek.data.map((d, i) => {
-                  const isThisWeek = i === perWeek.data.length - 1;
+                {perWeek.data.map((d) => {
+                  const isThisWeek = d.week === perWeek.thisMonday;
                   return (
                     <div key={d.week} className="flex-1 flex flex-col items-center gap-1 min-w-0">
                       <span className="text-[10px] text-muted-foreground tabular-nums leading-none">
