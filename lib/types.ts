@@ -194,6 +194,14 @@ export interface Job {
   endDate?: string;
   followUpDate?: string;
   /**
+   * The date the lead/enquiry actually came in (YYYY-MM-DD), as opposed to
+   * `createdAt` which is when the row was created in the app. They diverge
+   * badly for imported jobs (a whole backlog shares one import date), which
+   * made the Leads "leads per week" chart spike on the import day. The Leads
+   * insights bucket by `leadDate ?? createdAt`, and it's editable per job.
+   */
+  leadDate?: string;
+  /**
    * Last time Brad actively touched this lead/client — sent a message,
    * picked up the phone, sent the quote, replied to a question. Used by
    * the Leads chase-list to surface stale leads ("9 days since you last

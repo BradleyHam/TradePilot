@@ -303,6 +303,13 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             onChange={(workType) => updateJob(liveJob.id, { workType })}
           />
 
+          {/* Lead-received date — fixes the Leads "per week" trend for
+              imported jobs (which all share one createdAt). */}
+          <LeadDateRow
+            job={liveJob}
+            onChange={(leadDate) => updateJob(liveJob.id, { leadDate })}
+          />
+
           {/* Lead-stage action strip — only on leads. The two CTAs are
               the entire user-facing API for the quote flow today:
                 'Prep with AI' for jobs with wrap-up data; and
@@ -1029,6 +1036,69 @@ function WorkTypeRow({
         })}
       </div>
     </div>
+  );
+}
+
+// ── Lead-date row ───────────────────────────────────────────────────────────
+// The date the enquiry actually came in. Distinct from createdAt (the
+// row-creation date), which is identical across a whole imported backlog and
+// made the Leads "per week" chart spike on the import day. Until set, we show
+// the createdAt date as an "assumed" value (amber) so Brad knows to correct
+// it. The Leads insights bucket by leadDate ?? createdAt.
+function LeadDateRow({
+  job, onChange,
+}: {
+  job: Job;
+  onChange: (leadDate: string) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+  const fallback = job.createdAt ? job.createdAt.slice(0, 10) : '';
+
+  function handleDateChange(e: React.ChangeEvent<HTMLInputElement>) {
+    const next = e.target.value;
+    if (!next) return;
+    onChange(next);
+    setEditing(false);
+  }
+
+  if (editing) {
+    return (
+      <div className="flex items-center gap-2 text-sm">
+        <CalendarDays size={14} className="text-muted-foreground shrink-0" strokeWidth={1.8} />
+        <span className="text-muted-foreground">Lead came in:</span>
+        <input
+          type="date"
+          autoFocus
+          defaultValue={job.leadDate ?? fallback}
+          max={new Date().toISOString().slice(0, 10)}
+          onChange={handleDateChange}
+          onBlur={() => setEditing(false)}
+          onKeyDown={(e) => { if (e.key === 'Escape') setEditing(false); }}
+          className="h-8 px-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+        />
+      </div>
+    );
+  }
+
+  const hasDate = Boolean(job.leadDate);
+  return (
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      className={cn(
+        'flex items-center gap-1.5 text-sm rounded-lg -mx-1 px-1 py-0.5 hover:bg-muted/60 transition-colors text-left',
+        hasDate ? 'text-muted-foreground' : 'text-amber-600 dark:text-amber-400',
+      )}
+      aria-label={hasDate ? `Lead came in ${job.leadDate} — tap to edit` : 'Set the date this lead came in'}
+    >
+      <CalendarDays size={14} strokeWidth={1.8} />
+      <span>Lead came in:</span>
+      {hasDate ? (
+        <span className="font-medium text-foreground">{formatEntryDate(job.leadDate!)}</span>
+      ) : (
+        <span className="italic">{fallback ? `${formatEntryDate(fallback)} (assumed — tap to set)` : 'Tap to set'}</span>
+      )}
+    </button>
   );
 }
 

@@ -52,6 +52,7 @@ create table if not exists jobs (
   start_date      date,
   end_date        date,
   follow_up_date  date,
+  lead_date       date,
   notes           text,
   created_at      timestamptz default now() not null,
   updated_at      timestamptz default now() not null

@@ -47,6 +47,7 @@ export function rowToJob(r: Row): Job {
     startDate: asString(r.start_date),
     endDate: asString(r.end_date),
     followUpDate: asString(r.follow_up_date),
+    leadDate: asString(r.lead_date),
     lastContactedDate: asString(r.last_contacted_date),
     notes: asString(r.notes),
     source: (asString(r.source) as LeadSource | undefined),
@@ -97,6 +98,7 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.startDate !== undefined) out.start_date = j.startDate;
   if (j.endDate !== undefined) out.end_date = j.endDate;
   if (j.followUpDate !== undefined) out.follow_up_date = j.followUpDate;
+  if (j.leadDate !== undefined) out.lead_date = j.leadDate || null;
   if (j.lastContactedDate !== undefined) out.last_contacted_date = j.lastContactedDate || null;
   if (j.notes !== undefined) out.notes = j.notes;
   if (j.source !== undefined) out.source = j.source || null;

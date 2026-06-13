@@ -34,6 +34,24 @@ function isWon(j: Job): boolean { return WON_STATUSES.has(j.status); }
 function isLost(j: Job): boolean { return j.status === 'lost'; }
 function isClosed(j: Job): boolean { return isWon(j) || isLost(j); }
 
+// When did this lead actually come in? Prefer the explicit lead date; fall
+// back to createdAt (the row-creation date) when it hasn't been set. Imported
+// jobs all share one createdAt, so the explicit leadDate is what makes the
+// per-week trend honest.
+function leadDayISO(j: Job): string | null {
+  if (j.leadDate) return j.leadDate.slice(0, 10);
+  if (j.createdAt) return j.createdAt.slice(0, 10);
+  return null;
+}
+function leadMoment(j: Job): Date | null {
+  // Plain dates get a midday local time so week-bucketing never slips a day
+  // across the UTC boundary; timestamps parse as-is.
+  const raw = j.leadDate ? `${j.leadDate.slice(0, 10)}T12:00:00` : j.createdAt;
+  if (!raw) return null;
+  const d = new Date(raw);
+  return Number.isNaN(d.getTime()) ? null : d;
+}
+
 const WORK_TYPES: WorkType[] = ['interior', 'exterior', 'cedar', 'wallpaper', 'roof', 'mixed'];
 const WORK_TYPE_LABEL: Record<WorkType, string> = {
   interior: 'Interior', exterior: 'Exterior', cedar: 'Cedar',
@@ -147,7 +165,7 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
     return jobs.filter((j) => {
       if (filter !== 'all' && j.workType !== filter) return false;
       if (start || end) {
-        const d = (j.createdAt || '').slice(0, 10);
+        const d = leadDayISO(j);
         if (!d) return false;
         if (start && d < start) return false;
         if (end && d > end) return false;
@@ -184,8 +202,9 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
     if (dateWindow.start) {
       firstMonday = mondayOf(new Date(`${dateWindow.start}T12:00:00`));
     } else {
-      const earliest = scoped.map((j) => j.createdAt).filter(Boolean).sort()[0];
-      firstMonday = earliest ? mondayOf(new Date(earliest)) : addWeeks(lastMonday, -(WEEKS_SHOWN - 1));
+      const moments = scoped.map(leadMoment).filter((d): d is Date => d !== null)
+        .sort((a, b) => a.getTime() - b.getTime());
+      firstMonday = moments.length ? mondayOf(moments[0]) : addWeeks(lastMonday, -(WEEKS_SHOWN - 1));
     }
     // Last week to show: the window end (capped at this week), else this week.
     let endMonday = dateWindow.end ? mondayOf(new Date(`${dateWindow.end}T12:00:00`)) : lastMonday;
@@ -201,8 +220,9 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
 
     const counts = new Map<string, number>(weeks.map((w) => [w, 0]));
     for (const j of scoped) {
-      if (!j.createdAt) continue;
-      const wk = weekStartISO(new Date(j.createdAt));
+      const m = leadMoment(j);
+      if (!m) continue;
+      const wk = weekStartISO(m);
       if (counts.has(wk)) counts.set(wk, (counts.get(wk) ?? 0) + 1);
     }
     const data = weeks.map((w) => ({ week: w, count: counts.get(w) ?? 0 }));
@@ -224,8 +244,8 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
   const weekLeads = useMemo(() => {
     if (!activeWeek) return [];
     return scoped
-      .filter((j) => j.createdAt && weekStartISO(new Date(j.createdAt)) === activeWeek)
-      .sort((a, b) => (b.createdAt || '').localeCompare(a.createdAt || ''));
+      .filter((j) => { const m = leadMoment(j); return m !== null && weekStartISO(m) === activeWeek; })
+      .sort((a, b) => (leadDayISO(b) || '').localeCompare(leadDayISO(a) || ''));
   }, [scoped, activeWeek]);
 
   // ── Breakdown by work type (only shown when not already type-filtered) ─────
