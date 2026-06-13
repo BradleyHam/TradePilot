@@ -1,7 +1,7 @@
 'use client';
 
 import { useState, useRef, useEffect } from 'react';
-import { Job, Entry, Material, Quote, QuoteAttachment, QuoteAttachmentKind, ActivityType, Unit } from '@/lib/types';
+import { Job, Entry, Material, Quote, QuoteAttachment, QuoteAttachmentKind, ActivityType, Unit, WorkType } from '@/lib/types';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -292,6 +292,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
           <ClientInfoBlock
             job={liveJob}
             onSave={(patch) => updateJob(liveJob.id, patch)}
+          />
+
+          {/* Job type — tag the kind of work so the Leads insights (win-rate
+              by type, etc.) read true. One tap, sets immediately. Kept here
+              near the job's identity so it's the same place Brad fixes the
+              client name. */}
+          <WorkTypeRow
+            job={liveJob}
+            onChange={(workType) => updateJob(liveJob.id, { workType })}
           />
 
           {/* Lead-stage action strip — only on leads. The two CTAs are
@@ -973,6 +982,56 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
  * Saves via the parent's updateJob callback — optimistic store
  * update handles the persistence + rollback.
  */
+// ── Work-type tagger ────────────────────────────────────────────────────────
+// One-tap chips to set the job's work type. Drives the Leads insights
+// (win-rate / leads-per-week by type) — historically a lot of jobs came in
+// untyped, which made those breakdowns lie. Tapping the already-active chip
+// clears it back to untyped. Sets immediately via updateJob (optimistic).
+const WORK_TYPE_OPTIONS: { value: WorkType; label: string }[] = [
+  { value: 'interior', label: 'Interior' },
+  { value: 'exterior', label: 'Exterior' },
+  { value: 'cedar', label: 'Cedar' },
+  { value: 'wallpaper', label: 'Wallpaper' },
+  { value: 'roof', label: 'Roof' },
+  { value: 'mixed', label: 'Mixed' },
+];
+
+function WorkTypeRow({
+  job, onChange,
+}: {
+  job: Job;
+  onChange: (workType: WorkType) => void;
+}) {
+  return (
+    <div>
+      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+        Job type
+      </p>
+      <div className="flex flex-wrap gap-1.5">
+        {WORK_TYPE_OPTIONS.map(({ value, label }) => {
+          const active = job.workType === value;
+          return (
+            <button
+              key={value}
+              type="button"
+              onClick={() => onChange(value)}
+              aria-pressed={active}
+              className={cn(
+                'px-3 min-h-[36px] rounded-full text-sm font-medium border transition-colors',
+                active
+                  ? 'bg-primary text-primary-foreground border-primary'
+                  : 'bg-background text-muted-foreground border-border hover:border-primary/40',
+              )}
+            >
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
+  );
+}
+
 function ClientInfoBlock({
   job, onSave,
 }: {
