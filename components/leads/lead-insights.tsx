@@ -94,9 +94,31 @@ function weekStartISO(d: Date): string {
   return isoOf(mondayOf(d));
 }
 
-// Cap how many week-bars we draw, so a wide custom range doesn't render 200
-// hair-thin bars. Beyond this we show the most recent N weeks in the window.
+/** First-of-month key (YYYY-MM-01) for a date. */
+function monthStartISO(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-01`;
+}
+
+type Granularity = 'week' | 'month';
+
+/** Bucket key for a date at the chosen granularity. */
+function bucketKeyOf(d: Date, g: Granularity): string {
+  return g === 'week' ? weekStartISO(d) : monthStartISO(d);
+}
+
+/** Short axis/label for a bucket key at the chosen granularity. */
+function bucketLabel(key: string, g: Granularity): string {
+  const [y, m, d] = key.split('-').map(Number);
+  const date = new Date(y, m - 1, d || 1);
+  return g === 'week'
+    ? date.toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' })
+    : date.toLocaleDateString('en-NZ', { month: 'short', year: '2-digit' });
+}
+
+// Cap how many bars we draw, so a wide window doesn't render hundreds of
+// hair-thin bars. Beyond this we show the most recent N buckets in the window.
 const MAX_WEEK_BARS = 16;
+const MAX_MONTH_BARS = 24;
 
 type TimeFrame = 'all' | '30d' | '90d' | 'year' | 'custom';
 
@@ -108,10 +130,6 @@ const TIMEFRAME_OPTIONS: { value: TimeFrame; label: string }[] = [
   { value: 'custom', label: 'Custom' },
 ];
 
-function shortWeekLabel(iso: string): string {
-  const [y, m, d] = iso.split('-').map(Number);
-  return new Date(y, m - 1, d).toLocaleDateString('en-NZ', { day: 'numeric', month: 'short' });
-}
 
 interface LeadInsightsProps {
   /** All jobs from the store (open + closed). */
@@ -141,7 +159,9 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
   const [timeframe, setTimeframe] = useState<TimeFrame>('all');
   const [customFrom, setCustomFrom] = useState('');
   const [customTo, setCustomTo] = useState('');
-  // Per-week drill-down: which week-bar is expanded (Monday ISO), or null.
+  // Week vs month bars for the leads-over-time chart.
+  const [granularity, setGranularity] = useState<Granularity>('week');
+  // Drill-down: which bar (bucket key) is expanded, or null.
   const [selectedWeek, setSelectedWeek] = useState<string | null>(null);
 
   // Resolve the timeframe to an inclusive [start, end] date window (local
@@ -191,62 +211,72 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
     return { won, lost, closed, rate };
   }, [scoped]);
 
-  // ── Leads per week (by createdAt, spanning the timeframe window) ────────────
+  // ── Leads over time (week or month buckets, spanning the timeframe) ─────────
   const perWeek = useMemo(() => {
+    const g = granularity;
     const today = new Date();
-    const lastMonday = mondayOf(today);
+    // Step a date to the start of its bucket, and to the next bucket.
+    const startOf = (d: Date) => g === 'week'
+      ? mondayOf(d)
+      : new Date(d.getFullYear(), d.getMonth(), 1);
+    const next = (d: Date) => g === 'week'
+      ? addWeeks(d, 1)
+      : new Date(d.getFullYear(), d.getMonth() + 1, 1);
+    const curBucket = bucketKeyOf(today, g);
+    const lastStart = startOf(today);
 
-    // First week to show: the window start, else the earliest scoped lead,
-    // else 8 weeks back so a fresh account still draws a sensible axis.
-    let firstMonday: Date;
+    // First bucket: window start, else earliest scoped lead, else a sensible
+    // default span back from now.
+    let firstStart: Date;
     if (dateWindow.start) {
-      firstMonday = mondayOf(new Date(`${dateWindow.start}T12:00:00`));
+      firstStart = startOf(new Date(`${dateWindow.start}T12:00:00`));
     } else {
       const moments = scoped.map(leadMoment).filter((d): d is Date => d !== null)
         .sort((a, b) => a.getTime() - b.getTime());
-      firstMonday = moments.length ? mondayOf(moments[0]) : addWeeks(lastMonday, -(WEEKS_SHOWN - 1));
+      if (moments.length) firstStart = startOf(moments[0]);
+      else firstStart = g === 'week' ? addWeeks(lastStart, -(WEEKS_SHOWN - 1))
+        : new Date(today.getFullYear(), today.getMonth() - 5, 1);
     }
-    // Last week to show: the window end (capped at this week), else this week.
-    let endMonday = dateWindow.end ? mondayOf(new Date(`${dateWindow.end}T12:00:00`)) : lastMonday;
-    if (endMonday > lastMonday) endMonday = lastMonday;
-    if (firstMonday > endMonday) firstMonday = endMonday;
+    let endStart = dateWindow.end ? startOf(new Date(`${dateWindow.end}T12:00:00`)) : lastStart;
+    if (endStart > lastStart) endStart = lastStart;
+    if (firstStart > endStart) firstStart = endStart;
 
-    const allWeeks: string[] = [];
-    for (let c = new Date(firstMonday); c <= endMonday && allWeeks.length < 200; c = addWeeks(c, 1)) {
-      allWeeks.push(isoOf(c));
+    const allKeys: string[] = [];
+    for (let c = new Date(firstStart); c <= endStart && allKeys.length < 300; c = next(c)) {
+      allKeys.push(bucketKeyOf(c, g));
     }
-    // Cap: show the most recent MAX_WEEK_BARS weeks if the window is huge.
-    const weeks = allWeeks.length > MAX_WEEK_BARS ? allWeeks.slice(-MAX_WEEK_BARS) : allWeeks;
+    // Cap: most-recent N buckets if the window is huge.
+    const cap = g === 'week' ? MAX_WEEK_BARS : MAX_MONTH_BARS;
+    const keys = allKeys.length > cap ? allKeys.slice(-cap) : allKeys;
 
-    const counts = new Map<string, number>(weeks.map((w) => [w, 0]));
+    const counts = new Map<string, number>(keys.map((k) => [k, 0]));
     for (const j of scoped) {
       const m = leadMoment(j);
       if (!m) continue;
-      const wk = weekStartISO(m);
-      if (counts.has(wk)) counts.set(wk, (counts.get(wk) ?? 0) + 1);
+      const k = bucketKeyOf(m, g);
+      if (counts.has(k)) counts.set(k, (counts.get(k) ?? 0) + 1);
     }
-    const data = weeks.map((w) => ({ week: w, count: counts.get(w) ?? 0 }));
+    const data = keys.map((k) => ({ key: k, count: counts.get(k) ?? 0 }));
     const max = Math.max(1, ...data.map((d) => d.count));
     const total = data.reduce((s, d) => s + d.count, 0);
-    const thisMonday = isoOf(lastMonday);
-    return { data, max, total, thisMonday };
-  }, [scoped, dateWindow]);
+    return { data, max, total, curBucket };
+  }, [scoped, dateWindow, granularity]);
 
-  // The selected week is only "active" while it's still one of the visible
-  // bars — changing the timeframe/type filter can reshuffle the bars out from
-  // under it, in which case we just ignore the stale selection (no effect /
+  // The selected bucket is only "active" while it's still one of the visible
+  // bars — changing the timeframe/type/granularity can reshuffle the bars out
+  // from under it, in which case we ignore the stale selection (no effect /
   // setState-in-render needed). A fresh tap overwrites it.
-  const activeWeek = (selectedWeek && perWeek.data.some((d) => d.week === selectedWeek))
+  const activeWeek = (selectedWeek && perWeek.data.some((d) => d.key === selectedWeek))
     ? selectedWeek : null;
 
-  // Leads that landed in the drilled-into week (within the current scope),
+  // Leads that landed in the drilled-into bucket (within the current scope),
   // newest first. Drives the click-through list under the chart.
   const weekLeads = useMemo(() => {
     if (!activeWeek) return [];
     return scoped
-      .filter((j) => { const m = leadMoment(j); return m !== null && weekStartISO(m) === activeWeek; })
+      .filter((j) => { const m = leadMoment(j); return m !== null && bucketKeyOf(m, granularity) === activeWeek; })
       .sort((a, b) => (leadDayISO(b) || '').localeCompare(leadDayISO(a) || ''));
-  }, [scoped, activeWeek]);
+  }, [scoped, activeWeek, granularity]);
 
   // ── Breakdown by work type (only shown when not already type-filtered) ─────
   // Uses `scoped`, which when filter==='all' is exactly the timeframe window
@@ -396,25 +426,43 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
             <p className="text-xs text-muted-foreground">No closed quotes in this period yet — win rate appears once you&apos;ve won or lost a quote.</p>
           ))}
 
-          {/* Leads per week */}
+          {/* Leads over time */}
           {perWeek.total > 0 && (
             <section className="space-y-2">
-              <div className="flex items-baseline justify-between">
-                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Leads per week</h3>
-                <span className="text-xs text-muted-foreground">{perWeek.total} in {perWeek.data.length} {perWeek.data.length === 1 ? 'wk' : 'wks'}</span>
+              <div className="flex items-center justify-between gap-2">
+                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
+                  Leads per {granularity === 'week' ? 'week' : 'month'}
+                  <span className="font-normal normal-case tracking-normal"> · {perWeek.total} total</span>
+                </h3>
+                <div className="inline-flex rounded-lg border border-border overflow-hidden shrink-0">
+                  {(['week', 'month'] as Granularity[]).map((g) => (
+                    <button
+                      key={g}
+                      type="button"
+                      onClick={() => { setGranularity(g); setSelectedWeek(null); }}
+                      aria-pressed={granularity === g}
+                      className={cn(
+                        'px-2.5 h-7 text-[11px] font-medium transition-colors',
+                        granularity === g ? 'bg-foreground text-background' : 'bg-card text-muted-foreground hover:text-foreground',
+                      )}
+                    >
+                      {g === 'week' ? 'Week' : 'Month'}
+                    </button>
+                  ))}
+                </div>
               </div>
               <div className="flex items-end gap-1.5 h-20">
                 {perWeek.data.map((d) => {
-                  const isThisWeek = d.week === perWeek.thisMonday;
-                  const isSelected = d.week === activeWeek;
+                  const isCurrent = d.key === perWeek.curBucket;
+                  const isSelected = d.key === activeWeek;
                   return (
                     <button
-                      key={d.week}
+                      key={d.key}
                       type="button"
-                      onClick={() => setSelectedWeek(isSelected ? null : d.week)}
+                      onClick={() => setSelectedWeek(isSelected ? null : d.key)}
                       aria-pressed={isSelected}
                       className="flex-1 flex flex-col items-center gap-1 min-w-0 group cursor-pointer"
-                      title={`Week of ${shortWeekLabel(d.week)}: ${d.count} ${d.count === 1 ? 'lead' : 'leads'}`}
+                      title={`${bucketLabel(d.key, granularity)}: ${d.count} ${d.count === 1 ? 'lead' : 'leads'}`}
                     >
                       <span className="text-[10px] text-muted-foreground tabular-nums leading-none">
                         {d.count > 0 ? d.count : ''}
@@ -424,7 +472,7 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
                           'w-full rounded-t transition-colors',
                           isSelected
                             ? 'bg-violet-700 ring-2 ring-violet-400'
-                            : isThisWeek
+                            : isCurrent
                               ? 'bg-violet-600 group-hover:bg-violet-700'
                               : 'bg-violet-300 dark:bg-violet-800 group-hover:bg-violet-400 dark:group-hover:bg-violet-700',
                         )}
@@ -432,7 +480,7 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
                         aria-hidden="true"
                       />
                       <span className="text-[9px] text-muted-foreground leading-none whitespace-nowrap">
-                        {shortWeekLabel(d.week)}
+                        {bucketLabel(d.key, granularity)}
                       </span>
                     </button>
                   );
@@ -443,7 +491,7 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
                 <div className="rounded-lg border border-border bg-muted/30 p-2 space-y-1.5">
                   <div className="flex items-center justify-between gap-2">
                     <p className="text-xs font-medium text-foreground">
-                      Week of {shortWeekLabel(activeWeek)} · {weekLeads.length} {weekLeads.length === 1 ? 'lead' : 'leads'}
+                      {granularity === 'week' ? 'Week of ' : ''}{bucketLabel(activeWeek, granularity)} · {weekLeads.length} {weekLeads.length === 1 ? 'lead' : 'leads'}
                     </p>
                     <button
                       type="button"
