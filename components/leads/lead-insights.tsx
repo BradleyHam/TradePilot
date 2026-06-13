@@ -479,8 +479,13 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
                         style={{ height: `${Math.max(4, (d.count / perWeek.max) * 56)}px` }}
                         aria-hidden="true"
                       />
-                      <span className="text-[9px] text-muted-foreground leading-none whitespace-nowrap">
-                        {bucketLabel(d.key, granularity)}
+                      <span className={cn(
+                        'text-[9px] leading-none whitespace-nowrap',
+                        isCurrent ? 'text-violet-600 font-medium' : 'text-muted-foreground',
+                      )}>
+                        {isCurrent
+                          ? (granularity === 'week' ? 'This wk' : 'This mo')
+                          : bucketLabel(d.key, granularity)}
                       </span>
                     </button>
                   );
