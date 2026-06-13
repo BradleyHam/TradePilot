@@ -52,9 +52,10 @@ type MaterialInit = Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId'
 import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
-  Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split,
+  Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split, Send,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
+import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
 
 // ── ISO date helpers (local time — UTC drift bites week boundaries) ─────────
 function parseISODate(s: string): Date {
@@ -127,7 +128,7 @@ const LEADS_TO_CONTACT_MAX_ROWS = 6;
 // ── Page ────────────────────────────────────────────────────────────────────
 export default function HomePage() {
   const {
-    entries, scheduleItems, invoices, jobs, jobImports, businessId,
+    entries, scheduleItems, invoices, jobs, jobImports, quotes, businessId,
     updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry, updateJob,
     confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
     commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
@@ -296,10 +297,19 @@ export default function HomePage() {
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
   }, [jobs, invoices]);
 
+  // Quoted jobs gone quiet — the follow-up ladder (7d nudge → 3wk
+  // "either way" message → a week later, prompt to mark lost). All the
+  // rules live in lib/quote-follow-up.ts, shared with the Leads tab.
+  const quoteFollowUps = useMemo(
+    () => computeQuoteFollowUps(jobs, quotes, todayISO),
+    [jobs, quotes, todayISO],
+  );
+
   const showMoneyFlags = overdueInvoices.length > 0
     || billsDueSoon.length > 0
     || billDrafts.length > 0
     || depositsToSend.length > 0
+    || quoteFollowUps.length > 0
     || jobImports.length > 0;
 
   // ── Coming up (next 7 days, not including today) ───────────────────────
@@ -436,10 +446,17 @@ export default function HomePage() {
             billsDueSoon={billsDueSoon}
             billDrafts={billDrafts}
             depositsToSend={depositsToSend}
+            quoteFollowUps={quoteFollowUps}
             jobImports={jobImports}
             jobs={jobs}
             todayISO={todayISO}
             onIssueDeposit={(job) => setDepositForJob(job)}
+            onFollowedUp={(jobId) =>
+              updateJob(jobId, { lastContactedDate: new Date().toISOString() })
+            }
+            onMarkLost={(jobId) =>
+              updateJob(jobId, { status: 'lost', lostReason: 'no-reply' })
+            }
             onMarkInvoicePaid={(id, paidDate) => markInvoicePaid(id, paidDate)}
             onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
             onConfirmDraft={(id, { jobId, materials }) =>
@@ -1008,18 +1025,22 @@ function WeekStatsSection({
 // which collapses any open state automatically (correct behaviour).
 
 function MoneyFlagsCard({
-  overdueInvoices, billsDueSoon, billDrafts, depositsToSend, jobImports, jobs, todayISO,
+  overdueInvoices, billsDueSoon, billDrafts, depositsToSend, quoteFollowUps, jobImports, jobs, todayISO,
   onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onConfirmDraftSplit, onDeleteDraft,
   onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip, onIssueDeposit,
+  onFollowedUp, onMarkLost,
 }: {
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
   billDrafts: Entry[];
   depositsToSend: Job[];
+  quoteFollowUps: QuoteFollowUp[];
   jobImports: JobImport[];
   jobs: Job[];
   todayISO: string;
   onIssueDeposit: (job: Job) => void;
+  onFollowedUp: (jobId: string) => void;
+  onMarkLost: (jobId: string) => void;
   onMarkInvoicePaid: (invoiceId: string, paidDate: string) => void;
   onMarkBillPaid: (entryId: string, paidDate: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
@@ -1060,6 +1081,13 @@ function MoneyFlagsCard({
           <DepositToSendFlag
             jobs={depositsToSend}
             onIssueDeposit={onIssueDeposit}
+          />
+        )}
+        {quoteFollowUps.length > 0 && (
+          <QuoteFollowUpsFlag
+            followUps={quoteFollowUps}
+            onFollowedUp={onFollowedUp}
+            onMarkLost={onMarkLost}
           />
         )}
         {overdueInvoices.length > 0 && (
@@ -1152,6 +1180,184 @@ function DepositToSendFlag({
         </ul>
       )}
     </div>
+  );
+}
+
+// ── Flag: Quote follow-ups ──────────────────────────────────────────────────
+// Quoted jobs gone quiet, on Brad's chase cadence (lib/quote-follow-up.ts):
+// day 7 → first nudge, day 21 → the short "either way" message, and a week
+// of silence after that → prompt to mark the job lost. One row per job,
+// showing only the most urgent stage. "Followed up" stamps lastContactedDate
+// (same as the Leads page's Mark contacted) so the row self-clears; Mark
+// lost is two-tap (inline confirm) because it changes the job's status.
+function QuoteFollowUpsFlag({
+  followUps, onFollowedUp, onMarkLost,
+}: {
+  followUps: QuoteFollowUp[];
+  onFollowedUp: (jobId: string) => void;
+  onMarkLost: (jobId: string) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  // Header line: lead with the most urgent stage present.
+  const hasClose = followUps.some((f) => f.stage === 'close');
+  const subtitle = hasClose
+    ? 'No reply after your final follow-up — time to close some out'
+    : 'Quote sent, gone quiet — a quick chase wins these';
+
+  const STAGE_COPY: Record<QuoteFollowUp['stage'], {
+    pill: string;
+    pillClass: string;
+    line: (f: QuoteFollowUp) => string;
+  }> = {
+    first: {
+      pill: '1st follow-up',
+      pillClass: 'bg-amber-50 text-amber-700 border-amber-200',
+      line: (f) => `Quoted ${f.daysSinceSent}d ago, no reply — send a friendly nudge`,
+    },
+    second: {
+      pill: '2nd follow-up',
+      pillClass: 'bg-orange-50 text-orange-700 border-orange-200',
+      line: (f) => `Quoted ${f.daysSinceSent}d ago — send the short "either way" message`,
+    },
+    close: {
+      pill: 'Close it out',
+      pillClass: 'bg-red-50 text-red-700 border-red-200',
+      line: (f) => `Still quiet ${f.daysSinceContact}d after your follow-up — likely gone`,
+    },
+  };
+
+  return (
+    <div>
+      <button
+        type="button"
+        onClick={() => setOpen((v) => !v)}
+        aria-expanded={open}
+        className="w-full flex items-center gap-3 px-4 py-3 min-h-[56px] hover:bg-accent transition-colors text-left"
+      >
+        <div className="w-8 h-8 rounded-xl bg-blue-50 flex items-center justify-center shrink-0">
+          <Send size={16} className="text-blue-600" strokeWidth={1.8} />
+        </div>
+        <div className="flex-1 min-w-0">
+          <p className="text-sm font-medium text-foreground">
+            {followUps.length} quote follow-up{followUps.length === 1 ? '' : 's'} due
+          </p>
+          <p className="text-xs text-muted-foreground">{subtitle}</p>
+        </div>
+        <ChevronDown
+          size={16}
+          className={cn(
+            'text-muted-foreground shrink-0 transition-transform',
+            open && 'rotate-180',
+          )}
+        />
+      </button>
+      {open && (
+        <ul className="px-2 pb-2 space-y-2 bg-muted/30">
+          {followUps.map((f) => {
+            const copy = STAGE_COPY[f.stage];
+            return (
+              <li
+                key={f.job.id}
+                className="bg-card border border-border rounded-xl px-3 py-2.5 space-y-2"
+              >
+                <div className="flex items-start justify-between gap-3">
+                  <div className="flex-1 min-w-0">
+                    <p className="text-sm font-semibold text-foreground truncate">
+                      {f.job.name}
+                    </p>
+                    <p className="text-xs text-muted-foreground truncate">
+                      {f.job.clientName}
+                      {f.job.quoteAmount ? ` · quote ${fmtMoney(f.job.quoteAmount)}` : ''}
+                    </p>
+                    <p className="text-xs text-muted-foreground mt-0.5">
+                      {copy.line(f)}
+                    </p>
+                  </div>
+                  <span
+                    className={cn(
+                      'shrink-0 inline-flex items-center px-2 py-1 rounded-lg border text-[11px] font-semibold whitespace-nowrap',
+                      copy.pillClass,
+                    )}
+                  >
+                    {copy.pill}
+                  </span>
+                </div>
+                <div className="flex items-center gap-1.5">
+                  {f.job.clientPhone && (
+                    <a
+                      href={`tel:${f.job.clientPhone}`}
+                      onClick={(e) => e.stopPropagation()}
+                      className="shrink-0 w-11 h-11 inline-flex items-center justify-center rounded-xl border border-border text-foreground hover:bg-accent transition-colors"
+                      title={`Call ${f.job.clientName ?? 'the client'}`}
+                    >
+                      <Phone size={15} strokeWidth={1.8} />
+                    </a>
+                  )}
+                  {f.job.clientEmail && (
+                    <a
+                      href={gmailComposeUrl(f.job.clientEmail)}
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      onClick={(e) => e.stopPropagation()}
+                      className="shrink-0 w-11 h-11 inline-flex items-center justify-center rounded-xl border border-border text-foreground hover:bg-accent transition-colors"
+                      title={`Email ${f.job.clientName ?? 'the client'} in Gmail`}
+                    >
+                      <Mail size={15} strokeWidth={1.8} />
+                    </a>
+                  )}
+                  <button
+                    type="button"
+                    onClick={(e) => { e.stopPropagation(); onFollowedUp(f.job.id); }}
+                    className="flex-1 h-11 px-3 rounded-full bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold transition-colors active:scale-95"
+                    title="Stamps today as the last contact — the flag clears until the next stage"
+                  >
+                    Followed up
+                  </button>
+                  {f.stage !== 'first' && (
+                    <MarkLostControl onConfirm={() => onMarkLost(f.job.id)} />
+                  )}
+                </div>
+              </li>
+            );
+          })}
+        </ul>
+      )}
+    </div>
+  );
+}
+
+/**
+ * Two-tap Mark lost. First tap arms it ("Sure?"), second confirms.
+ * Status changes are recoverable from the job sheet, but a fat-finger
+ * at 5:30pm shouldn't silently kill a live lead — hence the confirm.
+ * Disarms itself after a few seconds if the second tap never comes.
+ */
+function MarkLostControl({ onConfirm }: { onConfirm: () => void }) {
+  const [armed, setArmed] = useState(false);
+
+  return (
+    <button
+      type="button"
+      onClick={(e) => {
+        e.stopPropagation();
+        if (!armed) {
+          setArmed(true);
+          setTimeout(() => setArmed(false), 4000);
+        } else {
+          onConfirm();
+        }
+      }}
+      className={cn(
+        'shrink-0 h-11 px-3 rounded-full border text-xs font-semibold transition-colors active:scale-95',
+        armed
+          ? 'bg-red-600 border-red-600 text-white'
+          : 'border-red-200 text-red-700 bg-red-50 hover:bg-red-100',
+      )}
+      title="Mark this job as lost (no reply)"
+    >
+      {armed ? 'Sure?' : 'Mark lost'}
+    </button>
   );
 }
 

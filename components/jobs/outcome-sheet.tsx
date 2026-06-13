@@ -23,6 +23,10 @@ const LOST_REASONS: { value: LostReason; label: string }[] = [
   { value: 'scope-changed',     label: 'Scope changed' },
   { value: 'project-cancelled', label: 'Project cancelled' },
   { value: 'timing',            label: 'Timing didn’t work' },
+  // "We declined it" reasons — Brad turned the job down, the client
+  // didn't walk. Distinguishable from competitive losses in insights.
+  { value: 'too-far',           label: 'Too far away' },
+  { value: 'wrong-fit',         label: 'Not our kind of work' },
   { value: 'other',             label: 'Other' },
 ];
 

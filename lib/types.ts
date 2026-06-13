@@ -160,6 +160,11 @@ export type LostReason =
   | 'scope-changed'
   | 'project-cancelled'
   | 'timing'
+  // The two "we declined it" reasons — the lead wasn't lost, Brad
+  // turned it down. Same field so the funnel stays simple, but
+  // distinguishable in future insights (declined ≠ outcompeted).
+  | 'too-far'      // outside the service area (e.g. Queenstown)
+  | 'wrong-fit'    // not our kind of work (e.g. new builds)
   | 'other';
 
 /** Why a quote landed. Set when status moves to 'accepted'. */

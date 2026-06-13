@@ -31,7 +31,8 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useStore } from '@/lib/store';
-import { Job, LeadSource, ScheduleItem } from '@/lib/types';
+import { Job, LeadSource, ScheduleItem, WorkType } from '@/lib/types';
+import { LeadInsights } from '@/components/leads/lead-insights';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { JobDetailSheet } from '@/components/jobs/job-detail-sheet';
@@ -41,9 +42,10 @@ import { Button } from '@/components/ui/button';
 import {
   Phone, Mail, MapPin, MessageCircle, Sparkles, Snowflake, Flame, Clock,
   ChevronRight, Globe, Search, UserPlus, Inbox, CalendarPlus, CalendarDays,
-  CalendarCheck, FileText, Send,
+  CalendarCheck, FileText, Send, X,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
+import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
 
 // Stale-ness thresholds. These match how leads actually behave for a
 // solo painter — most clients want a reply same-day, expect a quote
@@ -90,7 +92,7 @@ const SOURCE_PILL: Record<LeadSource, { label: string; Icon: typeof Globe } | nu
 };
 
 export default function LeadsPage() {
-  const { jobs, updateJob, scheduleItems } = useStore();
+  const { jobs, updateJob, scheduleItems, quotes } = useStore();
   const [openJob, setOpenJob] = useState<Job | null>(null);
   // When set, the BookVisitSheet opens for this lead.
   const [visitForJob, setVisitForJob] = useState<Job | null>(null);
@@ -99,6 +101,12 @@ export default function LeadsPage() {
   // have to detour through the job detail when the quote was
   // prepared outside the app.
   const [markQuotedForJob, setMarkQuotedForJob] = useState<Job | null>(null);
+  // Insights panel: work-type filter (drives the panel AND the chase-list
+  // below) + collapsed/expanded state. Collapsed by default so the 5:30pm
+  // "what do I chase?" view stays uncluttered; Brad opens it when he wants
+  // the bird's-eye read.
+  const [workFilter, setWorkFilter] = useState<WorkType | 'all'>('all');
+  const [insightsOpen, setInsightsOpen] = useState(false);
 
   // Three buckets, mutually exclusive. Each answers a different
   // "what do I do next?" question:
@@ -190,6 +198,18 @@ export default function LeadsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, today]);
 
+  // Follow-up ladder for quoted jobs (shared rules with the Home flag —
+  // lib/quote-follow-up.ts): day 7 nudge → day 21 "either way" message →
+  // a week of silence after that → prompt to mark lost. Keyed by job id
+  // so the awaiting-reply cards can show a stage pill + Mark lost action.
+  const followUpByJob = useMemo(() => {
+    const map = new Map<string, QuoteFollowUp>();
+    for (const f of computeQuoteFollowUps(jobs, quotes, todayISO)) {
+      map.set(f.job.id, f);
+    }
+    return map;
+  }, [jobs, quotes, todayISO]);
+
   // "Visit booked": a fresh lead (no wrap-up data yet) that has an upcoming
   // quote_visit. Carved out of New enquiries so it doesn't look un-actioned.
   // Sorted soonest-visit-first — the next thing on the calendar is top.
@@ -213,11 +233,33 @@ export default function LeadsPage() {
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, today, nextVisitByJob]);
 
-  // Top-strip stats summarise across all three buckets. Pipeline value
-  // is still useful as a single rolled-up number; coldOrDead now counts
+  // Apply the insights panel's work-type filter to the chase-list too, so
+  // picking "Cedar" focuses the whole page on cedar leads. 'all' = no-op.
+  // Jobs with no work-type only show under 'all' (we can't honestly file an
+  // untyped lead under a specific type).
+  const fToQuote = useMemo(
+    () => toQuote.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    [toQuote, workFilter]);
+  const fVisitBooked = useMemo(
+    () => visitBooked.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    [visitBooked, workFilter]);
+  const fAwaitingReply = useMemo(
+    () => awaitingReply.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    [awaitingReply, workFilter]);
+  const fNewEnquiries = useMemo(
+    () => newEnquiries.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    [newEnquiries, workFilter]);
+
+  // Unfiltered open count — lets the empty state tell "no leads at all" apart
+  // from "no leads of the type you've filtered to".
+  const totalOpenUnfiltered =
+    toQuote.length + visitBooked.length + awaitingReply.length + newEnquiries.length;
+
+  // Top-strip stats summarise across all three (filtered) buckets. Pipeline
+  // value is still useful as a single rolled-up number; coldOrDead now counts
   // anything (in any bucket) that's been waiting too long.
   const stats = useMemo(() => {
-    const all = [...toQuote, ...visitBooked, ...awaitingReply, ...newEnquiries];
+    const all = [...fToQuote, ...fVisitBooked, ...fAwaitingReply, ...fNewEnquiries];
     const openCount = all.length;
     const pipelineValue = all.reduce((sum, r) => {
       // Use quoteAmount when we have it (more reliable); otherwise the
@@ -226,12 +268,20 @@ export default function LeadsPage() {
     }, 0);
     const coldOrDead = all.filter((r) => r.temperature === 'cold' || r.temperature === 'dead').length;
     return { openCount, pipelineValue, coldOrDead };
-  }, [toQuote, visitBooked, awaitingReply, newEnquiries]);
+  }, [fToQuote, fVisitBooked, fAwaitingReply, fNewEnquiries]);
 
   function markContacted(jobId: string) {
     // Stamp "now" as the last contact moment. The chase-list re-ranks
     // immediately because the store update flows through useMemo above.
     updateJob(jobId, { lastContactedDate: new Date().toISOString() });
+  }
+
+  function markLost(jobId: string) {
+    // Close the loop on a quote that never got a reply. Only offered
+    // when the follow-up ladder says the lead is dead (a week of
+    // silence after the "either way" message). Recoverable from the
+    // job detail sheet if the client resurfaces.
+    updateJob(jobId, { status: 'lost', lostReason: 'no-reply' });
   }
 
   return (
@@ -246,6 +296,18 @@ export default function LeadsPage() {
       />
 
       <div className="px-4 md:px-6 space-y-4 pb-8">
+        {/* Insights — collapsible pipeline analytics (win rate, leads/week,
+            by type, by source) with a work-type filter that also scopes the
+            chase-list below. Renders over ALL jobs, so it's useful even on a
+            quiet week with no open leads. */}
+        <LeadInsights
+          jobs={jobs}
+          filter={workFilter}
+          onFilter={setWorkFilter}
+          open={insightsOpen}
+          onToggle={() => setInsightsOpen((v) => !v)}
+        />
+
         {/* Summary strip — quick stats. Only shown when there's data;
             empty state below covers the zero case. */}
         {stats.openCount > 0 && (
@@ -272,7 +334,7 @@ export default function LeadsPage() {
         {/* Empty state — nothing in any bucket. Soft tone because
             "no leads to chase" is also a perfectly normal "quiet
             week" state, not an error. */}
-        {stats.openCount === 0 && (
+        {stats.openCount === 0 && totalOpenUnfiltered === 0 && (
           <EmptyState
             icon={Inbox}
             title="No leads right now"
@@ -285,6 +347,19 @@ export default function LeadsPage() {
           />
         )}
 
+        {/* Filtered to a type that has no open leads — distinct from the
+            "no leads at all" state above; offer a one-tap way back. */}
+        {stats.openCount === 0 && totalOpenUnfiltered > 0 && (
+          <div className="rounded-xl border border-border bg-muted/30 px-4 py-6 text-center space-y-2">
+            <p className="text-sm text-muted-foreground">
+              No open <span className="font-medium text-foreground">{workFilter}</span> leads right now.
+            </p>
+            <Button variant="outline" size="sm" onClick={() => setWorkFilter('all')}>
+              Show all leads
+            </Button>
+          </div>
+        )}
+
         {/* Three sections — render order matches the natural funnel
             order (to quote → awaiting reply → new enquiries), but
             'To quote' is the visually-promoted bucket because it's
@@ -295,7 +370,7 @@ export default function LeadsPage() {
           iconClass="text-amber-600 bg-amber-50"
           title="To quote"
           subtitle="Site visit done — customer's waiting on a quote"
-          items={toQuote}
+          items={fToQuote}
           emptyHint={null /* hide when empty */}
           renderItem={(r) => (
             <LeadCard
@@ -315,7 +390,7 @@ export default function LeadsPage() {
           iconClass="text-emerald-600 bg-emerald-50"
           title="Visit booked"
           subtitle="Site visit scheduled — turn up, then quote"
-          items={visitBooked}
+          items={fVisitBooked}
           emptyHint={null}
           renderItem={(r) => (
             <LeadCard
@@ -335,15 +410,17 @@ export default function LeadsPage() {
           iconClass="text-blue-600 bg-blue-50"
           title="Quoted, awaiting reply"
           subtitle="Quote sent — chase if they go quiet"
-          items={awaitingReply}
+          items={fAwaitingReply}
           emptyHint={null}
           renderItem={(r) => (
             <LeadCard
               key={r.job.id}
               ranked={r}
               variant="awaiting-reply"
+              followUp={followUpByJob.get(r.job.id)}
               onMarkContacted={() => markContacted(r.job.id)}
               onBookVisit={() => setVisitForJob(r.job)}
+              onMarkLost={() => markLost(r.job.id)}
               onOpen={() => setOpenJob(r.job)}
             />
           )}
@@ -354,7 +431,7 @@ export default function LeadsPage() {
           iconClass="text-violet-600 bg-violet-50"
           title="New enquiries"
           subtitle="No site visit booked yet — book one to qualify"
-          items={newEnquiries}
+          items={fNewEnquiries}
           emptyHint={null}
           renderItem={(r) => (
             <LeadCard
@@ -420,8 +497,14 @@ interface LeadCardProps {
    * across all variants — only the primary changes.
    */
   variant?: 'to-quote' | 'awaiting-reply' | 'new-enquiry' | 'visit-booked';
+  /** Follow-up ladder stage for awaiting-reply cards (undefined = nothing
+   *  due right now). Drives the stage pill + the Mark lost action. */
+  followUp?: QuoteFollowUp;
   onMarkContacted: () => void;
   onBookVisit: () => void;
+  /** Mark the job lost (no reply). Only rendered when the follow-up
+   *  ladder reaches the 'close' stage. */
+  onMarkLost?: () => void;
   /** Open the inline 'Mark as quoted' sheet. Only meaningful for
    *  to-quote variant — others ignore it. Optional so existing
    *  awaiting-reply / new-enquiry callers don't have to pass it. */
@@ -433,10 +516,13 @@ interface LeadCardProps {
 }
 
 function LeadCard({
-  ranked, variant = 'awaiting-reply',
-  onMarkContacted, onBookVisit, onMarkQuoted, onOpen, bookedVisit,
+  ranked, variant = 'awaiting-reply', followUp,
+  onMarkContacted, onBookVisit, onMarkQuoted, onMarkLost, onOpen, bookedVisit,
 }: LeadCardProps) {
   const { job, daysSinceContact, temperature } = ranked;
+  // Two-tap Mark lost — first tap arms, second confirms. Fat-finger
+  // protection without a modal (5:30pm rule).
+  const [lostArmed, setLostArmed] = useState(false);
   const value = job.quoteAmount ?? job.estimatedValue;
   const sourceCfg = job.source ? SOURCE_PILL[job.source] : null;
   // 'To quote' rows: also show the promised delivery date as a
@@ -480,8 +566,24 @@ function LeadCard({
         {/* Pills row — source + value if we have either. Plus a
             quoteReadyBy chip on to-quote rows so Brad sees the
             promised delivery date inline. */}
-        {(sourceCfg || value || quoteReadyBy || bookedVisit) && (
+        {(sourceCfg || value || quoteReadyBy || bookedVisit || followUp) && (
           <div className="flex items-center gap-1.5 flex-wrap mt-2.5">
+            {followUp && (
+              <span
+                className={cn(
+                  'inline-flex items-center gap-1 px-2 py-0.5 rounded-md text-[11px] font-semibold',
+                  followUp.stage === 'first' && 'bg-amber-50 text-amber-700',
+                  followUp.stage === 'second' && 'bg-orange-50 text-orange-700',
+                  followUp.stage === 'close' && 'bg-red-50 text-red-700',
+                )}
+                title={`Quoted ${followUp.daysSinceSent} day${followUp.daysSinceSent === 1 ? '' : 's'} ago`}
+              >
+                <Send size={11} strokeWidth={2} />
+                {followUp.stage === 'first' && '1st follow-up due'}
+                {followUp.stage === 'second' && '2nd follow-up due'}
+                {followUp.stage === 'close' && 'No reply — mark lost?'}
+              </span>
+            )}
             {bookedVisit && (
               <span className="inline-flex items-center gap-1 px-2 py-0.5 rounded-md bg-emerald-50 text-[11px] text-emerald-700 font-medium">
                 <CalendarCheck size={11} strokeWidth={2} />
@@ -634,6 +736,29 @@ function LeadCard({
           >
             <MessageCircle size={12} strokeWidth={1.8} /> Mark contacted
           </button>
+          {followUp?.stage === 'close' && onMarkLost && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                if (!lostArmed) {
+                  setLostArmed(true);
+                  setTimeout(() => setLostArmed(false), 4000);
+                } else {
+                  onMarkLost();
+                }
+              }}
+              className={cn(
+                'flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-semibold transition-colors',
+                lostArmed
+                  ? 'bg-red-600 text-white'
+                  : 'text-red-700 bg-red-50 hover:bg-red-100',
+              )}
+              title="Mark this job as lost (no reply). Recoverable from the job detail."
+            >
+              <X size={12} strokeWidth={2} /> {lostArmed ? 'Sure?' : 'Mark lost'}
+            </button>
+          )}
           <button
             type="button"
             onClick={(e) => {

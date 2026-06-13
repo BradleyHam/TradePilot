@@ -58,6 +58,8 @@ const LOST_REASON_LABEL: Record<LostReason, string> = {
   'scope-changed':     'Scope changed',
   'project-cancelled': 'Project cancelled',
   'timing':            'Timing didn’t work',
+  'too-far':           'Too far away',
+  'wrong-fit':         'Not our kind of work',
   'other':             'Other',
 };
 

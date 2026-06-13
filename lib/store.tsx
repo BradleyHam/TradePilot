@@ -379,7 +379,7 @@ interface StoreState {
     outcome: {
       result: 'won' | 'lost' | 'unknown';
       /** Required when result='lost'. Maps to Job.lostReason. */
-      lostReason?: 'price' | 'no-reply' | 'went-elsewhere' | 'scope-changed' | 'project-cancelled' | 'timing' | 'other';
+      lostReason?: import('./types').LostReason;
       /** Free-form note for outcomeNotes on the job. */
       notes?: string;
     },
