@@ -257,7 +257,9 @@ export default function JobsPage() {
 
   function handleAddJob(data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) {
     addJob({
-      id: `job_${Date.now()}`,
+      // Real UUID — jobs.id is a uuid column, so a "job_123" temp id fails
+      // the insert with "invalid input syntax for type uuid".
+      id: crypto.randomUUID(),
       businessId: businessId ?? '',
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),

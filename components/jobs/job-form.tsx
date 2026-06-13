@@ -8,6 +8,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
+import { cn } from '@/lib/utils';
 
 const WORK_TYPES: { value: WorkType; label: string }[] = [
   { value: 'interior',   label: 'Interior'   },
@@ -38,6 +39,12 @@ interface JobFormProps {
   defaultValues?: Partial<Job>;
   onSave: (data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) => void;
   onCancel: () => void;
+  /**
+   * 'lead' trims the form to what's relevant when an enquiry first comes in —
+   * no quote amount, surface area, prep level, start date, or status picker
+   * (you haven't quoted or scheduled yet). 'job' (default) shows everything.
+   */
+  variant?: 'job' | 'lead';
 }
 
 // Defined at module scope — NOT inside JobForm. If these were redeclared on
@@ -63,7 +70,8 @@ function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   );
 }
 
-export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
+export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: JobFormProps) {
+  const isLead = variant === 'lead';
   const [name, setName] = useState(defaultValues?.name ?? '');
   const [clientName, setClientName] = useState(defaultValues?.clientName ?? '');
   const [clientPhone, setClientPhone] = useState(defaultValues?.clientPhone ?? '');
@@ -111,23 +119,29 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
         <Input placeholder="e.g. Smith Exterior Repaint" value={name} onChange={(e) => setName(e.target.value)} />
       </Field>
 
-      <div className="grid grid-cols-2 gap-3">
+      {isLead ? (
         <Field label="Client name *">
           <Input placeholder="Full name" value={clientName} onChange={(e) => setClientName(e.target.value)} />
         </Field>
-        <Field label="Status">
-          <Select value={status} onValueChange={(v) => setStatus(v as JobStatus)}>
-            <SelectTrigger className="h-9 text-sm">
-              <SelectValue />
-            </SelectTrigger>
-            <SelectContent>
-              {JOB_STATUSES.map((s) => (
-                <SelectItem key={s} value={s} className="capitalize">{s.replace('-', ' ')}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
-      </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Client name *">
+            <Input placeholder="Full name" value={clientName} onChange={(e) => setClientName(e.target.value)} />
+          </Field>
+          <Field label="Status">
+            <Select value={status} onValueChange={(v) => setStatus(v as JobStatus)}>
+              <SelectTrigger className="h-9 text-sm">
+                <SelectValue />
+              </SelectTrigger>
+              <SelectContent>
+                {JOB_STATUSES.map((s) => (
+                  <SelectItem key={s} value={s} className="capitalize">{s.replace('-', ' ')}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+        </div>
+      )}
 
       <div className="grid grid-cols-2 gap-3">
         <Field label="Phone">
@@ -170,7 +184,7 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
 
       {/* Scope — drives downstream $/m² benchmarks and win-rate stats.
           All optional; tap-and-skip if you don't have the data yet. */}
-      <div className="grid grid-cols-2 gap-3">
+      <div className={cn('grid gap-3', isLead ? 'grid-cols-1' : 'grid-cols-2')}>
         <Field label="Work type">
           {/*
             base-ui treats `value={undefined}` as uncontrolled. If we then
@@ -195,48 +209,60 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
             </SelectContent>
           </Select>
         </Field>
-        <Field label="Prep level">
-          <Select value={prepLevel || null} onValueChange={(v) => setPrepLevel((v ?? '') as PrepLevel | '')}>
-            <SelectTrigger className="h-9 text-sm">
-              <SelectValue placeholder="Pick one">
-                {(value) => {
-                  if (!value) return 'Pick one';
-                  return PREP_LEVELS.find((p) => p.value === value)?.label ?? 'Pick one';
-                }}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {PREP_LEVELS.map((p) => (
-                <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
-        </Field>
+        {!isLead && (
+          <Field label="Prep level">
+            <Select value={prepLevel || null} onValueChange={(v) => setPrepLevel((v ?? '') as PrepLevel | '')}>
+              <SelectTrigger className="h-9 text-sm">
+                <SelectValue placeholder="Pick one">
+                  {(value) => {
+                    if (!value) return 'Pick one';
+                    return PREP_LEVELS.find((p) => p.value === value)?.label ?? 'Pick one';
+                  }}
+                </SelectValue>
+              </SelectTrigger>
+              <SelectContent>
+                {PREP_LEVELS.map((p) => (
+                  <SelectItem key={p.value} value={p.value}>{p.label}</SelectItem>
+                ))}
+              </SelectContent>
+            </Select>
+          </Field>
+        )}
       </div>
 
-      <Field label="Surface area (m²)">
-        <Input
-          type="number"
-          inputMode="decimal"
-          step="0.5"
-          placeholder="e.g. 165"
-          value={surfaceAreaM2}
-          onChange={(e) => setSurfaceAreaM2(e.target.value)}
-        />
-      </Field>
+      {!isLead && (
+        <Field label="Surface area (m²)">
+          <Input
+            type="number"
+            inputMode="decimal"
+            step="0.5"
+            placeholder="e.g. 165"
+            value={surfaceAreaM2}
+            onChange={(e) => setSurfaceAreaM2(e.target.value)}
+          />
+        </Field>
+      )}
 
-      <div className="grid grid-cols-2 gap-3">
+      {isLead ? (
         <Field label="Estimated value ($)">
-          <Input type="number" inputMode="numeric" placeholder="0" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} />
+          <Input type="number" inputMode="numeric" placeholder="Rough ballpark, optional" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} />
         </Field>
-        <Field label="Quote amount ($)">
-          <Input type="number" inputMode="numeric" placeholder="0" value={quoteAmount} onChange={(e) => setQuoteAmount(e.target.value)} />
-        </Field>
-      </div>
+      ) : (
+        <div className="grid grid-cols-2 gap-3">
+          <Field label="Estimated value ($)">
+            <Input type="number" inputMode="numeric" placeholder="0" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} />
+          </Field>
+          <Field label="Quote amount ($)">
+            <Input type="number" inputMode="numeric" placeholder="0" value={quoteAmount} onChange={(e) => setQuoteAmount(e.target.value)} />
+          </Field>
+        </div>
+      )}
 
-      <Field label="Start date">
-        <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
-      </Field>
+      {!isLead && (
+        <Field label="Start date">
+          <Input type="date" value={startDate} onChange={(e) => setStartDate(e.target.value)} />
+        </Field>
+      )}
 
       <Field label="Notes">
         <Textarea
@@ -255,7 +281,7 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
           onClick={handleSave}
           disabled={!name.trim() || !clientName.trim()}
         >
-          Save Job
+          {isLead ? 'Save lead' : 'Save Job'}
         </Button>
       </div>
     </div>
