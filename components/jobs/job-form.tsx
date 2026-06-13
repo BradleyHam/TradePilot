@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Job, JobStatus, WorkType, PrepLevel } from '@/lib/types';
+import { Job, JobStatus, WorkType, PrepLevel, LeadSource } from '@/lib/types';
 import { JOB_STATUSES } from '@/lib/mock-data';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -23,6 +23,15 @@ const PREP_LEVELS: { value: PrepLevel; label: string }[] = [
   { value: 'medium',     label: 'Medium'     },
   { value: 'heavy',      label: 'Heavy'      },
   { value: 'full-strip', label: 'Full strip' },
+];
+
+const SOURCES: { value: LeadSource; label: string }[] = [
+  { value: 'phone',    label: 'Phone'        },
+  { value: 'referral', label: 'Referral'     },
+  { value: 'website',  label: 'Website'      },
+  { value: 'email',    label: 'Email'        },
+  { value: 'gmb',      label: 'Google'       },
+  { value: 'manual',   label: 'Other'        },
 ];
 
 interface JobFormProps {
@@ -70,6 +79,10 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
   const [workType, setWorkType] = useState<WorkType | ''>(defaultValues?.workType ?? '');
   const [surfaceAreaM2, setSurfaceAreaM2] = useState(defaultValues?.surfaceAreaM2?.toString() ?? '');
   const [prepLevel, setPrepLevel] = useState<PrepLevel | ''>(defaultValues?.prepLevel ?? '');
+  // Lead provenance — when the enquiry came in (drives the Leads per-week/month
+  // trend) and where from (the source pill + by-source insights).
+  const [leadDate, setLeadDate] = useState(defaultValues?.leadDate ?? '');
+  const [source, setSource] = useState<LeadSource | ''>(defaultValues?.source ?? '');
 
   function handleSave() {
     if (!name.trim() || !clientName.trim()) return;
@@ -83,6 +96,8 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
       estimatedValue: estimatedValue ? parseFloat(estimatedValue) : undefined,
       quoteAmount: quoteAmount ? parseFloat(quoteAmount) : undefined,
       startDate: startDate || undefined,
+      leadDate: leadDate || undefined,
+      source: source || undefined,
       notes: notes || undefined,
       workType: workType || undefined,
       surfaceAreaM2: surfaceAreaM2 ? parseFloat(surfaceAreaM2) : undefined,
@@ -126,6 +141,32 @@ export function JobForm({ defaultValues, onSave, onCancel }: JobFormProps) {
       <Field label="Location">
         <Input placeholder="Street address" value={location} onChange={(e) => setLocation(e.target.value)} />
       </Field>
+
+      {/* Lead provenance — when it came in + where from. Especially useful
+          for leads added by hand (phone / walk-in) so they slot into the
+          Leads trend on the right week and carry a source. */}
+      <div className="grid grid-cols-2 gap-3">
+        <Field label="Lead came in">
+          <Input type="date" value={leadDate} onChange={(e) => setLeadDate(e.target.value)} />
+        </Field>
+        <Field label="Source">
+          <Select value={source || null} onValueChange={(v) => setSource((v ?? '') as LeadSource | '')}>
+            <SelectTrigger className="h-9 text-sm">
+              <SelectValue placeholder="Pick one">
+                {(value) => {
+                  if (!value) return 'Pick one';
+                  return SOURCES.find((s) => s.value === value)?.label ?? 'Pick one';
+                }}
+              </SelectValue>
+            </SelectTrigger>
+            <SelectContent>
+              {SOURCES.map((s) => (
+                <SelectItem key={s.value} value={s.value}>{s.label}</SelectItem>
+              ))}
+            </SelectContent>
+          </Select>
+        </Field>
+      </div>
 
       {/* Scope — drives downstream $/m² benchmarks and win-rate stats.
           All optional; tap-and-skip if you don't have the data yet. */}

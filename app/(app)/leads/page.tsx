@@ -36,13 +36,15 @@ import { LeadInsights } from '@/components/leads/lead-insights';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { JobDetailSheet } from '@/components/jobs/job-detail-sheet';
+import { JobForm } from '@/components/jobs/job-form';
 import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
+import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 import {
   Phone, Mail, MapPin, MessageCircle, Sparkles, Snowflake, Flame, Clock,
   ChevronRight, Globe, Search, UserPlus, Inbox, CalendarPlus, CalendarDays,
-  CalendarCheck, FileText, Send, X,
+  CalendarCheck, FileText, Send, X, Plus,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
@@ -92,8 +94,11 @@ const SOURCE_PILL: Record<LeadSource, { label: string; Icon: typeof Globe } | nu
 };
 
 export default function LeadsPage() {
-  const { jobs, updateJob, scheduleItems, quotes } = useStore();
+  const { jobs, updateJob, addJob, businessId, scheduleItems, quotes } = useStore();
   const [openJob, setOpenJob] = useState<Job | null>(null);
+  // Manual "Add lead" sheet — for enquiries that didn't come in via the
+  // website form or Tapi (phone, walk-in, referral).
+  const [showAddLead, setShowAddLead] = useState(false);
   // When set, the BookVisitSheet opens for this lead.
   const [visitForJob, setVisitForJob] = useState<Job | null>(null);
   // When set, the MarkAsQuotedSheet opens for this lead — shortcut
@@ -276,6 +281,17 @@ export default function LeadsPage() {
     updateJob(jobId, { lastContactedDate: new Date().toISOString() });
   }
 
+  function handleAddLead(data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) {
+    addJob({
+      id: `job_${Date.now()}`,
+      businessId: businessId ?? '',
+      createdAt: new Date().toISOString(),
+      updatedAt: new Date().toISOString(),
+      ...data,
+    });
+    setShowAddLead(false);
+  }
+
   function markLost(jobId: string) {
     // Close the loop on a quote that never got a reply. Only offered
     // when the follow-up ladder says the lead is dead (a week of
@@ -292,6 +308,11 @@ export default function LeadsPage() {
           stats.openCount === 0
             ? 'No open leads right now'
             : `${stats.openCount} open · ${formatNZD(stats.pipelineValue)} pipeline`
+        }
+        action={
+          <Button size="sm" className="bg-primary h-9" onClick={() => setShowAddLead(true)}>
+            <Plus size={16} className="mr-1" /> Add lead
+          </Button>
         }
       />
 
@@ -446,6 +467,22 @@ export default function LeadsPage() {
           )}
         />
       </div>
+
+      {/* Add a lead by hand — for enquiries that didn't arrive via the
+          website form or Tapi (phone, walk-in, referral). Reuses the shared
+          JobForm with lead-friendly defaults (status = lead, today's date). */}
+      <Sheet open={showAddLead} onOpenChange={setShowAddLead}>
+        <SheetContent side="bottom" className="h-[92vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
+          <SheetHeader className="pb-4">
+            <SheetTitle>New lead</SheetTitle>
+          </SheetHeader>
+          <JobForm
+            defaultValues={{ status: 'lead', leadDate: todayISO }}
+            onSave={handleAddLead}
+            onCancel={() => setShowAddLead(false)}
+          />
+        </SheetContent>
+      </Sheet>
 
       {/* Reuse the existing job sheet for full detail. Keeps the leads
           page focused on the chase action without re-implementing the
