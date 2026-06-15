@@ -357,6 +357,86 @@ and asserts create → dedup → new-address → skip-non-quote → bad-secret.
 
 ---
 
+## Inbound email lead webhook (Gmail → CloudMailin → Trade Pilot)
+
+The route at `app/api/webhooks/inbound-email-lead/route.ts` turns a
+**forwarded customer enquiry** — one that did NOT come via the website
+contact form or Tapi — into a `lead`-status job with `source = 'email'`.
+Same transport as the inbound-bill / inbound-tapi-lead pipelines:
+
+```
+Customer emails Lakeside directly (or Brad gets a referral)
+  → Brad forwards the email to the email-lead CloudMailin address
+    (or a Gmail filter auto-forwards it)
+  → CloudMailin POSTs the email JSON to /api/webhooks/inbound-email-lead
+  → route authenticates, LLM-parses the email, inserts a lead
+  → lead appears in Jobs → Leads next time the app loads
+```
+
+**Parsing is LLM-based — deliberately unlike Tapi.** `lib/email-lead-parser.ts`
+calls `claude-haiku-4-5` (via `ANTHROPIC_API_KEY`, same model + retry policy
+as the bill parser) with an `emit_lead` tool. Forwarded human emails have no
+consistent format and Gmail buries the real enquirer's details inside the
+body (the envelope `from` becomes Brad's own inbox), so a regex parser like
+Tapi's would be brittle. The model extracts the **customer's** name / email /
+phone / address / job type, a one-line `summary` for the job title, and a
+cleaned `message`. Fields it can't find are omitted, never guessed.
+
+**Over-capture on purpose.** The parser returns `looksLikeLead`, biased
+towards `true`: a missed enquiry is a lost customer (real money), a junk lead
+takes two seconds to delete. The route only **skips** (200 + `{skipped:true,
+reason:'not-a-lead'}`) when the model is confident it's a newsletter /
+receipt / supplier invoice / automated notice / spam — so a Gmail filter or a
+stray forward can't spam the Leads tab.
+
+**Never-drop-a-lead fallback.** If the parser THROWS (e.g. Anthropic outage),
+the route does NOT 5xx and risk the enquiry vanishing — it inserts a minimal
+"needs review" lead carrying the raw subject + a body snippet in `notes`
+(`buildFallbackLead`). Mirrors the inbound-bill route's "nothing silently
+disappears" principle. A 200 in that case still stops CloudMailin retrying.
+
+**Lead fields.** `name` = `summary` → `{job type} — {short address}` →
+`{job type}` → `Email lead — {name}` → `Email lead`. `client_name` = parsed
+contact name → display name off the From header → `Email enquiry` (the column
+is NOT NULL). `client_email` / `client_phone` = the customer's, validated
+(email regex, phone needs ≥6 digits). `location` = the property address.
+`notes` = the customer's message + a "Lead contact:" line + the email subject
++ "Forwarded via:" (only when it differs from the captured lead email) + a
+low-confidence ⚠ flag when the parse was shaky.
+
+**`source = 'email'`** is a first-class `LeadSource` (already in the union in
+`lib/types.ts` and migration `003_lead_source.sql`), so unlike Tapi leads
+these render with a proper source pill out of the box — no follow-up UI work
+needed.
+
+**Dedup.** Content-based, no schema change (jobs has no `source_message_id`):
+within the last 7 days, a new email lead is a dupe if it shares a `client_email`
+with a recent `source='email'` lead, OR the same normalised `name`+`location`
+key. Catches CloudMailin retries / double-forwards; a genuine re-enquiry weeks
+later still comes through.
+
+**Env vars (Vercel AND `.env.local`):**
+- `EMAIL_LEAD_WEBHOOK_SECRET` — shared secret. `x-webhook-secret` header OR
+  basic-auth in the URL (`https://anything:<secret>@host/...`), same dual
+  scheme as the other two webhooks (free-tier CloudMailin can't set headers).
+- `ANTHROPIC_API_KEY` — the parser needs it (already set for the bill parser).
+- Reuses `TRADEPILOT_BUSINESS_ID`, `NEXT_PUBLIC_SUPABASE_URL`,
+  `SUPABASE_SERVICE_ROLE_KEY`.
+
+**CloudMailin → webhook URL.** `https://anything:<EMAIL_LEAD_WEBHOOK_SECRET>@<your-vercel-domain>/api/webhooks/inbound-email-lead`.
+The username before the colon is ignored — only the password (the secret) is
+matched. Use a SEPARATE CloudMailin address from the bill + Tapi ones so each
+address maps cleanly to one route.
+
+**Smoke test.** `npx tsx scripts/test-inbound-email-lead.ts` POSTs
+forwarded-enquiry payloads at the dev server (or prod via
+`INBOUND_EMAIL_ENDPOINT`) and asserts create → dedup → different-lead →
+skip-newsletter → bad-secret. Note: parsing is the live model, so the
+create/skip assertions depend on its judgement (sample emails are written to
+be unambiguous).
+
+---
+
 ## Brad's tax structure (confirmed April 2026)
 
 This is the source of truth for Brad's tax position. Update this section whenever something changes — every other tax-related decision in the app and in conversations should be consistent with what's written here.
