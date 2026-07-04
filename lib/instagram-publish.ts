@@ -222,20 +222,36 @@ async function fetchPermalink(mediaId: string, token: string): Promise<string | 
  */
 export async function postJobToInstagram(
   jobId: string,
-  opts: { caption?: string; photoAttachmentIds?: string[] } = {},
+  opts: {
+    caption?: string;
+    photoAttachmentIds?: string[];
+    /**
+     * attachmentId → temp storage path of a pre-labelled JPEG (BEFORE/AFTER
+     * pill burned in client-side). When present for a chosen photo, the
+     * override bytes are posted instead of the original attachment.
+     */
+    photoOverrides?: Record<string, string>;
+  } = {},
 ): Promise<InstagramPostResult> {
   const token = requireToken();
   assertSipsAvailable();
   const igId = await resolveIgAccountId(token);
 
-  const { job, before, after, process: processImgs, marketing } = await loadJobMarketingContext(jobId);
+  const { job, before, after, process: processImgs, testimonial, marketing } = await loadJobMarketingContext(jobId);
 
   const caption = (opts.caption ?? marketing?.instagram?.caption ?? '').trim();
   if (!caption) throw new Error('Add a caption before posting to Instagram.');
 
   const afterImgs = after.filter(isImageAttachment);
   const beforeImgs = before.filter(isImageAttachment);
-  const allImages = [...afterImgs, ...beforeImgs, ...processImgs.filter(isImageAttachment)];
+  // Testimonial cards join the id-resolvable pool (mirrors facebook-publish);
+  // the no-explicit-selection default below still leads with after photos.
+  const allImages = [
+    ...testimonial.filter(isImageAttachment),
+    ...afterImgs,
+    ...beforeImgs,
+    ...processImgs.filter(isImageAttachment),
+  ];
   const byId = new Map(allImages.map((a) => [a.id, a]));
 
   let chosen: QuoteAttachment[];
@@ -256,6 +272,17 @@ export async function postJobToInstagram(
   // Download + normalise everything first so a bad photo fails the whole post
   // before anything is half-published.
   const jpgs = await Promise.all(chosen.map(async (att) => {
+    const override = opts.photoOverrides?.[att.id];
+    if (override) {
+      // Labelled temp copies must live under this business's prefix — never
+      // fetch arbitrary bucket paths on behalf of the client.
+      if (!override.startsWith(`${job.businessId}/`)) {
+        throw new Error('Invalid labelled-photo path.');
+      }
+      const { data, error } = await supabaseAdmin.storage.from(STORAGE_BUCKET).download(override);
+      if (error || !data) throw new Error(`Download failed for ${override}: ${error?.message ?? 'no data'}`);
+      return toInstagramJpeg(Buffer.from(await data.arrayBuffer()), '.jpg');
+    }
     const ext = path.extname(att.fileName ?? att.storagePath).toLowerCase();
     const buf = await downloadAttachment(att);
     return toInstagramJpeg(buf, ext);

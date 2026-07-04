@@ -130,6 +130,17 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const [prepWithAIOpen, setPrepWithAIOpen] = useState(false);
   // Book-a-site-visit sheet, opened from the lead-stage action strip.
   const [bookVisitOpen, setBookVisitOpen] = useState(false);
+  // Inline rename of the job title in the header. Self-contained editor;
+  // reset whenever the sheet switches to a different job so a half-finished
+  // rename on job A doesn't carry over to job B. Done during render (React's
+  // recommended "adjust state when a prop changes" pattern) instead of an
+  // effect, which would trigger a cascading render.
+  const [renaming, setRenaming] = useState(false);
+  const [renameJobId, setRenameJobId] = useState(job?.id);
+  if (job?.id !== renameJobId) {
+    setRenameJobId(job?.id);
+    setRenaming(false);
+  }
 
   if (!job) return null;
 
@@ -263,21 +274,45 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               style={{ paddingTop: 'max(env(safe-area-inset-top), 1rem)' }}
             >
               <div className="flex items-start justify-between gap-3">
-                <SheetTitle className="text-lg font-bold leading-tight text-left flex-1 min-w-0">
-                  {liveJob.name}
-                </SheetTitle>
-                <Select value={liveJob.status} onValueChange={handleStatusChange}>
-                  <SelectTrigger className="h-9 text-sm w-36 shrink-0">
-                    <SelectValue />
-                  </SelectTrigger>
-                  <SelectContent>
-                    {JOB_STATUSES.map((s) => (
-                      <SelectItem key={s} value={s} className="capitalize">
-                        {s.replace('-', ' ')}
-                      </SelectItem>
-                    ))}
-                  </SelectContent>
-                </Select>
+                {renaming ? (
+                  // Edit mode takes the full row width (status dropdown is
+                  // hidden while renaming so the long Tapi-style names have
+                  // room to wrap).
+                  <JobNameEditor
+                    name={liveJob.name}
+                    onSave={(next) => { updateJob(liveJob.id, { name: next }); setRenaming(false); }}
+                    onCancel={() => setRenaming(false)}
+                  />
+                ) : (
+                  <>
+                    <div className="flex-1 min-w-0 flex items-start gap-1">
+                      <SheetTitle className="text-lg font-bold leading-tight text-left min-w-0">
+                        {liveJob.name}
+                      </SheetTitle>
+                      <button
+                        type="button"
+                        onClick={() => setRenaming(true)}
+                        aria-label="Rename job"
+                        title="Rename job"
+                        className="shrink-0 -mr-1 mt-0.5 inline-flex h-9 w-9 items-center justify-center rounded-lg text-muted-foreground/70 hover:text-primary hover:bg-muted/60 transition-colors"
+                      >
+                        <Edit3 size={15} strokeWidth={2} />
+                      </button>
+                    </div>
+                    <Select value={liveJob.status} onValueChange={handleStatusChange}>
+                      <SelectTrigger className="h-9 text-sm w-36 shrink-0">
+                        <SelectValue />
+                      </SelectTrigger>
+                      <SelectContent>
+                        {JOB_STATUSES.map((s) => (
+                          <SelectItem key={s} value={s} className="capitalize">
+                            {s.replace('-', ' ')}
+                          </SelectItem>
+                        ))}
+                      </SelectContent>
+                    </Select>
+                  </>
+                )}
               </div>
             </div>
           </div>
@@ -1006,6 +1041,69 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         onClose={() => setReviewInvoiceOpen(false)}
       />
     </Sheet>
+  );
+}
+
+/**
+ * Inline editor for the job's name (title), shown in the sheet header when
+ * Brad taps the pencil. A textarea (not a single-line input) because job
+ * names can be long — e.g. the Tapi "Please provide a quote…" subjects.
+ *
+ * - Enter saves, Shift+Enter inserts a newline, Escape cancels.
+ * - Empty or unchanged input is treated as a cancel: we never blank out a
+ *   job's name (every other view keys off it).
+ * - Keeps a visually-hidden SheetTitle mounted so the dialog retains its
+ *   accessible name while the visible UI is the editor.
+ */
+function JobNameEditor({
+  name, onSave, onCancel,
+}: {
+  name: string;
+  onSave: (next: string) => void;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState(name);
+
+  function save() {
+    const trimmed = draft.trim();
+    // Never allow an empty name, and skip the write if nothing changed.
+    if (!trimmed || trimmed === name.trim()) {
+      onCancel();
+      return;
+    }
+    onSave(trimmed);
+  }
+
+  return (
+    <div className="w-full space-y-2">
+      <SheetTitle className="sr-only">{name}</SheetTitle>
+      <Textarea
+        value={draft}
+        onChange={(e) => setDraft(e.target.value)}
+        rows={2}
+        autoFocus
+        // Put the caret at the end rather than selecting all, so a quick
+        // tweak to the end of a long name doesn't wipe it on first keypress.
+        onFocus={(e) => {
+          const v = e.currentTarget.value;
+          e.currentTarget.setSelectionRange(v.length, v.length);
+        }}
+        onKeyDown={(e) => {
+          if (e.key === 'Enter' && !e.shiftKey) { e.preventDefault(); save(); }
+          else if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+        }}
+        placeholder="Job name"
+        className="text-base font-bold leading-tight resize-y min-h-[3rem]"
+      />
+      <div className="flex gap-2">
+        <Button variant="outline" size="sm" className="flex-1" onClick={onCancel}>
+          Cancel
+        </Button>
+        <Button size="sm" className="flex-1 bg-primary" onClick={save}>
+          Save name
+        </Button>
+      </div>
+    </div>
   );
 }
 
@@ -2338,6 +2436,17 @@ function JobAttachmentsList({
           </Button>
         </div>
 
+        {/* Persistent drag hint. The empty-state message below already
+            invites a drop, but it disappears once the section has any
+            files — so on a job that already has (say) a quote PDF, the
+            block looks click-only. This keeps the drag affordance
+            visible whenever there's existing content. */}
+        {jobAttachments.length > 0 && (
+          <p className="text-[11px] text-muted-foreground mb-2">
+            Drag files anywhere in here to add them, or tap <strong>Add files</strong>. Plans, PDFs and photos welcome.
+          </p>
+        )}
+
         <input
           ref={fileInputRef}
           type="file"
@@ -2407,7 +2516,7 @@ function JobAttachmentsList({
           </div>
         ) : staged.length === 0 ? (
           <p className="text-xs text-muted-foreground mb-3">
-            Nothing attached yet. Drag &amp; drop your <strong>quote</strong>, <strong>invoice</strong>, plans or photos here — or tap <strong>Add files</strong>. PDFs and images welcome.
+            Nothing attached yet. Drag &amp; drop your <strong>quote</strong>, <strong>invoice</strong>, plans or photos here, or tap <strong>Add files</strong>. PDFs and images welcome.
           </p>
         ) : null}
 
@@ -2543,6 +2652,7 @@ function kindLabel(kind: QuoteAttachment['kind']): string {
     case 'after_photo': return 'After';
     case 'process_photo': return 'Progress';
     case 'scope_photo': return 'Scope photos';
+    case 'testimonial_image': return 'Testimonial card';
     case 'quote_pdf': return 'Quote PDF';
     case 'other': return 'Other';
   }

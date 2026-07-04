@@ -71,9 +71,9 @@ function isImageAttachment(a: QuoteAttachment): boolean {
   return IMAGE_EXTS.has(path.extname(name));
 }
 
-async function downloadAttachment(att: QuoteAttachment): Promise<Buffer> {
-  const { data, error } = await supabaseAdmin.storage.from(STORAGE_BUCKET).download(att.storagePath);
-  if (error || !data) throw new Error(`Download failed for ${att.storagePath}: ${error?.message ?? 'no data'}`);
+async function downloadPath(storagePath: string): Promise<Buffer> {
+  const { data, error } = await supabaseAdmin.storage.from(STORAGE_BUCKET).download(storagePath);
+  if (error || !data) throw new Error(`Download failed for ${storagePath}: ${error?.message ?? 'no data'}`);
   return Buffer.from(await data.arrayBuffer());
 }
 
@@ -136,19 +136,36 @@ function jpegBlob(buf: Buffer): Blob {
  */
 export async function postJobToFacebook(
   jobId: string,
-  opts: { caption?: string; photoAttachmentIds?: string[] } = {},
+  opts: {
+    caption?: string;
+    photoAttachmentIds?: string[];
+    /**
+     * attachmentId → temp storage path of a pre-labelled JPEG (BEFORE/AFTER
+     * pill burned in client-side). When present for a chosen photo, the
+     * override bytes are posted instead of the original attachment.
+     */
+    photoOverrides?: Record<string, string>;
+  } = {},
 ): Promise<FacebookPostResult> {
   const { pageId, token } = requireEnv();
   assertSipsAvailable();
 
-  const { job, before, after, process: processImgs, marketing } = await loadJobMarketingContext(jobId);
+  const { job, before, after, process: processImgs, testimonial, marketing } = await loadJobMarketingContext(jobId);
 
   const caption = (opts.caption ?? marketing?.facebook?.caption ?? '').trim();
   if (!caption) throw new Error('Add a caption before posting to Facebook.');
 
   const afterImgs = after.filter(isImageAttachment);
   const beforeImgs = before.filter(isImageAttachment);
-  const allImages = [...afterImgs, ...beforeImgs, ...processImgs.filter(isImageAttachment)];
+  // Testimonial cards join the id-resolvable pool so an explicitly chosen
+  // card isn't silently dropped; the no-explicit-selection default below
+  // still leads with after photos.
+  const allImages = [
+    ...testimonial.filter(isImageAttachment),
+    ...afterImgs,
+    ...beforeImgs,
+    ...processImgs.filter(isImageAttachment),
+  ];
   const byId = new Map(allImages.map((a) => [a.id, a]));
 
   let chosen: QuoteAttachment[];
@@ -169,8 +186,17 @@ export async function postJobToFacebook(
   // Download + normalise every photo to JPEG before any upload, so a bad photo
   // fails the whole post before we've half-published an album.
   const jpgs = await Promise.all(chosen.map(async (att) => {
+    const override = opts.photoOverrides?.[att.id];
+    if (override) {
+      // Labelled temp copies must live under this business's prefix — never
+      // fetch arbitrary bucket paths on behalf of the client.
+      if (!override.startsWith(`${job.businessId}/`)) {
+        throw new Error('Invalid labelled-photo path.');
+      }
+      return toJpegBytes(await downloadPath(override), '.jpg');
+    }
     const ext = path.extname(att.fileName ?? att.storagePath).toLowerCase();
-    const buf = await downloadAttachment(att);
+    const buf = await downloadPath(att.storagePath);
     return toJpegBytes(buf, ext);
   }));
 

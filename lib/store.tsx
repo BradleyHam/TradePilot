@@ -152,7 +152,15 @@ interface StoreState {
   deleteScheduleItem: (id: string) => void;
 
   // Invoice mutators
-  addInvoice: (invoice: Invoice) => void;
+  /**
+   * Optimistically insert an invoice, then persist it. Resolves with the
+   * persisted invoice (carrying its real Supabase UUID) once the row comes
+   * back, or `null` if the insert failed (the optimistic row is rolled back
+   * in that case). Await the result before chaining anything that references
+   * the invoice by id — e.g. markInvoicePaid — so you never hit the DB with
+   * the temporary `inv_…` client id.
+   */
+  addInvoice: (invoice: Invoice) => Promise<Invoice | null>;
   updateInvoice: (id: string, updates: Partial<Invoice>) => void;
 
   // Bank-transaction mutators
@@ -316,8 +324,8 @@ interface StoreState {
    */
   addQuoteAttachments: (
     quoteId: string,
-    files: { file: File; kind: QuoteAttachmentKind }[],
-  ) => Promise<{ inserted: number; failed: number }>;
+    files: { file: File; kind: QuoteAttachmentKind; skipCompression?: boolean }[],
+  ) => Promise<{ inserted: number; failed: number; ids: string[] }>;
 
   /**
    * Returns an existing quote on the given job, or creates a minimal
@@ -447,7 +455,7 @@ interface StoreState {
    */
   saveJobMarketing: (
     jobId: string,
-    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook' | 'instagram'>>,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'excludedImageIds' | 'review' | 'facebook' | 'instagram'>>,
   ) => Promise<{ ok: boolean; error?: string }>;
 
   // Re-fetch everything from Supabase (useful after a write succeeds).
@@ -1298,17 +1306,23 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
    */
   const addQuoteAttachments = useCallback(async (
     quoteId: string,
-    files: { file: File; kind: QuoteAttachmentKind }[],
-  ): Promise<{ inserted: number; failed: number }> => {
-    if (!businessId || files.length === 0) return { inserted: 0, failed: 0 };
+    files: { file: File; kind: QuoteAttachmentKind; skipCompression?: boolean }[],
+  ): Promise<{ inserted: number; failed: number; ids: string[] }> => {
+    if (!businessId || files.length === 0) return { inserted: 0, failed: 0, ids: [] };
 
     let inserted = 0;
     let failed = 0;
+    const ids: string[] = [];
 
-    for (const { file, kind } of files) {
+    for (const { file, kind, skipCompression } of files) {
       try {
-        // Compress images. Non-images pass through unchanged.
-        const { file: prepared, originalSize, compressedSize, skipped } = await compressImage(file);
+        // Compress images. Non-images pass through unchanged. Callers can
+        // opt out (skipCompression) for images that are already optimally
+        // encoded — e.g. the generated testimonial card, a flat-colour PNG
+        // that JPEG re-encoding would only smear.
+        const { file: prepared, originalSize, compressedSize, skipped } = skipCompression
+          ? { file, originalSize: file.size, compressedSize: file.size, skipped: true }
+          : await compressImage(file);
         if (!skipped && originalSize > 0) {
           const savedPct = Math.round((1 - compressedSize / originalSize) * 100);
           console.info(`[addQuoteAttachments] compressed ${file.name}: ${(originalSize / 1024).toFixed(0)}KB → ${(compressedSize / 1024).toFixed(0)}KB (-${savedPct}%)`);
@@ -1353,6 +1367,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
         const persisted = rowToQuoteAttachment(insData);
         setQuoteAttachments((prev) => [persisted, ...prev]);
+        ids.push(persisted.id);
         inserted++;
       } catch (err) {
         console.error('[addQuoteAttachments] unexpected error for', file.name, err);
@@ -1363,7 +1378,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (failed > 0) {
       setError(`${failed} of ${files.length} uploads failed — check console for details.`);
     }
-    return { inserted, failed };
+    return { inserted, failed, ids };
   }, [businessId]);
 
   /**
@@ -2326,27 +2341,34 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     }
   }, [updateJob]);
 
-  const addInvoice = useCallback((invoice: Invoice) => {
+  const addInvoice = useCallback(async (invoice: Invoice): Promise<Invoice | null> => {
     if (!businessId) {
       console.warn('[store] addInvoice called with no businessId; ignoring');
-      return;
+      return null;
     }
+    // Optimistic insert runs synchronously (before the first await) so the
+    // invoice shows up in the UI immediately, exactly as before.
     setInvoices((prev) => [invoice, ...prev]);
     const tempId = invoice.id;
-    (async () => {
-      const row = invoiceToRow({ ...invoice, businessId });
-      const { data, error: insErr } = await supabase
-        .from('invoices').insert(row).select('*').single();
-      if (insErr || !data) {
-        console.error('[store] addInvoice failed:', insErr);
-        setError(insErr?.message ?? 'Failed to save invoice');
-        setInvoices((prev) => prev.filter((i) => i.id !== tempId));
-        return;
-      }
-      const persisted = rowToInvoice(data);
-      setInvoices((prev) => prev.map((i) => (i.id === tempId ? persisted : i)));
-      maybeAdvanceJobStatus(invoice.jobId);
-    })();
+
+    const row = invoiceToRow({ ...invoice, businessId });
+    const { data, error: insErr } = await supabase
+      .from('invoices').insert(row).select('*').single();
+    if (insErr || !data) {
+      console.error('[store] addInvoice failed:', insErr);
+      setError(insErr?.message ?? 'Failed to save invoice');
+      setInvoices((prev) => prev.filter((i) => i.id !== tempId));
+      return null;
+    }
+    // Swap the temp client id ('inv_…') for the persisted row, which carries
+    // the real Supabase UUID. Returning it lets callers chain id-dependent
+    // work (e.g. markInvoicePaid) against the real id rather than the temp
+    // one — the temp id is not a valid UUID and a DB update keyed on it
+    // fails with Postgres 22P02.
+    const persisted = rowToInvoice(data);
+    setInvoices((prev) => prev.map((i) => (i.id === tempId ? persisted : i)));
+    maybeAdvanceJobStatus(invoice.jobId);
+    return persisted;
   }, [businessId, maybeAdvanceJobStatus]);
 
   const updateInvoice = useCallback((id: string, updates: Partial<Invoice>) => {
@@ -2849,6 +2871,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         heroMode: parsed.heroMode,
         heroBeforeId: parsed.heroBeforeId,
         heroAfterId: parsed.heroAfterId,
+        excludedImageIds: Array.isArray(parsed.excludedImageIds) ? parsed.excludedImageIds : undefined,
+        review: parsed.review?.quote ? parsed.review : undefined,
         facebook: parsed.facebook,
         instagram: parsed.instagram,
         updatedAt: parsed.updatedAt ?? row.updatedAt,
@@ -2861,7 +2885,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const saveJobMarketing = useCallback(async (
     jobId: string,
-    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'facebook' | 'instagram'>>,
+    updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'excludedImageIds' | 'review' | 'facebook' | 'instagram'>>,
   ): Promise<{ ok: boolean; error?: string }> => {
     if (!businessId) {
       return { ok: false, error: 'No business loaded — try refreshing.' };
@@ -2887,6 +2911,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       heroMode: updates.heroMode !== undefined ? updates.heroMode : prevData.heroMode,
       heroBeforeId: updates.heroBeforeId !== undefined ? updates.heroBeforeId : prevData.heroBeforeId,
       heroAfterId: updates.heroAfterId !== undefined ? updates.heroAfterId : prevData.heroAfterId,
+      excludedImageIds: updates.excludedImageIds !== undefined ? updates.excludedImageIds : prevData.excludedImageIds,
+      // `'review' in updates` (not !== undefined) so passing review: undefined
+      // explicitly CLEARS a previously-saved review rather than keeping it.
+      review: 'review' in updates ? updates.review : prevData.review,
       facebook: updates.facebook !== undefined ? updates.facebook : prevData.facebook,
       instagram: updates.instagram !== undefined ? updates.instagram : prevData.instagram,
       updatedAt: now,

@@ -36,7 +36,7 @@ export async function POST(req: Request) {
   const auth = await verifyBearer(req);
   if (!auth.ok) return NextResponse.json({ ok: false, error: auth.error }, { status: auth.status });
 
-  let body: { jobId?: unknown; caption?: unknown; photoAttachmentIds?: unknown };
+  let body: { jobId?: unknown; caption?: unknown; photoAttachmentIds?: unknown; photoOverrides?: unknown };
   try {
     body = (await req.json()) as typeof body;
   } catch {
@@ -48,9 +48,17 @@ export async function POST(req: Request) {
   const photoAttachmentIds = Array.isArray(body.photoAttachmentIds)
     ? body.photoAttachmentIds.filter((x): x is string => typeof x === 'string')
     : undefined;
+  // attachmentId → temp storage path of a pre-labelled JPEG (see photo-badge).
+  const photoOverrides =
+    body.photoOverrides && typeof body.photoOverrides === 'object' && !Array.isArray(body.photoOverrides)
+      ? Object.fromEntries(
+          Object.entries(body.photoOverrides as Record<string, unknown>)
+            .filter((e): e is [string, string] => typeof e[1] === 'string'),
+        )
+      : undefined;
 
   try {
-    const result = await postJobToFacebook(jobId, { caption, photoAttachmentIds });
+    const result = await postJobToFacebook(jobId, { caption, photoAttachmentIds, photoOverrides });
     return NextResponse.json({ ok: true, result });
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);

@@ -15,8 +15,11 @@
 // lib/instagram-publish.ts).
 
 import { useMemo, useState } from 'react';
+import { Poppins } from 'next/font/google';
 import { supabase } from '@/lib/supabase/client';
 import { useStore } from '@/lib/store';
+import { TestimonialPanel } from './testimonial-panel';
+import { labelPhoto, type PhotoLabel } from '@/lib/photo-badge';
 import type { Job, JobMarketing, QuoteAttachment } from '@/lib/types';
 import {
   Send, Sparkles, Loader2, Check, ExternalLink, Minus, Plus, RefreshCw, AlertCircle,
@@ -36,6 +39,17 @@ function IgGlyph({ size = 16 }: { size?: number }) {
 import { cn } from '@/lib/utils';
 
 const MAX_PHOTOS = 10;
+
+// Brand font for the burned-in BEFORE/AFTER pills (same face as the
+// testimonial card). next/font self-hosts at build; no runtime request.
+const poppins = Poppins({ weight: ['600'], subsets: ['latin'], display: 'swap' });
+
+/** Which pill (if any) a photo gets when "Label photos" is on. */
+function labelForKind(kind: QuoteAttachment['kind']): PhotoLabel | null {
+  if (kind === 'after_photo') return 'AFTER';
+  if (kind === 'before_photo' || kind === 'scope_photo') return 'BEFORE';
+  return null; // process shots + testimonial cards stay unlabelled
+}
 
 export type SocialPlatform = 'facebook' | 'instagram';
 
@@ -114,37 +128,43 @@ async function authedPost(path: string, payload: unknown): Promise<{ httpOk: boo
 }
 
 export function SocialPanel({
-  platform, job, afterImages, beforeImages, processImages = [], signedUrls,
-  websiteDescription, websiteOverview, websiteServices,
+  platform, job, afterImages, beforeImages, processImages = [], testimonialImages = [],
+  signedUrls, websiteDescription, websiteOverview, websiteServices,
 }: {
   platform: SocialPlatform;
   job: Job;
   afterImages: QuoteAttachment[];
   beforeImages: QuoteAttachment[];
   processImages?: QuoteAttachment[];
+  /** Generated testimonial cards (kind 'testimonial_image'; 0 or 1 expected). */
+  testimonialImages?: QuoteAttachment[];
   signedUrls: Record<string, string>;
   websiteDescription: string;
   websiteOverview: string[];
   websiteServices: string[];
 }) {
   const cfg = PLATFORMS[platform];
-  const { getJobMarketing, saveJobMarketing, refresh } = useStore();
+  const { getJobMarketing, saveJobMarketing, refresh, businessId } = useStore();
   const saved = getJobMarketing(job.id);
   const channel = platform === 'facebook' ? saved?.facebook : saved?.instagram;
 
-  // Photo pool: ALL the job's photos — afters lead (hero first), then befores,
-  // then process shots. Brad picks any mix in any order.
+  // Photo pool: the testimonial card leads (it's made to be photo 1), then
+  // afters (hero first), then befores, then process shots. Brad picks any
+  // mix in any order.
   const pool = useMemo(() => {
     const heroId = saved?.heroAfterId ?? saved?.heroAttachmentId;
     let afters = afterImages;
     if (heroId && afters.some((a) => a.id === heroId)) {
       afters = [afters.find((a) => a.id === heroId)!, ...afters.filter((a) => a.id !== heroId)];
     }
-    return [...afters, ...beforeImages, ...processImages];
-  }, [afterImages, beforeImages, processImages, saved?.heroAfterId, saved?.heroAttachmentId]);
+    return [...testimonialImages, ...afters, ...beforeImages, ...processImages];
+  }, [afterImages, beforeImages, processImages, testimonialImages, saved?.heroAfterId, saved?.heroAttachmentId]);
 
   const groupOf = (a: QuoteAttachment) =>
-    a.kind === 'after_photo' ? 'After' : a.kind === 'before_photo' ? 'Before' : 'Process';
+    a.kind === 'testimonial_image' ? 'Review'
+      : a.kind === 'after_photo' ? 'After'
+        : a.kind === 'before_photo' ? 'Before'
+          : 'Process';
 
   const [caption, setCaption] = useState(channel?.caption ?? '');
   // Selection order IS post order — first tap is photo 1 in the post.
@@ -161,6 +181,9 @@ export function SocialPanel({
   const [posting, setPosting] = useState(false);
   const [postErr, setPostErr] = useState<string | null>(null);
   const [postedNow, setPostedNow] = useState<{ permalink?: string } | null>(null);
+  // Burn BEFORE/AFTER pills onto before+after photos at post time. On by
+  // default — the whole point of a before/after album is knowing which is which.
+  const [labelPhotos, setLabelPhotos] = useState<boolean>(channel?.labelPhotos ?? true);
 
   // Post order = tap order. selectedIds is already in the order Brad tapped.
   const selected = selectedIds
@@ -171,11 +194,12 @@ export function SocialPanel({
   const alreadyPosted = channel?.status === 'posted';
   const permalink = postedNow?.permalink ?? channel?.permalink;
 
-  async function persist(nextCaption: string, nextIds: string[]) {
+  async function persist(nextCaption: string, nextIds: string[], nextLabel: boolean = labelPhotos) {
     const next = {
       ...channel,
       caption: nextCaption,
       photoAttachmentIds: nextIds,
+      labelPhotos: nextLabel,
       status: channel?.status ?? 'draft',
     };
     const updates: Partial<Pick<JobMarketing, 'facebook' | 'instagram'>> =
@@ -232,6 +256,46 @@ export function SocialPanel({
     });
   }
 
+  // A freshly generated testimonial card jumps to photo 1 — that's the whole
+  // point of making it. Persist the new order so a reopen matches.
+  function handleTestimonialGenerated(id: string) {
+    const nextIds = [id, ...orderedSelectedIds.filter((x) => x !== id)].slice(0, MAX_PHOTOS);
+    setSelectedIds(nextIds);
+    void persist(caption, nextIds);
+  }
+
+  /**
+   * When labelling is on, composite BEFORE/AFTER pills onto the relevant
+   * photos in the browser and upload the copies as TEMP storage objects.
+   * Returns { attachmentId → temp storagePath } plus the temp paths for
+   * cleanup. Originals in storage are never touched.
+   */
+  async function buildLabelledOverrides(): Promise<{
+    overrides: Record<string, string>;
+    tempPaths: string[];
+  }> {
+    const overrides: Record<string, string> = {};
+    const tempPaths: string[] = [];
+    if (!labelPhotos || !businessId) return { overrides, tempPaths };
+    try {
+      await document.fonts.load(`600 40px ${poppins.style.fontFamily}`);
+    } catch { /* degrade to system sans */ }
+    for (const att of selected) {
+      const label = labelForKind(att.kind);
+      const url = signedUrls[att.storagePath];
+      if (!label || !url) continue;
+      const blob = await labelPhoto(url, label, poppins.style.fontFamily);
+      const tempPath = `${businessId}/social-labelled/${crypto.randomUUID()}.jpg`;
+      const { error } = await supabase.storage
+        .from('quote-attachments')
+        .upload(tempPath, blob, { contentType: 'image/jpeg', upsert: false });
+      if (error) throw new Error(`Couldn't stage the labelled "${label}" photo: ${error.message}`);
+      overrides[att.id] = tempPath;
+      tempPaths.push(tempPath);
+    }
+    return { overrides, tempPaths };
+  }
+
   async function post() {
     setPostErr(null);
     setPostedNow(null);
@@ -240,11 +304,20 @@ export function SocialPanel({
     // uses the reviewed copy.
     await persist(caption, orderedSelectedIds);
     setPosting(true);
+    let tempPaths: string[] = [];
     try {
+      let overrides: Record<string, string> = {};
+      try {
+        ({ overrides, tempPaths } = await buildLabelledOverrides());
+      } catch (e) {
+        setPostErr(e instanceof Error ? e.message : 'Labelling the photos failed.');
+        return;
+      }
       const { httpOk, body } = await authedPost(cfg.postPath, {
         jobId: job.id,
         caption,
         photoAttachmentIds: orderedSelectedIds,
+        photoOverrides: Object.keys(overrides).length > 0 ? overrides : undefined,
       });
       if (!httpOk || body.ok === false) {
         setPostErr(body.error ?? 'Posting failed — check the dev-server console.');
@@ -253,6 +326,10 @@ export function SocialPanel({
       setPostedNow({ permalink: body.result?.permalink });
       await refresh();
     } finally {
+      // The temp labelled copies have served their purpose either way.
+      if (tempPaths.length > 0) {
+        void supabase.storage.from('quote-attachments').remove(tempPaths).catch(() => {});
+      }
       setPosting(false);
     }
   }
@@ -273,6 +350,20 @@ export function SocialPanel({
           </span>
         )}
       </div>
+
+      {/* Testimonial card maker — Facebook tab only (the generated image
+          shows up in BOTH platforms' photo pools once created). */}
+      {platform === 'facebook' && (
+        <div className="mb-4">
+          <TestimonialPanel
+            job={job}
+            existing={testimonialImages}
+            signedUrls={signedUrls}
+            accent={cfg.accent}
+            onGenerated={handleTestimonialGenerated}
+          />
+        </div>
+      )}
 
       {caption.trim().length === 0 ? (
         // Empty state — one button to draft the caption from the page copy.
@@ -369,13 +460,32 @@ export function SocialPanel({
                 The numbers are the order they&apos;ll appear in the post. Tap a selected photo to remove it.
                 {cfg.note ? ` ${cfg.note}` : ''}
               </p>
+              {/* Burn-in labels — only offered when the selection has photos to label. */}
+              {selected.some((a) => labelForKind(a.kind) !== null) && (
+                <label className="mt-2 flex w-fit cursor-pointer items-center gap-2 rounded-lg px-1 py-1.5 text-[13px] font-medium text-gray-700">
+                  <input
+                    type="checkbox"
+                    checked={labelPhotos}
+                    onChange={(e) => {
+                      setLabelPhotos(e.target.checked);
+                      void persist(caption, orderedSelectedIds, e.target.checked);
+                    }}
+                    className="h-4.5 w-4.5 accent-current"
+                    style={{ accentColor: cfg.accent }}
+                  />
+                  Add <span className="rounded-full bg-gray-900/70 px-2 py-0.5 text-[10px] font-semibold tracking-widest text-white">BEFORE</span>
+                  /
+                  <span className="rounded-full bg-gray-900/70 px-2 py-0.5 text-[10px] font-semibold tracking-widest text-white">AFTER</span>
+                  tags to the photos
+                </label>
+              )}
             </div>
           )}
 
           {/* Live mock of the actual post */}
           {platform === 'facebook'
-            ? <FacebookMock caption={caption} photos={selected} signedUrls={signedUrls} />
-            : <InstagramMock caption={caption} photos={selected} signedUrls={signedUrls} account={cfg.account} />}
+            ? <FacebookMock caption={caption} photos={selected} signedUrls={signedUrls} labelOf={labelPhotos ? (a) => labelForKind(a.kind) : undefined} />
+            : <InstagramMock caption={caption} photos={selected} signedUrls={signedUrls} account={cfg.account} labelOf={labelPhotos ? (a) => labelForKind(a.kind) : undefined} />}
         </div>
       )}
 
@@ -439,13 +549,23 @@ function CapBtn({ icon: Icon, label, onClick }: { icon: typeof Sparkles; label: 
   );
 }
 
+// A small mock of the burned-in pill, matching lib/photo-badge.ts's design.
+function MockPill({ label }: { label: string }) {
+  return (
+    <span className="absolute left-1.5 top-1.5 rounded-full bg-gray-900/70 px-2 py-0.5 text-[9px] font-semibold tracking-widest text-white">
+      {label}
+    </span>
+  );
+}
+
 // A faithful-ish render of the Facebook post: page header, caption, photo grid.
 function FacebookMock({
-  caption, photos, signedUrls,
+  caption, photos, signedUrls, labelOf,
 }: {
   caption: string;
   photos: QuoteAttachment[];
   signedUrls: Record<string, string>;
+  labelOf?: (a: QuoteAttachment) => string | null;
 }) {
   const shown = photos.slice(0, 4);
   const extra = photos.length - shown.length;
@@ -471,6 +591,7 @@ function FacebookMock({
                 {url
                   ? <img src={url} alt="" className="h-full w-full object-cover" />
                   : <span className="flex h-full items-center justify-center text-gray-300"><Loader2 size={16} className="animate-spin" /></span>}
+                {labelOf?.(a) && <MockPill label={labelOf(a)!} />}
                 {isLast && extra > 0 && (
                   <span className="absolute inset-0 flex items-center justify-center bg-black/50 text-lg font-semibold text-white">+{extra}</span>
                 )}
@@ -486,12 +607,13 @@ function FacebookMock({
 // A faithful-ish render of the Instagram post: username header, big square
 // first photo (with carousel counter), then the caption below it IG-style.
 function InstagramMock({
-  caption, photos, signedUrls, account,
+  caption, photos, signedUrls, account, labelOf,
 }: {
   caption: string;
   photos: QuoteAttachment[];
   signedUrls: Record<string, string>;
   account: string;
+  labelOf?: (a: QuoteAttachment) => string | null;
 }) {
   const first = photos[0];
   const url = first ? (signedUrls[first.storagePath] ?? null) : null;
@@ -511,6 +633,7 @@ function InstagramMock({
           {url
             ? <img src={url} alt="" className="h-full w-full object-cover" />
             : <span className="flex h-full items-center justify-center text-gray-300"><Loader2 size={16} className="animate-spin" /></span>}
+          {first && labelOf?.(first) && <MockPill label={labelOf(first)!} />}
           {photos.length > 1 && (
             <span className="absolute right-2 top-2 rounded-full bg-black/60 px-2 py-0.5 text-[11px] font-semibold text-white">
               1/{photos.length}

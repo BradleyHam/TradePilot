@@ -203,11 +203,14 @@ export async function publishJobToWebsite(
   if (!description) {
     throw new Error('Add a description on the Marketing tab before publishing.');
   }
-  const beforeImgs = before.filter(isImageAttachment);
-  const afterImgs = after.filter(isImageAttachment);
-  const processImgs = process.filter(isImageAttachment);
+  // Skip photos Brad hid in the preview (opt-out list on the marketing blob).
+  const excluded = new Set(marketing?.excludedImageIds ?? []);
+  const keep = (a: QuoteAttachment) => isImageAttachment(a) && !excluded.has(a.id);
+  const beforeImgs = before.filter(keep);
+  const afterImgs = after.filter(keep);
+  const processImgs = process.filter(keep);
   if (afterImgs.length === 0) {
-    throw new Error('Add at least one after photo before publishing.');
+    throw new Error('Add (or un-hide) at least one after photo before publishing.');
   }
 
   assertSipsAvailable();
@@ -313,6 +316,15 @@ export async function publishJobToWebsite(
       featured: false,
       mainImage,
     };
+    // Client review — the site renders this as a testimonial block. Only
+    // written when there's an actual quote (matches the add-project skill's
+    // "omit `review` entirely if no quote was given").
+    const reviewQuote = marketing?.review?.quote?.trim();
+    if (reviewQuote) {
+      const author = marketing?.review?.author?.trim();
+      projectJson.review = { quote: reviewQuote, ...(author ? { author } : {}) };
+    }
+
     // Before/after slider only when Brad chose it AND both images resolve.
     if (heroMode === 'slider' && chosenBefore && chosenAfter) {
       projectJson.compareSlider = {

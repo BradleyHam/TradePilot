@@ -21,6 +21,11 @@ export interface JobMarketingContext {
   after: QuoteAttachment[];
   /** process_photo (work-in-progress) attachments. */
   process: QuoteAttachment[];
+  /**
+   * Generated testimonial cards (kind 'testimonial_image'). Social posts
+   * only — the website publish pipeline deliberately never reads these.
+   */
+  testimonial: QuoteAttachment[];
   marketing: JobMarketing | null;
 }
 
@@ -47,6 +52,7 @@ export async function loadJobMarketingContext(jobId: string): Promise<JobMarketi
   const before = attachments.filter((a) => BEFORE_KINDS.has(a.kind));
   const after = attachments.filter((a) => a.kind === 'after_photo');
   const process = attachments.filter((a) => a.kind === 'process_photo');
+  const testimonial = attachments.filter((a) => a.kind === 'testimonial_image');
 
   // Marketing description/status blob (settings key `marketing:{jobId}`).
   const { data: setRow } = await supabaseAdmin
@@ -70,6 +76,8 @@ export async function loadJobMarketingContext(jobId: string): Promise<JobMarketi
         heroMode: parsed.heroMode,
         heroBeforeId: parsed.heroBeforeId,
         heroAfterId: parsed.heroAfterId,
+        excludedImageIds: Array.isArray(parsed.excludedImageIds) ? parsed.excludedImageIds : undefined,
+        review: parsed.review?.quote ? parsed.review : undefined,
         facebook: parsed.facebook,
         instagram: parsed.instagram,
         updatedAt: parsed.updatedAt,
@@ -79,7 +87,7 @@ export async function loadJobMarketingContext(jobId: string): Promise<JobMarketi
     }
   }
 
-  return { job, before, after, process, marketing };
+  return { job, before, after, process, testimonial, marketing };
 }
 
 /** Flip the job's marketing status to 'published', preserving the description. */
@@ -98,6 +106,8 @@ export async function markJobMarketingPublished(
     heroMode: prev?.heroMode,
     heroBeforeId: prev?.heroBeforeId,
     heroAfterId: prev?.heroAfterId,
+    excludedImageIds: prev?.excludedImageIds,
+    review: prev?.review,
     facebook: prev?.facebook,
     instagram: prev?.instagram,
     updatedAt: new Date().toISOString(),
@@ -152,6 +162,8 @@ async function saveJobChannel(
     heroMode: prev?.heroMode,
     heroBeforeId: prev?.heroBeforeId,
     heroAfterId: prev?.heroAfterId,
+    excludedImageIds: prev?.excludedImageIds,
+    review: prev?.review,
     facebook: channel.facebook ?? prev?.facebook,
     instagram: channel.instagram ?? prev?.instagram,
     updatedAt: new Date().toISOString(),

@@ -220,6 +220,9 @@ function JobMarketingCard({
   const beforeImages = images.filter((a) => BEFORE_KINDS.has(a.kind));
   const afterImages = images.filter((a) => a.kind === 'after_photo');
   const processImages = images.filter((a) => a.kind === 'process_photo');
+  // Generated testimonial cards — used by the social composer only. Never
+  // shown in the card's photo groups or the website galleries.
+  const testimonialImages = images.filter((a) => a.kind === 'testimonial_image');
 
   // Map an attachment id → its index in the flat lightbox list.
   const lightboxIndexOf = (id: string) => images.findIndex((a) => a.id === id);
@@ -379,6 +382,7 @@ function JobMarketingCard({
           beforeImages={beforeImages}
           afterImages={afterImages}
           processImages={processImages}
+          testimonialImages={testimonialImages}
           signedUrls={signedUrls}
           onClose={() => setPreviewOpen(false)}
         />

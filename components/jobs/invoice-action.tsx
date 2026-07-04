@@ -441,7 +441,13 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       createdAt: new Date().toISOString(),
       updatedAt: new Date().toISOString(),
     };
-    addInvoice(newInvoice);
+    // Kick off the insert. Keep the promise so that, when "mark paid" is
+    // ticked, we can wait for the REAL Supabase UUID before marking it paid.
+    // Marking paid with the optimistic temp id ('inv_…') was the cause of the
+    // 22P02 "invalid input syntax for type uuid" failure — markInvoicePaid
+    // ran an .eq('id', tempId) update before addInvoice had swapped in the
+    // real id (the old setTimeout(…, 0) raced the network insert and lost).
+    const createdPromise = addInvoice(newInvoice);
 
     const newTotal = Math.max(totalWorkValue, balanceAfter);
     updateJob(job.id, {
@@ -461,7 +467,12 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
     }
 
     if (markPaid) {
-      setTimeout(() => markInvoicePaid(tempId, paidDate), 0);
+      // Wait for the persisted invoice (real UUID) before marking it paid so
+      // we never key the DB update on the temp id. If the insert failed,
+      // addInvoice resolves null (and has already surfaced the error +
+      // rolled back the optimistic row), so there's nothing to mark paid.
+      const created = await createdPromise;
+      if (created) markInvoicePaid(created.id, paidDate);
     }
 
     setSubmitting(false);

@@ -577,6 +577,13 @@ export type QuoteAttachmentKind =
   | 'after_photo'
   | 'scope_photo'
   | 'process_photo'
+  /**
+   * A generated 1080×1080 testimonial card (the client's review rendered
+   * as a branded image, drawn client-side on a canvas). Made in the
+   * Facebook composer to lead a social post. NEVER shown in website
+   * galleries — the publish pipeline only reads photo kinds.
+   */
+  | 'testimonial_image'
   | 'quote_pdf'
   | 'other';
 
@@ -889,6 +896,12 @@ export interface JobFacebook {
   caption?: string;
   /** quote_attachments.ids of the photos to attach, in post order (hero first). */
   photoAttachmentIds?: string[];
+  /**
+   * Burn a small BEFORE / AFTER pill onto before+after photos when posting
+   * (composited client-side at post time; originals in storage stay clean).
+   * Defaults to true in the composer.
+   */
+  labelPhotos?: boolean;
   /** 'draft' until posted, then 'posted'. */
   status?: 'draft' | 'posted';
   /** Graph API post id returned on a successful publish. */
@@ -922,6 +935,20 @@ export type JobInstagram = JobFacebook;
  * done). The Marketing tab reads them per job via the job's quotes, the
  * same way JobDetailSheet's "Plans & photos" panel does.
  */
+/** A client testimonial shown on the website project page. */
+export interface JobReview {
+  /** The client's words, verbatim. */
+  quote: string;
+  /** First name (or however the client should be credited). */
+  author?: string;
+  /**
+   * Role line under the name on the generated testimonial card
+   * (e.g. "Home Owner", "Property Manager"). Card-only — the website
+   * publish pipeline ignores it (project.json has no role field).
+   */
+  role?: string;
+}
+
 export interface JobMarketing {
   jobId: string;
   /** Page title for the website project (defaults to the job name). */
@@ -942,6 +969,20 @@ export interface JobMarketing {
   heroBeforeId?: string;
   /** Chosen AFTER image (quote_attachments.id) — slider's after side + the main/card image. */
   heroAfterId?: string;
+  /**
+   * quote_attachments.ids Brad has hidden from the website project page.
+   * Hidden photos stay on the job (and in the app) but are skipped by the
+   * publish pipeline's galleries. Opt-out rather than opt-in so newly added
+   * photos show by default.
+   */
+  excludedImageIds?: string[];
+  /**
+   * Optional client testimonial for the project page. Rendered by the
+   * painters-wanaka site's `review` block in project.json. Omitted from the
+   * published page when there's no quote. The quote is the client's own
+   * words — never AI-rewritten.
+   */
+  review?: JobReview;
   /** Facebook channel: caption + post status/link. See JobFacebook. */
   facebook?: JobFacebook;
   /** Instagram channel: caption + post status/link. See JobInstagram. */

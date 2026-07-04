@@ -17,7 +17,7 @@ import { SocialPanel } from './social-panel';
 import type { Job, QuoteAttachment } from '@/lib/types';
 import {
   Sparkles, Plus, Minus, Undo2, Loader2, Check, Globe, Pencil,
-  MapPin, Calendar, CheckCircle, AlertCircle, RefreshCw,
+  MapPin, Calendar, CheckCircle, AlertCircle, RefreshCw, Eye, EyeOff,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -72,12 +72,14 @@ function monthYear(job: Job): string | null {
 }
 
 export function ProjectPreviewSheet({
-  job, beforeImages, afterImages, processImages, signedUrls, onClose,
+  job, beforeImages, afterImages, processImages, testimonialImages = [], signedUrls, onClose,
 }: {
   job: Job;
   beforeImages: QuoteAttachment[];
   afterImages: QuoteAttachment[];
   processImages: QuoteAttachment[];
+  /** Generated testimonial cards — social-post only, never in web galleries. */
+  testimonialImages?: QuoteAttachment[];
   signedUrls: Record<string, string>;
   onClose: () => void;
 }) {
@@ -88,18 +90,38 @@ export function ProjectPreviewSheet({
   const [tab, setTab] = useState<'website' | 'facebook' | 'instagram'>('website');
 
   const defaultServices = job.workType ? (SERVICE_BY_WORKTYPE[job.workType] ?? ['Exterior Painting']) : ['Exterior Painting'];
-  const sliderAvailable = beforeImages.length > 0 && afterImages.length > 0;
+
+  // Photos hidden from the published page (quote_attachments.ids). Opt-out:
+  // everything shows unless Brad taps the eye to hide it. Persisted with the
+  // draft so publish (server-side) can skip the same set.
+  const [excludedIds, setExcludedIds] = useState<string[]>(saved?.excludedImageIds ?? []);
+  function toggleImage(id: string) {
+    setExcludedIds((prev) => (prev.includes(id) ? prev.filter((x) => x !== id) : [...prev, id]));
+  }
+  const isExcluded = (id: string) => excludedIds.includes(id);
+  const visibleBefore = beforeImages.filter((a) => !isExcluded(a.id));
+  const visibleAfter = afterImages.filter((a) => !isExcluded(a.id));
+  const visibleProcess = processImages.filter((a) => !isExcluded(a.id));
+
+  const sliderAvailable = visibleBefore.length > 0 && visibleAfter.length > 0;
 
   const [title, setTitle] = useState(saved?.title || job.name);
   const [description, setDescription] = useState(saved?.description || '');
   const [overview, setOverview] = useState<string[]>(saved?.overview && saved.overview.length ? saved.overview : []);
   const [services, setServices] = useState<string[]>(saved?.services && saved.services.length ? saved.services : defaultServices);
   const [heroMode, setHeroMode] = useState<'image' | 'slider'>(saved?.heroMode ?? (sliderAvailable ? 'slider' : 'image'));
+
+  // Client review — the client's own words, kept verbatim (no AI tools on
+  // purpose). Empty quote = no review block on the published page.
+  const [reviewQuote, setReviewQuote] = useState(saved?.review?.quote ?? '');
+  const [reviewAuthor, setReviewAuthor] = useState(saved?.review?.author ?? '');
   const [heroBeforeId, setHeroBeforeId] = useState<string | undefined>(saved?.heroBeforeId ?? beforeImages[0]?.id);
   const [heroAfterId, setHeroAfterId] = useState<string | undefined>(saved?.heroAfterId ?? afterImages[0]?.id);
 
-  const chosenAfter = afterImages.find((a) => a.id === heroAfterId) ?? afterImages[0];
-  const chosenBefore = beforeImages.find((a) => a.id === heroBeforeId) ?? beforeImages[0];
+  // Hero picks resolve against VISIBLE images only — hiding the chosen hero
+  // falls back to the first still-visible photo.
+  const chosenAfter = visibleAfter.find((a) => a.id === heroAfterId) ?? visibleAfter[0];
+  const chosenBefore = visibleBefore.find((a) => a.id === heroBeforeId) ?? visibleBefore[0];
   const chosenAfterUrl = chosenAfter ? (signedUrls[chosenAfter.storagePath] ?? null) : null;
   const chosenBeforeUrl = chosenBefore ? (signedUrls[chosenBefore.storagePath] ?? null) : null;
 
@@ -189,6 +211,10 @@ export function ProjectPreviewSheet({
         heroMode,
         heroBeforeId,
         heroAfterId,
+        excludedImageIds: excludedIds,
+        review: reviewQuote.trim()
+          ? { quote: reviewQuote.trim(), author: reviewAuthor.trim() || undefined }
+          : undefined, // explicit undefined clears a previously-saved review
       });
       if (!res.ok) { alert(`Couldn't save: ${res.error ?? 'unknown error'}`); return false; }
       setSavedTick(true);
@@ -356,11 +382,11 @@ export function ProjectPreviewSheet({
                     <p className="text-[11px] text-gray-400">Add at least one before and one after photo to use a slider.</p>
                   )}
                   {heroMode === 'image' ? (
-                    <ThumbPicker label="Main image" images={afterImages} signedUrls={signedUrls} selectedId={chosenAfter?.id} onSelect={setHeroAfterId} />
+                    <ThumbPicker label="Main image" images={visibleAfter} signedUrls={signedUrls} selectedId={chosenAfter?.id} onSelect={setHeroAfterId} />
                   ) : sliderAvailable ? (
                     <div className="space-y-2">
-                      <ThumbPicker label="Before" images={beforeImages} signedUrls={signedUrls} selectedId={chosenBefore?.id} onSelect={setHeroBeforeId} />
-                      <ThumbPicker label="After" images={afterImages} signedUrls={signedUrls} selectedId={chosenAfter?.id} onSelect={setHeroAfterId} />
+                      <ThumbPicker label="Before" images={visibleBefore} signedUrls={signedUrls} selectedId={chosenBefore?.id} onSelect={setHeroBeforeId} />
+                      <ThumbPicker label="After" images={visibleAfter} signedUrls={signedUrls} selectedId={chosenAfter?.id} onSelect={setHeroAfterId} />
                       <p className="text-[11px] text-gray-400">Tip: pick the same area before + after so the slider lines up.</p>
                     </div>
                   ) : null}
@@ -456,25 +482,61 @@ export function ProjectPreviewSheet({
                   <p className="mt-2 text-[11px] text-gray-400">Tap to toggle. These show on the page and drive its service links.</p>
                 </div>
 
+                {/* Client review — optional testimonial. Rendered on the live
+                    page as a quote block; left out entirely when empty. */}
+                <div className="mt-8 border-t border-gray-200 pt-6">
+                  <div className="flex items-baseline justify-between gap-2 mb-3">
+                    <h3 className="text-sm font-medium text-gray-900">Client review</h3>
+                    <span className="text-[11px] text-gray-400">Optional — leave empty to skip</span>
+                  </div>
+                  <blockquote className="border-l-2 border-gray-300 pl-4">
+                    <textarea
+                      value={reviewQuote}
+                      onChange={(e) => setReviewQuote(e.target.value)}
+                      placeholder={'What did the client say? e.g. "The team were tidy, on time and the house looks brand new."'}
+                      className="w-full resize-none [field-sizing:content] min-h-[3.5rem] rounded-lg bg-transparent px-2 py-1.5 -mx-2 text-base italic text-gray-600 leading-relaxed outline-none placeholder:not-italic placeholder:text-gray-300 hover:bg-gray-50 focus:bg-white focus:ring-2 focus:ring-primary/30 transition"
+                    />
+                    <div className="mt-1 flex items-center gap-1 text-sm text-gray-500">
+                      <span aria-hidden>—</span>
+                      <input
+                        value={reviewAuthor}
+                        onChange={(e) => setReviewAuthor(e.target.value)}
+                        placeholder="Client's first name"
+                        className="min-w-0 flex-1 rounded bg-transparent px-1 py-0.5 font-medium outline-none placeholder:font-normal placeholder:text-gray-300 hover:bg-gray-50 focus:bg-white focus:ring-2 focus:ring-primary/30 transition"
+                      />
+                    </div>
+                  </blockquote>
+                  <p className="mt-2 text-[11px] text-gray-400">
+                    The client&apos;s words go on the page exactly as written here — no AI rewriting.
+                  </p>
+                </div>
+
+                {/* Galleries — every photo on the job, with a show/hide toggle.
+                    Hidden photos stay on the job but are skipped on publish. */}
+                {(afterImages.length > 0 || beforeImages.length > 0 || processImages.length > 0) && (
+                  <p className="mt-10 text-[11px] text-gray-400">
+                    Tap the eye on a photo to hide it from the published page. Hidden photos stay on the job.
+                  </p>
+                )}
                 {/* After gallery */}
                 {afterImages.length > 0 && (
-                  <div className="mt-10">
-                    <h2 className="text-xl font-bold text-gray-900 mb-4">After</h2>
-                    <Gallery images={afterImages} signedUrls={signedUrls} />
+                  <div className="mt-4">
+                    <GalleryHeading label="After" shown={visibleAfter.length} total={afterImages.length} />
+                    <Gallery images={afterImages} signedUrls={signedUrls} excludedIds={excludedIds} onToggle={toggleImage} />
                   </div>
                 )}
                 {/* Before gallery */}
                 {beforeImages.length > 0 && (
                   <div className="mt-10">
-                    <h2 className="text-xl font-bold text-gray-900 mb-4">Before</h2>
-                    <Gallery images={beforeImages} signedUrls={signedUrls} />
+                    <GalleryHeading label="Before" shown={visibleBefore.length} total={beforeImages.length} />
+                    <Gallery images={beforeImages} signedUrls={signedUrls} excludedIds={excludedIds} onToggle={toggleImage} />
                   </div>
                 )}
                 {/* Process gallery */}
                 {processImages.length > 0 && (
                   <div className="mt-10">
-                    <h2 className="text-xl font-bold text-gray-900 mb-4">Process</h2>
-                    <Gallery images={processImages} signedUrls={signedUrls} />
+                    <GalleryHeading label="Process" shown={visibleProcess.length} total={processImages.length} />
+                    <Gallery images={processImages} signedUrls={signedUrls} excludedIds={excludedIds} onToggle={toggleImage} />
                   </div>
                 )}
 
@@ -492,6 +554,7 @@ export function ProjectPreviewSheet({
               afterImages={afterImages}
               beforeImages={beforeImages}
               processImages={processImages}
+              testimonialImages={testimonialImages}
               signedUrls={signedUrls}
               websiteDescription={description}
               websiteOverview={overview}
@@ -507,6 +570,7 @@ export function ProjectPreviewSheet({
               afterImages={afterImages}
               beforeImages={beforeImages}
               processImages={processImages}
+              testimonialImages={testimonialImages}
               signedUrls={signedUrls}
               websiteDescription={description}
               websiteOverview={overview}
@@ -546,7 +610,7 @@ export function ProjectPreviewSheet({
               <button
                 type="button"
                 onClick={handlePublish}
-                disabled={publishBusy || !description.trim() || afterImages.length === 0}
+                disabled={publishBusy || !description.trim() || visibleAfter.length === 0}
                 className="inline-flex items-center gap-1.5 rounded-lg bg-primary px-3 min-h-[40px] text-sm font-medium text-primary-foreground transition hover:bg-primary/80 active:translate-y-px disabled:opacity-50"
               >
                 {publishBusy ? <Loader2 size={15} className="animate-spin" /> : <Globe size={15} />}
@@ -562,16 +626,58 @@ export function ProjectPreviewSheet({
   );
 }
 
-function Gallery({ images, signedUrls }: { images: QuoteAttachment[]; signedUrls: Record<string, string> }) {
+function GalleryHeading({ label, shown, total }: { label: string; shown: number; total: number }) {
+  return (
+    <h2 className="text-xl font-bold text-gray-900 mb-4">
+      {label}
+      {shown < total && (
+        <span className="ml-2 text-sm font-medium text-gray-400">{shown} of {total} shown</span>
+      )}
+    </h2>
+  );
+}
+
+function Gallery({
+  images, signedUrls, excludedIds, onToggle,
+}: {
+  images: QuoteAttachment[];
+  signedUrls: Record<string, string>;
+  excludedIds: string[];
+  onToggle: (id: string) => void;
+}) {
   return (
     <div className="grid grid-cols-2 sm:grid-cols-3 gap-3">
       {images.map((a) => {
         const url = signedUrls[a.storagePath] ?? null;
+        const hidden = excludedIds.includes(a.id);
         return (
           <div key={a.id} className="relative aspect-[4/3] overflow-hidden rounded-lg bg-gray-100">
             {url
-              ? <img src={url} alt={a.fileName ?? 'photo'} className="h-full w-full object-cover" />
+              ? (
+                <img
+                  src={url}
+                  alt={a.fileName ?? 'photo'}
+                  className={cn('h-full w-full object-cover transition', hidden && 'opacity-30 grayscale')}
+                />
+              )
               : <div className="flex h-full items-center justify-center"><Loader2 size={16} className="animate-spin text-gray-400" /></div>}
+            {hidden && (
+              <span className="absolute left-2 bottom-2 rounded-full bg-gray-900/70 px-2 py-0.5 text-[10px] font-semibold uppercase tracking-wide text-white">
+                Hidden
+              </span>
+            )}
+            <button
+              type="button"
+              onClick={() => onToggle(a.id)}
+              title={hidden ? 'Show on the published page' : 'Hide from the published page'}
+              aria-label={hidden ? 'Show this photo on the published page' : 'Hide this photo from the published page'}
+              className={cn(
+                'absolute right-2 top-2 inline-flex h-8 w-8 items-center justify-center rounded-full shadow-sm transition active:scale-95',
+                hidden ? 'bg-gray-900 text-white' : 'bg-white/90 text-gray-700 hover:bg-white',
+              )}
+            >
+              {hidden ? <EyeOff size={15} /> : <Eye size={15} />}
+            </button>
           </div>
         );
       })}
