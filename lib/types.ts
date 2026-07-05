@@ -506,6 +506,39 @@ export interface Material {
   createdAt: string;
 }
 
+export type PaintStockKind =
+  | 'topcoat' | 'enamel' | 'ceiling' | 'primer_sealer' | 'stain'
+  | 'test_pot' | 'other';
+
+export type PaintStockLocation = 'garage' | 'van';
+
+/**
+ * Paint inventory on hand — deliberately separate from Material.
+ * Material is a usage/purchase LOG (historical, tied to jobs/bills);
+ * PaintStockItem is CURRENT state (what's in the garage or van right
+ * now), mutated as paint is used and bought. Low-stock is derived in
+ * the UI (litres <= 1 and not a test pot), never stored.
+ */
+export interface PaintStockItem {
+  id: string;
+  businessId: string;
+  /** Product line, e.g. "Lumbersider", "Wash&Wear Low Sheen". */
+  product: string;
+  brand?: string;
+  /** Tint, e.g. "Flax Pod". Undefined for untinted (sealers etc). */
+  color?: string;
+  kind: PaintStockKind;
+  /**
+   * Approx litres remaining. Undefined = not tracked by volume
+   * (test pots, spray cans — presence is what matters).
+   */
+  litres?: number;
+  location: PaintStockLocation;
+  notes?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 export interface Quote {
   id: string;
   businessId: string;

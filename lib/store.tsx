@@ -8,11 +8,13 @@ import {
   rowToJobImport,
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
+  rowToPaintStock, paintStockToRow,
 } from './supabase/mappers';
 import type {
   Job, Entry, EntryType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
+  PaintStockItem,
 } from './types';
 import { compressImage } from './image-compress';
 
@@ -71,6 +73,11 @@ interface StoreState {
   entries: Entry[];
   scheduleItems: ScheduleItem[];
   materials: Material[];
+  /**
+   * Paint inventory on hand (garage + van). Current-state rows mutated
+   * as paint is used/bought — NOT a usage log (that's `materials`).
+   */
+  paintStock: PaintStockItem[];
   quotes: Quote[];
   settings: Setting[];
   invoices: Invoice[];
@@ -458,6 +465,17 @@ interface StoreState {
     updates: Partial<Pick<JobMarketing, 'title' | 'description' | 'overview' | 'services' | 'status' | 'heroAttachmentId' | 'heroMode' | 'heroBeforeId' | 'heroAfterId' | 'excludedImageIds' | 'review' | 'facebook' | 'instagram'>>,
   ) => Promise<{ ok: boolean; error?: string }>;
 
+  /**
+   * Paint stock mutators. Same optimistic + rollback contract as
+   * everything else. addPaintStock resolves with the persisted id so
+   * the UI can focus/animate the new row.
+   */
+  addPaintStock: (
+    item: Omit<PaintStockItem, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>,
+  ) => Promise<{ ok: boolean; id?: string; error?: string }>;
+  updatePaintStock: (id: string, updates: Partial<PaintStockItem>) => void;
+  deletePaintStock: (id: string) => void;
+
   // Re-fetch everything from Supabase (useful after a write succeeds).
   refresh: () => Promise<void>;
 }
@@ -485,6 +503,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   scheduleItemsRef.current = scheduleItems;
   /* eslint-enable react-hooks/refs */
   const [materials, setMaterials] = useState<Material[]>([]);
+  const [paintStock, setPaintStock] = useState<PaintStockItem[]>([]);
   const [quotes, setQuotes] = useState<Quote[]>([]);
   const [settings, setSettings] = useState<Setting[]>([]);
   const [invoices, setInvoices] = useState<Invoice[]>([]);
@@ -529,6 +548,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setJobs([]); setEntries([]); setScheduleItems([]);
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
         setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
+        setPaintStock([]);
         setLoading(false);
         return;
       }
@@ -539,7 +559,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // Errors on individual tables (e.g. a missing-table during migration)
       // shouldn't take down the whole page. Each table degrades to an empty
       // array and the error is logged with full detail.
-      const [j, e, s, m, q, st, inv, bnk, ji, qa] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps] = await Promise.all([
         supabase.from('jobs').select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -557,6 +577,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // filters client-side to the quotes tied to the open job.
         supabase.from('quote_attachments').select('*').eq('business_id', bizId)
           .order('created_at', { ascending: false }),
+        // Paint stock — small table, degrades to empty like the others
+        // if migration 024 hasn't been applied yet.
+        supabase.from('paint_stock').select('*').eq('business_id', bizId)
+          .order('created_at', { ascending: true }),
       ]);
 
       // Log per-table errors with detail (Supabase errors don't stringify
@@ -569,6 +593,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       collect('materials', m); collect('quotes', q); collect('settings', st);
       collect('invoices', inv); collect('bank_transactions', bnk);
       collect('job_imports', ji); collect('quote_attachments', qa);
+      collect('paint_stock', ps);
 
       if (tableErrors.length > 0) {
         for (const { table, err: tErr } of tableErrors) {
@@ -600,6 +625,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setInvoices((inv.data ?? []).map(rowToInvoice));
       setJobImports((ji.data ?? []).map(rowToJobImport));
       setQuoteAttachments((qa.data ?? []).map(rowToQuoteAttachment));
+      setPaintStock((ps.data ?? []).map(rowToPaintStock));
     } catch (err: unknown) {
       // Top-level catch — only fires for the businesses fetch or completely
       // unexpected throws.
@@ -1236,6 +1262,90 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setMaterials((prev) => prev.map((m) => (m.id === tempId ? persisted : m)));
     return { ok: true, id: persisted.id };
   }, [businessId]);
+
+  // ── Paint stock ───────────────────────────────────────────────────────────
+  // Inventory on hand, not a usage log. Same optimistic + rollback
+  // contract as everything else in here.
+
+  const addPaintStock = useCallback(async (
+    item: Omit<PaintStockItem, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>,
+  ): Promise<{ ok: boolean; id?: string; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business loaded.' };
+
+    const tempId = `ps_${Date.now()}`;
+    const nowIso = new Date().toISOString();
+    const optimistic: PaintStockItem = {
+      ...item,
+      id: tempId,
+      businessId,
+      createdAt: nowIso,
+      updatedAt: nowIso,
+    };
+    setPaintStock((prev) => [...prev, optimistic]);
+
+    const payload = {
+      ...paintStockToRow(item),
+      business_id: businessId,
+    };
+
+    const { data, error: insErr } = await supabase
+      .from('paint_stock')
+      .insert(payload)
+      .select('*')
+      .single();
+
+    if (insErr || !data) {
+      const msg = describeError(insErr) || 'Failed to add stock item';
+      console.error('[store] addPaintStock failed:', msg);
+      setError(msg);
+      setPaintStock((prev) => prev.filter((p) => p.id !== tempId));
+      return { ok: false, error: msg };
+    }
+
+    const persisted = rowToPaintStock(data);
+    setPaintStock((prev) => prev.map((p) => (p.id === tempId ? persisted : p)));
+    return { ok: true, id: persisted.id };
+  }, [businessId]);
+
+  const updatePaintStock = useCallback((id: string, updates: Partial<PaintStockItem>) => {
+    let prevItem: PaintStockItem | undefined;
+    const nowIso = new Date().toISOString();
+    setPaintStock((prev) => {
+      prevItem = prev.find((p) => p.id === id);
+      return prev.map((p) => (p.id === id ? { ...p, ...updates, updatedAt: nowIso } : p));
+    });
+
+    (async () => {
+      const row = { ...paintStockToRow(updates), updated_at: nowIso };
+      const { error: updErr } = await supabase.from('paint_stock').update(row).eq('id', id);
+      if (updErr) {
+        console.error('[store] updatePaintStock failed:', describeError(updErr));
+        setError(describeError(updErr));
+        if (prevItem) {
+          setPaintStock((prev) => prev.map((p) => (p.id === id ? prevItem! : p)));
+        }
+      }
+    })();
+  }, []);
+
+  const deletePaintStock = useCallback((id: string) => {
+    let prevItem: PaintStockItem | undefined;
+    setPaintStock((prev) => {
+      prevItem = prev.find((p) => p.id === id);
+      return prev.filter((p) => p.id !== id);
+    });
+
+    (async () => {
+      const { error: delErr } = await supabase.from('paint_stock').delete().eq('id', id);
+      if (delErr) {
+        console.error('[store] deletePaintStock failed:', describeError(delErr));
+        setError(describeError(delErr));
+        if (prevItem) {
+          setPaintStock((prev) => [...prev, prevItem!]);
+        }
+      }
+    })();
+  }, []);
 
   /**
    * Ensure a job has at least one quote — return the existing first quote's
@@ -3008,7 +3118,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   return (
     <StoreContext.Provider
       value={{
-        jobs, entries, scheduleItems, materials, quotes, settings, invoices, bankTransactions,
+        jobs, entries, scheduleItems, materials, paintStock, quotes, settings, invoices, bankTransactions,
         jobImports, quoteAttachments,
         businessId, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
@@ -3017,6 +3127,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         addInvoice, updateInvoice, markInvoicePaid,
         confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,
         addMaterials, addMaterialFromOverhead,
+        addPaintStock, updatePaintStock, deletePaintStock,
         addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment,
         updateQuote, deleteQuote,
         commitImportAsLink, commitImportAsCreate, commitImportAsSkip,

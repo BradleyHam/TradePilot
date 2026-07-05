@@ -53,6 +53,7 @@ import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
   Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split, Send,
+  Paintbrush,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
@@ -3037,27 +3038,32 @@ function chipDateLabel(iso: string, todayISO: string): string {
 }
 
 // ── Section: Quick add ──────────────────────────────────────────────────────
-const QUICK_ADD: { type: 'hours' | 'expense' | 'income'; label: string; icon: React.ElementType; accent: string }[] = [
-  { type: 'hours',   label: 'Log hours',   icon: Clock,      accent: 'bg-blue-50 text-blue-600' },
-  { type: 'expense', label: 'Log expense', icon: Receipt,    accent: 'bg-red-50 text-red-600' },
-  { type: 'income',  label: 'Log income',  icon: DollarSign, accent: 'bg-green-50 text-green-600' },
+// href-based (was entry-type-based) so non-entry destinations can live
+// here too. Paint stock rides in this grid because it's NOT in the mobile
+// bottom nav (that's at its 7-item limit per the note in bottom-nav.tsx)
+// — this card is the phone's path to /stock.
+const QUICK_ADD: { href: string; label: string; icon: React.ElementType; accent: string }[] = [
+  { href: '/entry?type=hours',   label: 'Log hours',   icon: Clock,      accent: 'bg-blue-50 text-blue-600' },
+  { href: '/entry?type=expense', label: 'Log expense', icon: Receipt,    accent: 'bg-red-50 text-red-600' },
+  { href: '/entry?type=income',  label: 'Log income',  icon: DollarSign, accent: 'bg-green-50 text-green-600' },
+  { href: '/stock',              label: 'Paint stock', icon: Paintbrush, accent: 'bg-purple-50 text-purple-600' },
 ];
 
 function QuickAddSection() {
   return (
     <section>
       <SectionLabel>Quick add</SectionLabel>
-      <div className="grid grid-cols-3 gap-2">
-        {QUICK_ADD.map(({ type, label, icon: Icon, accent }) => (
+      <div className="grid grid-cols-4 gap-2">
+        {QUICK_ADD.map(({ href, label, icon: Icon, accent }) => (
           <Link
-            key={type}
-            href={`/entry?type=${type}`}
-            className="flex flex-col items-center justify-center gap-1.5 p-3 rounded-2xl bg-card border border-border hover:border-primary/40 hover:bg-accent transition-colors min-h-[80px] active:scale-95"
+            key={href}
+            href={href}
+            className="flex flex-col items-center justify-center gap-1.5 p-2 rounded-2xl bg-card border border-border hover:border-primary/40 hover:bg-accent transition-colors min-h-[80px] active:scale-95"
           >
             <div className={cn('w-9 h-9 rounded-xl flex items-center justify-center', accent)}>
               <Icon size={18} strokeWidth={1.8} />
             </div>
-            <span className="text-xs font-medium text-foreground">{label}</span>
+            <span className="text-xs font-medium text-foreground text-center leading-tight">{label}</span>
           </Link>
         ))}
       </div>

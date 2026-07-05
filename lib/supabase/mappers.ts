@@ -8,6 +8,7 @@ import type {
   FolderFileCounts, ParsedQuote,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
   ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
+  PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
 } from '../types';
@@ -297,6 +298,38 @@ export function materialToRow(m: Partial<Material>): Row {
   if (m.area !== undefined) out.area = m.area || null;
   if (m.notes !== undefined) out.notes = m.notes || null;
   if (m.source !== undefined) out.source = m.source; // CHECK constrains to 'bill' | 'overhead' — don't coerce to null
+  return out;
+}
+
+// ── PaintStock ──────────────────────────────────────────────────────────────
+export function rowToPaintStock(r: Row): PaintStockItem {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    product: r.product as string,
+    brand: asString(r.brand),
+    color: asString(r.color),
+    kind: (asString(r.kind) as PaintStockKind | undefined) ?? 'topcoat',
+    // litres is genuinely nullable (test pots / spray cans), and 0 is a
+    // meaningful value ("ran out, need to buy") — asNumber preserves both.
+    litres: asNumber(r.litres),
+    location: (asString(r.location) as PaintStockLocation | undefined) ?? 'garage',
+    notes: asString(r.notes),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function paintStockToRow(p: Partial<PaintStockItem>): Row {
+  const out: Row = {};
+  if (p.businessId !== undefined) out.business_id = p.businessId;
+  if (p.product !== undefined) out.product = p.product;
+  if (p.brand !== undefined) out.brand = p.brand || null;
+  if (p.color !== undefined) out.color = p.color || null;
+  if (p.kind !== undefined) out.kind = p.kind; // CHECK-constrained — never null
+  if (p.litres !== undefined) out.litres = p.litres ?? null;
+  if (p.location !== undefined) out.location = p.location; // CHECK-constrained — never null
+  if (p.notes !== undefined) out.notes = p.notes || null;
   return out;
 }
 

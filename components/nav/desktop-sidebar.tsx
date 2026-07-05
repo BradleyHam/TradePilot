@@ -2,7 +2,7 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Settings, Hammer, ListChecks, Sparkles, Megaphone } from 'lucide-react';
+import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Settings, Hammer, ListChecks, Sparkles, Megaphone, Paintbrush } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 // Leads sits between Entry and Jobs — the natural flow is Entry (log
@@ -18,6 +18,11 @@ const NAV_ITEMS = [
   { href: '/jobs', label: 'Jobs', icon: Briefcase },
   { href: '/money', label: 'Money', icon: DollarSign },
   { href: '/schedule', label: 'Schedule', icon: CalendarDays },
+  // Stock sits after Schedule: it's a "before/after the day's work"
+  // check (what's in the van, what to buy), not part of the log→chase→
+  // work flow above. NOT in the mobile bottom nav — that's at its
+  // 7-item limit — phones reach it via the Home quick-add card.
+  { href: '/stock', label: 'Paint stock', icon: Paintbrush },
   { href: '/marketing', label: 'Marketing', icon: Megaphone },
 ];
 
