@@ -24,6 +24,15 @@ import type { ParsedBill } from './types';
 const NZ_GST_RATE = 0.15;
 const GST_TOLERANCE_DOLLARS = 0.10;
 
+// Single-tenant app: every bill is a purchase made BY our own business, so
+// our own name can never be the supplier (see AGENTS.md — the first/only user
+// is Lakeside Painting Ltd). Xero-generated supplier invoices (e.g. Trademax)
+// print the buyer's name prominently, which occasionally makes the parser
+// return "Lakeside Painting" as the supplier — that's the buyer, not the
+// seller. This pattern lets us catch and drop that mistake. Matches "Lakeside
+// Painting" / "Lakeside Painting Ltd" / "Lakeside Painting Limited".
+const OWN_BUSINESS_NAME_PATTERN = /lakeside\s*painting/i;
+
 const PARSE_TOOL: Tool = {
   name: 'emit_bill',
   description:
@@ -88,6 +97,19 @@ const SYSTEM_PROMPT = [
   'shorter, may have letters like "D69359" or "ACC-1234"). When in doubt,',
   'prefer the longer all-digit value that appears under the "Invoice',
   'Number" header. Never return a customer-account code as invoiceNumber.',
+  '',
+  'SUPPLIER vs BUYER. The supplier is the business that ISSUED this invoice',
+  '— the seller you pay. Every bill in this system is a PURCHASE made by',
+  'our own business, "Lakeside Painting Ltd" (may appear as "Lakeside',
+  'Painting"). We are ALWAYS the buyer — the party the invoice is addressed',
+  'to, usually under a "Bill To", "Customer", "Sold To", "Charge To" or',
+  '"Deliver To" heading. NEVER return Lakeside Painting as the supplier.',
+  'The supplier is the OTHER company on the document — the issuer, typically',
+  'shown at the top with its own logo, GST number and bank/payment details',
+  '(e.g. "Trademax NZ Limited", "Resene Paints Ltd", "Dulux"). This matters',
+  'for invoices generated through Xero, where the buyer name can appear',
+  'prominently. If the only clearly-named business is Lakeside Painting,',
+  'omit supplier rather than returning our own name.',
   '',
   'JOB HINT. We use this to fuzzy-match the bill to a job in the system.',
   'Prefer in order:',
@@ -229,7 +251,17 @@ export function normaliseParsedBill(raw: Record<string, unknown>): ParsedBill {
       : 'low',
   };
 
-  if (typeof raw.supplier === 'string') parsed.supplier = raw.supplier;
+  if (typeof raw.supplier === 'string') {
+    if (OWN_BUSINESS_NAME_PATTERN.test(raw.supplier)) {
+      // The model returned our own business as the supplier — that's the
+      // buyer, not the seller. Wrong data is worse than missing: drop it and
+      // downgrade confidence so the UI nudges the user to check the vendor.
+      console.warn('[bill-parser] supplier looked like the buyer (Lakeside Painting); dropping', raw.supplier);
+      parsed.confidence = 'low';
+    } else {
+      parsed.supplier = raw.supplier;
+    }
+  }
   if (typeof raw.invoiceNumber === 'string') parsed.invoiceNumber = raw.invoiceNumber;
   if (typeof raw.invoiceDate === 'string') parsed.invoiceDate = raw.invoiceDate;
   if (typeof raw.dueDate === 'string') parsed.dueDate = raw.dueDate;
