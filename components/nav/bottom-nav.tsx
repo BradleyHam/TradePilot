@@ -2,8 +2,9 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Sparkles, Megaphone } from 'lucide-react';
+import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Sparkles, Megaphone, Clock } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useStore } from '@/lib/store';
 
 // Leads slots between Entry and Jobs to match the desktop sidebar order
 // and the user's mental flow (log → chase → work → showcase).
@@ -23,13 +24,23 @@ const NAV_ITEMS = [
   { href: '/marketing', label: 'Marketing', icon: Megaphone },
 ];
 
+// Employees see a deliberately tiny, money-free nav — just log hours and
+// check their schedule. Everything financial is absent (and RLS-blocked
+// even if the URL were typed in directly).
+const EMPLOYEE_NAV_ITEMS = [
+  { href: '/my/hours', label: 'Hours', icon: Clock },
+  { href: '/my/schedule', label: 'Schedule', icon: CalendarDays },
+];
+
 export function BottomNav() {
   const pathname = usePathname();
+  const { role } = useStore();
+  const items = role === 'employee' ? EMPLOYEE_NAV_ITEMS : NAV_ITEMS;
 
   return (
     <nav className="fixed bottom-0 left-0 right-0 z-50 bg-card border-t border-border md:hidden">
       <div className="flex items-center justify-around h-16 px-2 pb-safe">
-        {NAV_ITEMS.map(({ href, label, icon: Icon }) => {
+        {items.map(({ href, label, icon: Icon }) => {
           const active = pathname === href || pathname.startsWith(href + '/');
           return (
             <Link

@@ -2,8 +2,9 @@
 
 import Link from 'next/link';
 import { usePathname } from 'next/navigation';
-import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Settings, Hammer, ListChecks, Sparkles, Megaphone, Paintbrush } from 'lucide-react';
+import { Home, PenLine, Briefcase, DollarSign, CalendarDays, Settings, Hammer, ListChecks, Sparkles, Megaphone, Paintbrush, Clock } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { useStore } from '@/lib/store';
 
 // Leads sits between Entry and Jobs — the natural flow is Entry (log
 // an enquiry) → Leads (chase the open ones) → Jobs (work the booked
@@ -26,8 +27,17 @@ const NAV_ITEMS = [
   { href: '/marketing', label: 'Marketing', icon: Megaphone },
 ];
 
+// Money-free employee nav (see BottomNav for rationale).
+const EMPLOYEE_NAV_ITEMS = [
+  { href: '/my/hours', label: 'Log hours', icon: Clock },
+  { href: '/my/schedule', label: 'My schedule', icon: CalendarDays },
+];
+
 export function DesktopSidebar() {
   const pathname = usePathname();
+  const { role } = useStore();
+  const isEmployee = role === 'employee';
+  const navItems = isEmployee ? EMPLOYEE_NAV_ITEMS : NAV_ITEMS;
 
   return (
     <aside className="hidden md:flex md:flex-col w-60 shrink-0 border-r border-border bg-card h-screen sticky top-0">
@@ -44,7 +54,7 @@ export function DesktopSidebar() {
 
       {/* Nav */}
       <nav className="flex-1 px-3 py-4 space-y-1">
-        {NAV_ITEMS.map(({ href, label, icon: Icon }) => {
+        {navItems.map(({ href, label, icon: Icon }) => {
           const active = pathname === href || pathname.startsWith(href + '/');
           return (
             <Link
@@ -64,8 +74,9 @@ export function DesktopSidebar() {
         })}
       </nav>
 
-      {/* Settings */}
-      <div className="px-3 pb-4 border-t border-border pt-4">
+      {/* Settings — owner only. Employees have no settings page (it exposes
+          GST + business config); they sign out from their Hours screen. */}
+      <div className={cn('px-3 pb-4 border-t border-border pt-4', isEmployee && 'hidden')}>
         <Link
           href="/settings"
           className={cn(

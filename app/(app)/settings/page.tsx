@@ -7,7 +7,7 @@ import { supabase } from '@/lib/supabase/client';
 import { Separator } from '@/components/ui/separator';
 import { Badge } from '@/components/ui/badge';
 import {
-  Building2, User, Palette, Bell, Database, Info, ChevronRight, Hammer, LogOut, FileText,
+  Building2, User, Palette, Bell, Database, Info, ChevronRight, Hammer, LogOut, FileText, Users,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -100,6 +100,16 @@ export default function SettingsPage() {
           <SettingRow icon={Building2} label="Business name" value={businessName} />
           <SettingRow icon={User} label="Owner" value="Brad Hamilton" />
           <SettingRow icon={Palette} label="Industry" value="Painting" />
+        </SettingSection>
+
+        {/* Team */}
+        <SettingSection title="Team">
+          <SettingRow
+            icon={Users}
+            label="Employees"
+            value="Add logins so staff can log their own hours"
+            onClick={() => router.push('/settings/team')}
+          />
         </SettingSection>
 
         {/* Quotes — defaults that drive every generated quote PDF. */}

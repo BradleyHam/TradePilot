@@ -57,7 +57,7 @@ export type ActivityType =
  * - `apprentice`   — 2nd-year+ with some skill, supervised. Lower target
  *                    because productivity is lower while learning.
  * - `helper`       — Inexperienced labourer. Prep, sanding, masking,
- *                    cleanup. Brad's partner Sophie sits here.
+ *                    cleanup. Brad's partner Suzie sits here.
  * - `subcontractor`— Paid per-job, not per-hour, but we still log time
  *                    so the job's hours math is honest. Charge-out rate
  *                    typically 60-70% of owner rate.
@@ -79,6 +79,34 @@ export const WORKER_RATE_SETTING_KEYS: Record<WorkerKind, string> = {
   helper:        'worker_rate_helper',
   subcontractor: 'worker_rate_subcontractor',
 };
+
+/**
+ * A person's role within a business. Drives what they can see and do.
+ * - `owner`    — full access (Brad). Sees money, tax, everything; can add
+ *                employees.
+ * - `employee` — money-blind. Logs their own hours to jobs, sees their
+ *                schedule + job details minus any financials. Enforced at
+ *                the database (RLS), not just hidden in the UI.
+ */
+export type MemberRole = 'owner' | 'employee';
+
+/**
+ * Links a signed-in auth user to a business with a role. One row per
+ * (business, user). The owner is backfilled from `businesses.owner_id`;
+ * employees are added later (Supabase dashboard for now, in-app screen
+ * once Phase 4 ships).
+ */
+export interface BusinessMember {
+  id: string;
+  businessId: string;
+  userId: string;
+  role: MemberRole;
+  /** Friendly name shown in the team list + attributed on their hours. */
+  displayName?: string;
+  /** Which worker tier this person's logged hours default to (e.g. Suzie = 'helper'). */
+  workerKind?: WorkerKind;
+  createdAt: string;
+}
 
 export type QuoteStatus =
   | 'draft'
@@ -326,6 +354,14 @@ export interface Entry {
    * workerKind.
    */
   helperHours?: number;
+  /**
+   * The auth user who logged this entry. Set for hours logged by an
+   * EMPLOYEE (e.g. Suzie logging her own time) — the database requires it
+   * to match the signed-in user for employee inserts, and it's how their
+   * hours are attributed on payroll timesheets. Null/undefined for the
+   * owner's own historical entries. Only meaningful for `type === 'hours'`.
+   */
+  loggedByUserId?: string;
   supplier?: string;
   paymentMethod?: string;
   gstApplies: boolean;

@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { StoreProvider } from '@/lib/store';
 import { BottomNav } from '@/components/nav/bottom-nav';
 import { DesktopSidebar } from '@/components/nav/desktop-sidebar';
+import { RoleGuard } from '@/components/nav/role-guard';
 import { supabase } from '@/lib/supabase/client';
 
 type AuthState = 'loading' | 'signed-in' | 'signed-out';
@@ -46,6 +47,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
 
   return (
     <StoreProvider>
+      <RoleGuard />
       <div className="flex h-full min-h-screen">
         <DesktopSidebar />
         <main className="flex-1 flex flex-col min-h-screen overflow-y-auto pb-20 md:pb-0">

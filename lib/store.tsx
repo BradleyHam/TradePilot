@@ -9,12 +9,14 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
+  rowToBusinessMember,
 } from './supabase/mappers';
 import type {
-  Job, Entry, EntryType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
+  Job, Entry, EntryType, ActivityType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
+  BusinessMember, MemberRole,
 } from './types';
 import { compressImage } from './image-compress';
 
@@ -96,6 +98,15 @@ interface StoreState {
    */
   quoteAttachments: QuoteAttachment[];
   businessId: string | null;
+  /**
+   * The signed-in user's role in the current business. Drives UI gating
+   * (employees don't see money). Defaults to 'owner' until the membership
+   * row resolves (safe for the current single-user state — the real
+   * money guard is RLS at the database, not this flag). See BusinessMember.
+   */
+  role: MemberRole;
+  /** The signed-in user's membership row for this business, if resolved. */
+  membership: BusinessMember | null;
   loading: boolean;
   error: string | null;
 
@@ -154,6 +165,21 @@ interface StoreState {
   addEntry: (entry: Entry) => void;
   updateEntry: (id: string, updates: Partial<Entry>) => void;
   deleteEntry: (id: string) => void;
+  /**
+   * Employee-facing helper: log the signed-in user's OWN hours against a
+   * job. Fills in businessId, workerKind (from the membership), and the
+   * required `loggedByUserId = my auth uid` so the row satisfies the
+   * employee RLS insert policy. Wraps addEntry, so it also triggers the
+   * hours→in-progress auto-advance + schedule auto-complete. Owners can
+   * use it too (defaults workerKind to 'owner').
+   */
+  logMyHours: (input: {
+    jobId: string;
+    hours: number;
+    activity?: ActivityType;
+    note?: string;
+    entryDate?: string;
+  }) => void;
   addScheduleItem: (item: ScheduleItem) => void;
   updateScheduleItem: (id: string, updates: Partial<ScheduleItem>) => void;
   deleteScheduleItem: (id: string) => void;
@@ -517,6 +543,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   /* eslint-enable react-hooks/refs */
   const [quoteAttachments, setQuoteAttachments] = useState<QuoteAttachment[]>([]);
   const [businessId, setBusinessId] = useState<string | null>(null);
+  const [role, setRole] = useState<MemberRole>('owner');
+  const [membership, setMembership] = useState<BusinessMember | null>(null);
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
 
@@ -555,12 +583,58 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       const bizId = bizRows[0].id as string;
       setBusinessId(bizId);
 
+      // Resolve the signed-in user's role in this business. Best-effort:
+      // if the business_members table doesn't exist yet (migration 025 not
+      // applied) or there's no row for this user, we DON'T block the app —
+      // we fall back to 'owner' so Brad's single-user experience is
+      // unchanged. This flag only drives UI gating; the real money guard
+      // is RLS. Employees will always have a membership row (they can't
+      // sign in without one being created).
+      // Local copy (state setters don't update mid-run) so the jobs fetch
+      // below can pick the money-free `jobs_public` view for employees.
+      let resolvedRole: MemberRole = 'owner';
+      try {
+        const { data: { user } } = await supabase.auth.getUser();
+        if (user) {
+          const { data: memRows, error: memErr } = await supabase
+            .from('business_members')
+            .select('*')
+            .eq('business_id', bizId)
+            .eq('user_id', user.id)
+            .limit(1);
+          if (memErr) {
+            // Table missing / RLS / migration pending — log, keep owner default.
+            console.warn('[store] business_members lookup failed (defaulting role=owner):', memErr.message);
+            setMembership(null);
+            setRole('owner');
+          } else if (memRows && memRows.length > 0) {
+            const mem = rowToBusinessMember(memRows[0]);
+            setMembership(mem);
+            setRole(mem.role);
+            resolvedRole = mem.role;
+          } else {
+            // No membership row yet (e.g. owner backfill not run). Owner default.
+            setMembership(null);
+            setRole('owner');
+          }
+        }
+      } catch (roleErr) {
+        console.warn('[store] role resolution threw (defaulting role=owner):', describeError(roleErr));
+        setMembership(null);
+        setRole('owner');
+      }
+
       // Fetch all in parallel. Small dataset — fine for now.
       // Errors on individual tables (e.g. a missing-table during migration)
       // shouldn't take down the whole page. Each table degrades to an empty
       // array and the error is logged with full detail.
+      // Employees can't read the base `jobs` table (owner-only RLS) — they
+      // read the money-free `jobs_public` view instead. rowToJob tolerates
+      // the missing money columns (they map to undefined). Owners read the
+      // full base table as before.
+      const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
       const [j, e, s, m, q, st, inv, bnk, ji, qa, ps] = await Promise.all([
-        supabase.from('jobs').select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
+        supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
         supabase.from('materials').select('*').eq('business_id', bizId).order('used_on', { ascending: false }),
@@ -1085,6 +1159,41 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
   }
 
+  /**
+   * Auto-advance a job to `in-progress` the moment real hours are logged
+   * against it. Logging hours IS the act of starting the job, so Brad
+   * shouldn't have to also tap the status dropdown.
+   *
+   * FORWARD-ONLY and conservative — mirrors `maybeAdvanceJobStatus` (the
+   * invoice-driven one). It only ever promotes from a PRE-START status
+   * (lead / quoted / accepted / booked) up to `in-progress`. It never
+   * demotes a job that's already further along (`in-progress`, or the
+   * terminal `completed` / `invoiced` / `paid` / `lost`) — so logging a
+   * late/backdated hour on a finished job can't drag it back to active.
+   *
+   * Inline ref-reading helper (same shape as
+   * `maybeCompleteJobBookingForEntry` above) so it can run before
+   * `maybeAdvanceJobStatus` is defined later in the component.
+   */
+  function maybeAdvanceJobToInProgress(entry: { type?: EntryType; jobId?: string; hours?: number }) {
+    if (entry.type !== 'hours') return;
+    if (!entry.jobId) return;
+    if (!entry.hours || entry.hours <= 0) return;
+
+    const job = jobsRef.current.find((j) => j.id === entry.jobId);
+    if (!job) return;
+
+    // Only promote from a status that sits BEFORE in-progress in the chain.
+    const PRE_START: JobStatus[] = ['lead', 'quoted', 'accepted', 'booked'];
+    if (!PRE_START.includes(job.status)) return;
+
+    // eslint-disable-next-line no-console
+    console.log('[store] hours logged → auto-advancing job to in-progress', {
+      jobId: job.id, from: job.status,
+    });
+    updateJob(job.id, { status: 'in-progress' });
+  }
+
   const addEntry = useCallback((entry: Entry) => {
     if (!businessId) {
       console.warn('[store] addEntry called with no businessId; ignoring');
@@ -1098,6 +1207,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // the supabase round-trip. The schedule_items mutation rides along
     // separately and is fire-and-forget.
     maybeCompleteJobBookingForEntry(entry);
+    // Logging hours starts the job — bump status to in-progress if it's
+    // still sitting in a pre-start state. Forward-only; see helper.
+    maybeAdvanceJobToInProgress(entry);
 
     (async () => {
       const row = entryToRow({ ...entry, businessId });
@@ -1129,6 +1241,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // Fire auto-complete optimistically so the UI reacts immediately to
     // edits like "added a jobId" or "moved date onto a scheduled day".
     if (nextEntry) maybeCompleteJobBookingForEntry(nextEntry);
+    // Same for the in-progress bump — e.g. an entry that just gained a
+    // jobId, or was switched to type 'hours', should start its job.
+    if (nextEntry) maybeAdvanceJobToInProgress(nextEntry);
 
     (async () => {
       const row = entryToRow(updates);
@@ -2333,6 +2448,40 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  const logMyHours = useCallback((input: {
+    jobId: string;
+    hours: number;
+    activity?: ActivityType;
+    note?: string;
+    entryDate?: string;
+  }) => {
+    if (!businessId) {
+      console.warn('[store] logMyHours called with no businessId; ignoring');
+      return;
+    }
+    const todayIso = new Date().toISOString().slice(0, 10);
+    // Attribute to the signed-in user. For an employee this uid is what the
+    // RLS insert policy checks; for the owner it's harmless extra provenance.
+    const uid = membership?.userId;
+    const entry: Entry = {
+      id: crypto.randomUUID(),
+      businessId,
+      jobId: input.jobId,
+      type: 'hours',
+      hours: input.hours,
+      activity: input.activity,
+      // description is NOT NULL in the DB — fall back to the activity or a
+      // generic label so an empty note never violates the constraint.
+      description: (input.note?.trim()) || (input.activity ? `${input.activity} work` : 'Hours'),
+      entryDate: input.entryDate || todayIso,
+      gstApplies: false,
+      workerKind: membership?.workerKind ?? 'owner',
+      loggedByUserId: uid,
+      createdAt: new Date().toISOString(),
+    };
+    addEntry(entry);
+  }, [businessId, membership, addEntry]);
+
   const addScheduleItem = useCallback((item: ScheduleItem) => {
     if (!businessId) {
       console.warn('[store] addScheduleItem called with no businessId; ignoring');
@@ -3120,9 +3269,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       value={{
         jobs, entries, scheduleItems, materials, paintStock, quotes, settings, invoices, bankTransactions,
         jobImports, quoteAttachments,
-        businessId, loading, error,
+        businessId, role, membership, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
-        addEntry, updateEntry, deleteEntry,
+        addEntry, updateEntry, deleteEntry, logMyHours,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
         confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,

@@ -40,7 +40,7 @@ This means:
 - Surface deductible expenses Brad might be miscategorising as personal.
 - Flag timing decisions that would land income in a different tax year (e.g. invoice 30 March vs 1 April).
 - Remind him about the once-a-year decisions: shareholder salary reclassification, provisional tax instalments (Aug / Jan / May), GST returns, end-of-year IR4 filing.
-- Suggest legitimate income-shifting where his partner does paid work (see "Brad's tax structure" below — biggest free win available right now).
+- Income-splitting via Suzie's wages is now IN PLACE (she's on payroll — see "Brad's tax structure" below). Focus shifts from "set this up" to keeping it defensible: market-rate hourly, PAYE returns filed on time, wages deducted before year-end salary reclassification.
 - Flag when an expense should run through the company books rather than personal, and vice versa.
 
 **Constraints:**
@@ -409,6 +409,23 @@ low-confidence ⚠ flag when the parse was shaky.
 these render with a proper source pill out of the box — no follow-up UI work
 needed.
 
+**Attachments (added July 2026).** The route now saves any photos / plan PDFs
+on the forwarded email onto the lead, so a "please quote this" email with
+site photos + a drawing set lands fully populated. It reuses the app's own
+storage convention rather than inventing a new one: `saveLeadAttachments()`
+creates a stub `draft` quote linked to the job (identical to
+`store.ensureJobHasQuote`), then uploads each file to the `quote-attachments`
+bucket at `{businessId}/{quoteId}/{uuid}__{safeName}` and inserts a
+`quote_attachments` row — so the JobDetailSheet's existing "Plans + photos"
+panel renders them with **zero UI / schema / type changes**. Kind is inferred
+by `inferLeadAttachmentKind` (PDF → `plan`, image → `scope_photo`, keyword
+overrides for before/after/progress). Guards: inline signature/logo images
+(`disposition: inline` or a `content_id`) are skipped, only image/* + PDF are
+kept, ≤12 files, ≤25 MB each. Best-effort and non-throwing — an upload hiccup
+can never lose the lead itself (attachments run *after* the job insert). The
+response includes `attachments: { saved, skipped }`. Same CloudMailin base64
+attachment shape as inbound-bill. No new env vars.
+
 **Dedup.** Content-based, no schema change (jobs has no `source_message_id`):
 within the last 7 days, a new email lead is a dupe if it shares a `client_email`
 with a recent `source='email'` lead, OR the same normalised `name`+`location`
@@ -458,7 +475,7 @@ Pre-registration GST claim under s 21B may be available for assets/inventory bou
 
 **Tax year.** NZ standard, **1 April → 31 March**. We are currently in tax year **2026/27** (1 April 2026 – 31 March 2027). Previous year **2025/26** (1 April 2025 – 31 March 2026) was *mostly dormant* — only Jan–Mar 2026 contains real activity. **2025/26 IR4 is due 7 July 2026** and should reflect this dormant-then-restarted shape.
 
-**Payroll (EMP) account — registered, never used.** Lakeside Painting Ltd is registered as an employer (`136-377-892-EMP004`), but no-one has ever been paid PAYE wages. Monthly nil returns must be filed for every period the EMP is open, or IRD assesses **$250 per period default penalty**. **Keep the EMP open** — it's the channel for putting Brad's partner on payroll later. File nil EI returns for outstanding periods (currently April + May 2026 visible).
+**Payroll (EMP) account — now live (July 2026).** Lakeside Painting Ltd is registered as an employer (`136-377-892-EMP004`) and, as of July 2026, is **actually paying PAYE wages** (Suzie — see Partner below). Was previously registered-but-never-used, requiring monthly *nil* returns; from the period she starts being paid, those become **real EI returns with PAYE**. Still **$250 per period default penalty** for a missed filing, so file every period on time. Any nil-return periods before she started being paid (e.g. April + May 2026 if not already filed) still need filing.
 
 **Year-end mechanism.** Brad takes money out by ad-hoc bank transfers from the business account to personal savings (drawings, posted to shareholder current account). At year-end, **most drawings are reclassified as shareholder salary** — the standard one-person-Ltd move. Net effect: company shows ~$0 profit, Brad pays tax at personal rates instead of the 28% company rate. The tax estimator already assumes this approach.
 
@@ -466,9 +483,30 @@ Reconciling bank transfers to savings/tax-savings: **always "Ignore (it's a tran
 
 **No accountant.** Brad does his own books. **This raises the bar for Claude — be careful, consistent, conservative. If unsure, say so.** The cost of a small mistake is real money out of his pocket with no second pair of eyes to catch it.
 
-**Partner.** Brad's girlfriend (pregnant, due late 2026). Helps **informally** — masking, sanding, prep, light admin. Currently **not on payroll, not invoicing as a contractor, not paid for her time**. The internal $25–30/hr rate currently mentioned is a costing assumption only, not an actual money movement.
+**Partner.** Suzie — Brad's girlfriend (pregnant, due late 2026). Helps on jobs — masking, sanding, prep, light admin.
 
-**This is the single biggest tax-saving move Brad isn't yet taking.** Putting her on payroll (or contracting with IR330C) at a market rate for the hours she actually works would shift income from his marginal rate to her lower brackets, saving an estimated **$2,000–3,000/year**. Setup needed: payroll registration OR contractor agreement, timesheets, market-rate hourly. *Claude should bring this up periodically until it's set up.*
+**Now on payroll (confirmed July 2026).** Suzie is being paid PAYE wages through Lakeside Painting Ltd. This is the income-splitting move that was previously flagged as the biggest tax-saving opportunity — it's now in place, shifting income from Brad's marginal rate to her lower brackets (est. **$2,000–3,000/year** saved). Consequences that flow from this and should stay consistent everywhere:
+- The EMP account (`136-377-892-EMP004`) is **live and in use** now, not dormant — see the payroll note above.
+- Real PAYE returns replace nil returns from the period she started being paid; keep filing on time to avoid the $250/period penalty.
+- Her wages are a **deductible expense** to the company (s DA 1) and reduce company profit before the year-end shareholder-salary reclassification.
+- **Rate + hours (confirmed July 2026):** target **~25 hrs/week at $35/hr** = **$875/week gross** (~**$45,500/yr** at a full 52 weeks; less in practice given parental leave late 2026). $35/hr is a defensible market rate for skilled prep/masking/sanding + admin — keep timesheets so the hours are evidenced if IRD ever asks.
+- **Working from 15 July 2026:** from this date, on-site work sessions include Suzie — so hours logged from 15 July onward should capture her time too (currently as `helperHours` on Brad's own hours entry; eventually via her own employee login — see below). Treat 15 July as the start of her tracked working hours; confirm whether it also aligns with her first PAYE pay period.
+
+**Employee accounts (planned, July 2026).** Brad wants to give Suzie (and future employees) their own login to log their own hours against jobs, with a **money-blind** view. The current app is single-user (RLS scoped to `owner_id = auth.uid()`, login hardcoded to Brad); this is the main architectural lift. The `workerKind`/`helperHours` data model is the foundation — an employee's hours are just `hours` entries with their own `workerKind`.
+
+Decisions (confirmed July 2026):
+- **One app, role-gated** — NOT a separate build. Suzie logs into the same app; her role hides money pages/buttons in the UI *and* money tables at the database (RLS), so money-blindness is enforced server-side, not just visually.
+- **Employee (v1) can:** log their own hours to jobs; see their upcoming schedule; see job details *minus money* (client, address, scope — never quote/invoice/income/tax); add a note + photo per shift.
+- **Job access:** any active job (no per-job assignment step for Brad).
+- **Roles:** `owner` (Brad — full app) and `employee` (Suzie). Needs a `business_members` table (business_id, user_id, role, display_name, worker_kind) + RLS rewritten from `owner_id = auth.uid()` to membership-based. Money-blindness for the `jobs` table (which has money columns) needs employee-facing **views** that omit money columns, since Postgres column privileges can't distinguish two app users on the same `authenticated` role.
+- Adding Suzie's auth user: originally a Supabase dashboard step, but Phase 4 will build an **in-app owner-only "Add employee"** screen (server route + service-role key) so Brad never touches the dashboard.
+
+**Build progress (July 2026):**
+- **Phase 1 shipped** — migration `025_business_members.sql`: `business_members` table (business_id, user_id, role, display_name, worker_kind) + own RLS, Brad backfilled as `owner`. Store now resolves `role` + `membership` (defaults to `owner` if no row, so single-user is unchanged).
+- **Phase 2 shipped** — migration `026_employee_access.sql`: money-blindness. KEY INSIGHT — the existing `owner_id = auth.uid()` policies already deny employees everything, so Brad's policies were left untouched; the migration only ADDS narrow employee grants. Employees get: read own business row; read `jobs_public` (money-free view — no estimated_value/quote_amount/invoice_amount; base `jobs` stays owner-only); insert/read/edit/delete ONLY their own `hours` entries (new `entries.logged_by_user_id` column, must equal auth.uid()); read the business's `job_booking` schedule rows. Helper fn `public.current_user_business_ids()`.
+- **Phase 3 shipped** — employee UI (app code only, no SQL). Role-gated nav (`bottom-nav`/`desktop-sidebar` show only Hours + Schedule for employees), `RoleGuard` keeps employees inside `/my/*`, store loads jobs from `jobs_public` when role=employee, new `store.logMyHours()` mutator (attaches `loggedByUserId` + `workerKind` from membership), pages `app/(app)/my/hours` (log-hours: any active job → hours + activity + note, shows job notes as money-free scope) and `app/(app)/my/schedule`.
+- **Phase 4 shipped** — in-app Add Employee. Server route `app/api/employees/route.ts` (POST create, DELETE revoke): verifies the caller is the business OWNER via `businesses.owner_id`, then uses the service-role admin client to `auth.admin.createUser` (email pre-confirmed) + insert a `business_members` employee row. Always creates role=`employee` (can't mint an owner). DELETE removes the membership only (revokes access; doesn't delete the auth user — would trip the `entries.logged_by_user_id` FK). UI: owner-only `app/(app)/settings/team` page (team list + add form with generated temp password + worker-kind picker) linked from Settings → Team. No SQL/migration for this phase — reuses `business_members`. Needs `SUPABASE_SERVICE_ROLE_KEY` (already set for webhooks). To onboard Suzie: Settings → Team → Add employee (helper).
+- Caveat baked in: job `notes` ARE visible to employees (scope lives there) — don't put pricing in job notes.
 
 **Vehicle.** Currently uncertain whether registered to Brad personally or to the company. If personal: mileage method only (IRD rate $1.17/km tier 1, $0.37/km after 14,000 km). If company-owned: full running costs deductible + depreciation, but FBT on private use unless logbook used to apportion. **Brad to check rego paperwork.**
 

@@ -11,6 +11,7 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
+  BusinessMember, MemberRole, WorkerKind,
 } from '../types';
 
 type Row = Record<string, unknown>;
@@ -148,6 +149,7 @@ export function rowToEntry(r: Row): Entry {
     activity: (asString(r.activity) as ActivityType | undefined),
     workerKind: asString(r.worker_kind) as Entry['workerKind'],
     helperHours: asNumber(r.helper_hours),
+    loggedByUserId: asString(r.logged_by_user_id),
     supplier: asString(r.supplier),
     paymentMethod: asString(r.payment_method),
     gstApplies: asBool(r.gst_applies, true),
@@ -185,6 +187,7 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.activity !== undefined) out.activity = e.activity || null;
   if (e.workerKind !== undefined) out.worker_kind = e.workerKind || null;
   if (e.helperHours !== undefined) out.helper_hours = e.helperHours ?? null;
+  if (e.loggedByUserId !== undefined) out.logged_by_user_id = e.loggedByUserId || null;
   if (e.supplier !== undefined) out.supplier = e.supplier || null;
   if (e.paymentMethod !== undefined) out.payment_method = e.paymentMethod || null;
   if (e.gstApplies !== undefined) out.gst_applies = e.gstApplies;
@@ -479,6 +482,18 @@ export function jobImportToRow(i: Partial<JobImport>): Row {
 }
 
 // ── Setting ─────────────────────────────────────────────────────────────────
+export function rowToBusinessMember(r: Row): BusinessMember {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    userId: r.user_id as string,
+    role: (r.role as MemberRole) ?? 'employee',
+    displayName: asString(r.display_name),
+    workerKind: asString(r.worker_kind) as WorkerKind | undefined,
+    createdAt: r.created_at as string,
+  };
+}
+
 export function rowToSetting(r: Row): Setting {
   return {
     businessId: r.business_id as string,
