@@ -145,6 +145,46 @@ async function main() {
     process.exit(1);
   }
 
+  console.log('\n▶ Enquiry WITH attachments (expect new lead + attachments saved)…');
+  // Two real enquiry files (a photo + a plan PDF) plus one inline signature
+  // logo that must be skipped (disposition=inline / content_id set). Content is
+  // just small placeholder bytes — the route uploads bytes, it doesn't validate
+  // the file format.
+  const tinyPng =
+    'iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mNk+M9QDwADhgGAWjR9awAAAABJRU5ErkJggg==';
+  const tinyPdf = Buffer.from('%PDF-1.4\n1 0 obj<<>>endobj\ntrailer<<>>\n%%EOF').toString('base64');
+  const withAttachments = {
+    ...buildPayload({
+      subject: 'Fwd: Timber weatherboard restoration — photos + plan attached',
+      plain: forwardedEnquiry({
+        fromName: 'Priya Nair',
+        fromEmail: 'priya.nair@example.com',
+        originalSubject: 'Timber weatherboard restoration',
+        body:
+          'Hi,\n\nWe are restoring the timber weatherboards at 5 Rata Lane, Hawea. Photos ' +
+          'and the plan showing the walls to be retained are attached. Could you advise an ' +
+          'approach and ballpark cost?\n\nThanks\nPriya\n021 777 6655',
+      }),
+    }),
+    attachments: [
+      { file_name: 'IMG_2297.JPG', content_type: 'image/jpeg', content: tinyPng, size: 1024 },
+      { file_name: 'site-plan-consultant-issue.pdf', content_type: 'application/pdf', content: tinyPdf, size: 2048 },
+      // Inline email-signature logo — must be skipped.
+      { file_name: 'image001.png', content_type: 'image/png', content: tinyPng, size: 512, disposition: 'inline', content_id: '<image001.png@sig>' },
+    ],
+  };
+  const rA = await post(withAttachments, secret);
+  console.log('  ↳', rA.status, rA.body);
+  const att = rA.body.attachments as { saved?: number; skipped?: number } | undefined;
+  if (rA.status !== 200 || !rA.body.ok || !rA.body.jobId || rA.body.dedup) {
+    console.error('✗ Expected 200 + new jobId for the attachment enquiry.');
+    process.exit(1);
+  }
+  if (!att || att.saved !== 2 || (att.skipped ?? 0) < 1) {
+    console.error('✗ Expected attachments {saved:2, skipped>=1} (2 real files kept, inline logo skipped).');
+    process.exit(1);
+  }
+
   console.log('\n▶ Obvious newsletter (expect skipped)…');
   const newsletter = buildPayload({
     subject: 'Fwd: 20% off all Resene paints this weekend only! 🎨',

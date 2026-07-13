@@ -32,12 +32,15 @@
 
 import { NextResponse } from 'next/server';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import crypto from 'crypto';
 import {
   parseEmailLead,
   buildEmailLeadFields,
   normaliseForDedup,
   type EmailLeadFields,
 } from '@/lib/email-lead-parser';
+import { quoteToRow, quoteAttachmentToRow } from '@/lib/supabase/mappers';
+import type { QuoteAttachmentKind } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -53,6 +56,157 @@ interface CloudMailinPayload {
   plain?: unknown;
   html?: unknown;
   subject?: unknown;
+  attachments?: unknown;
+}
+
+// CloudMailin v0.4 attachment shape (same transport as inbound-bill). We read
+// `disposition` + `content_id` too so we can skip inline signature/logo images
+// (those are embedded via `cid:` refs in the HTML body, not real enquiry files).
+interface CloudMailinAttachment {
+  file_name?: unknown;
+  content_type?: unknown;
+  content?: unknown; // base64-encoded
+  size?: unknown;
+  disposition?: unknown;
+  content_id?: unknown;
+}
+
+// Guardrails so a hostile / oversized email can't blow up storage.
+const MAX_LEAD_ATTACHMENTS = 12;
+const MAX_LEAD_ATTACHMENT_BYTES = 25 * 1024 * 1024; // 25 MB per file
+
+/**
+ * Pick a `quote_attachments.kind` for an enquiry file. Mirrors the app's own
+ * `inferAttachmentKind` (lib/store.tsx) but biased for the LEAD context: an
+ * emailed enquiry PDF is almost always a plan/drawing, and an emailed photo is
+ * showing us the work area (scope), so those are the sensible defaults.
+ */
+function inferLeadAttachmentKind(name: string, contentType?: string): QuoteAttachmentKind {
+  const lower = name.toLowerCase();
+  const ct = (contentType ?? '').toLowerCase();
+  const isPdf = ct === 'application/pdf' || lower.endsWith('.pdf');
+  if (isPdf) {
+    if (lower.startsWith('q-') || lower.includes('quote')) return 'quote_pdf';
+    if (lower.startsWith('inv-') || lower.includes('invoice')) return 'other';
+    return 'plan'; // consent set, drawings, "consultant issue", etc.
+  }
+  const isImage = ct.startsWith('image/') || /\.(jpe?g|png|webp|heic|heif)$/.test(lower);
+  if (isImage) {
+    if (lower.includes('before') || lower.includes('start')) return 'before_photo';
+    if (lower.includes('after') || lower.includes('final') || lower.includes('done')) return 'after_photo';
+    if (lower.includes('progress') || lower.includes('during') || lower.includes('wip')) return 'process_photo';
+    return 'scope_photo';
+  }
+  return 'other';
+}
+
+/**
+ * Save any real enquiry attachments (photos, plan PDFs) onto a freshly-created
+ * lead. Reuses the app's own storage convention exactly: a lead's files hang
+ * off a stub `draft` quote linked to the job (same as `ensureJobHasQuote` in
+ * the store), uploaded to the `quote-attachments` bucket at
+ * `{businessId}/{quoteId}/{uuid}__{safeName}`. The JobDetailSheet's existing
+ * "Plans + photos" panel then renders them with zero UI changes.
+ *
+ * Best-effort: never throws. A failure here must not lose the lead itself.
+ * Inline signature/logo images (cid-referenced, disposition=inline) and
+ * non-photo/non-PDF files are skipped.
+ */
+async function saveLeadAttachments(
+  admin: SupabaseClient,
+  businessId: string,
+  jobId: string,
+  jobLocation: string | undefined,
+  rawAttachments: unknown,
+): Promise<{ saved: number; skipped: number }> {
+  const list = Array.isArray(rawAttachments) ? rawAttachments : [];
+  if (list.length === 0) return { saved: 0, skipped: 0 };
+
+  // Filter down to genuine enquiry files first, so we only spin up a stub
+  // quote when there's actually something worth attaching.
+  const keep: { buf: Buffer; fileName: string; contentType: string; kind: QuoteAttachmentKind }[] = [];
+  let skipped = 0;
+  for (const a of list) {
+    if (keep.length >= MAX_LEAD_ATTACHMENTS) { skipped++; continue; }
+    if (typeof a !== 'object' || a === null) { skipped++; continue; }
+    const att = a as CloudMailinAttachment;
+
+    const ct = asString(att.content_type)?.toLowerCase() ?? '';
+    const fn = asString(att.file_name) ?? '';
+    const disposition = asString(att.disposition)?.toLowerCase();
+    const hasContentId = asString(att.content_id) != null;
+
+    // Skip embedded signature/logo images referenced by the HTML body.
+    if (disposition === 'inline' || hasContentId) { skipped++; continue; }
+
+    const isPdf = ct === 'application/pdf' || fn.toLowerCase().endsWith('.pdf');
+    const isImage = ct.startsWith('image/') || /\.(jpe?g|png|webp|heic|heif)$/.test(fn.toLowerCase());
+    if (!isPdf && !isImage) { skipped++; continue; }
+
+    const base64 = asString(att.content);
+    if (!base64) { skipped++; continue; }
+    let buf: Buffer;
+    try {
+      buf = Buffer.from(base64, 'base64');
+    } catch {
+      skipped++; continue;
+    }
+    if (buf.length === 0 || buf.length > MAX_LEAD_ATTACHMENT_BYTES) { skipped++; continue; }
+
+    keep.push({
+      buf,
+      fileName: fn || (isPdf ? 'attachment.pdf' : 'photo.jpg'),
+      contentType: ct || (isPdf ? 'application/pdf' : 'application/octet-stream'),
+      kind: inferLeadAttachmentKind(fn, ct),
+    });
+  }
+
+  if (keep.length === 0) return { saved: 0, skipped };
+
+  // Stub quote to hang the files off — mirrors store.ensureJobHasQuote.
+  const { data: quote, error: quoteErr } = await admin
+    .from('quotes')
+    .insert(quoteToRow({ businessId, jobId, jobAddress: jobLocation, status: 'draft' }))
+    .select('id')
+    .single();
+  if (quoteErr || !quote) {
+    console.error('[inbound-email-lead] stub quote insert failed — attachments skipped', quoteErr);
+    return { saved: 0, skipped: skipped + keep.length };
+  }
+  const quoteId = quote.id as string;
+
+  let saved = 0;
+  for (const item of keep) {
+    const safeName = item.fileName.replace(/[^a-zA-Z0-9._-]+/g, '_');
+    const storagePath = `${businessId}/${quoteId}/${crypto.randomUUID()}__${safeName}`;
+    const { error: upErr } = await admin.storage
+      .from('quote-attachments')
+      .upload(storagePath, item.buf, { contentType: item.contentType, upsert: false });
+    if (upErr) {
+      console.error('[inbound-email-lead] attachment upload failed for', item.fileName, upErr);
+      skipped++;
+      continue;
+    }
+    const { error: insErr } = await admin
+      .from('quote_attachments')
+      .insert(quoteAttachmentToRow({
+        businessId,
+        quoteId,
+        kind: item.kind,
+        storagePath,
+        fileName: item.fileName,
+      }));
+    if (insErr) {
+      console.error('[inbound-email-lead] attachment row insert failed for', item.fileName, insErr);
+      // Don't leak the orphaned Storage object.
+      await admin.storage.from('quote-attachments').remove([storagePath]).catch(() => {});
+      skipped++;
+      continue;
+    }
+    saved++;
+  }
+
+  return { saved, skipped };
 }
 
 function asString(v: unknown): string | undefined {
@@ -231,12 +385,29 @@ export async function POST(req: Request) {
     );
   }
 
+  // ── 7. Save any enquiry attachments (photos, plan PDFs) onto the lead ────
+  // Best-effort: a storage/upload hiccup must never lose the lead we just
+  // created, so this is wrapped and never throws upward.
+  let attachments = { saved: 0, skipped: 0 };
+  try {
+    attachments = await saveLeadAttachments(
+      admin,
+      businessId,
+      inserted.id as string,
+      lead.location,
+      body.attachments,
+    );
+  } catch (err) {
+    console.error('[inbound-email-lead] saveLeadAttachments threw (lead kept)', err);
+  }
+
   console.info('[inbound-email-lead] lead created', {
     jobId: inserted.id,
     name: lead.name,
     confidence,
+    attachments,
   });
-  return NextResponse.json({ ok: true, jobId: inserted.id, name: lead.name });
+  return NextResponse.json({ ok: true, jobId: inserted.id, name: lead.name, attachments });
 }
 
 /**
