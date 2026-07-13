@@ -65,42 +65,74 @@ export async function POST(req: Request) {
   const owner = await resolveOwner(req);
   if (!owner.ok) return NextResponse.json({ ok: false, error: owner.error }, { status: owner.status });
 
-  let body: { email?: string; password?: string; displayName?: string; workerKind?: string };
+  let body: { email?: string; password?: string; displayName?: string; workerKind?: string; mode?: string };
   try {
     body = await req.json();
   } catch {
     return NextResponse.json({ ok: false, error: 'Invalid JSON body.' }, { status: 400 });
   }
 
+  // Two ways to create the login:
+  //   'invite'   — email them a link; they set their own password (default).
+  //   'password' — owner sets a temp password to hand over (fallback for
+  //                when Supabase email sending isn't configured yet).
+  const mode: 'invite' | 'password' = body.mode === 'password' ? 'password' : 'invite';
   const email = (body.email ?? '').trim().toLowerCase();
   const password = body.password ?? '';
   const displayName = (body.displayName ?? '').trim();
   const workerKind = (body.workerKind ?? 'helper').trim();
 
   if (!EMAIL_RE.test(email)) return NextResponse.json({ ok: false, error: 'Enter a valid email address.' }, { status: 400 });
-  if (password.length < 8) return NextResponse.json({ ok: false, error: 'Password must be at least 8 characters.' }, { status: 400 });
   if (!displayName) return NextResponse.json({ ok: false, error: 'Enter the employee’s name.' }, { status: 400 });
   if (!ALLOWED_WORKER_KINDS.includes(workerKind)) {
     return NextResponse.json({ ok: false, error: 'Invalid worker kind.' }, { status: 400 });
   }
+  if (mode === 'password' && password.length < 8) {
+    return NextResponse.json({ ok: false, error: 'Password must be at least 8 characters.' }, { status: 400 });
+  }
 
-  // 1. Create the auth login (email pre-confirmed — no verification email).
-  const { data: created, error: createErr } = await supabaseAdmin.auth.admin.createUser({
-    email,
-    password,
-    email_confirm: true,
-    user_metadata: { display_name: displayName },
-  });
-  if (createErr || !created.user) {
-    const msg = createErr?.message ?? 'Failed to create login.';
-    const already = /already|exist|registered/i.test(msg);
-    return NextResponse.json({ ok: false, error: already ? 'That email already has a login.' : msg }, { status: already ? 409 : 500 });
+  // 1. Create the auth login.
+  let newUserId: string;
+  if (mode === 'invite') {
+    // Emails an invite link that lands on /set-password (must be in
+    // Supabase → Auth → URL Configuration → Redirect URLs).
+    const origin = req.headers.get('origin') ?? new URL(req.url).origin;
+    const { data, error: inviteErr } = await supabaseAdmin.auth.admin.inviteUserByEmail(email, {
+      data: { display_name: displayName },
+      redirectTo: `${origin}/set-password`,
+    });
+    if (inviteErr || !data.user) {
+      const msg = inviteErr?.message ?? 'Failed to send invite.';
+      const already = /already|exist|registered/i.test(msg);
+      // A missing email provider surfaces here — give a pointed hint.
+      const emailCfg = /smtp|email|provider|send/i.test(msg);
+      const hint = emailCfg ? ` (${msg}) — check Supabase email/SMTP is configured, or use "Set a temporary password" instead.` : '';
+      return NextResponse.json(
+        { ok: false, error: already ? 'That email already has a login.' : `Couldn’t send the invite${hint}` },
+        { status: already ? 409 : 500 },
+      );
+    }
+    newUserId = data.user.id;
+  } else {
+    // email_confirm: true so no separate verification email is needed.
+    const { data, error: createErr } = await supabaseAdmin.auth.admin.createUser({
+      email,
+      password,
+      email_confirm: true,
+      user_metadata: { display_name: displayName },
+    });
+    if (createErr || !data.user) {
+      const msg = createErr?.message ?? 'Failed to create login.';
+      const already = /already|exist|registered/i.test(msg);
+      return NextResponse.json({ ok: false, error: already ? 'That email already has a login.' : msg }, { status: already ? 409 : 500 });
+    }
+    newUserId = data.user.id;
   }
 
   // 2. Link them to the owner's business as an employee.
   const { error: memErr } = await supabaseAdmin.from('business_members').insert({
     business_id: owner.businessId,
-    user_id: created.user.id,
+    user_id: newUserId,
     role: 'employee',
     display_name: displayName,
     worker_kind: workerKind,
@@ -108,13 +140,14 @@ export async function POST(req: Request) {
   if (memErr) {
     // Roll back the orphaned auth user so a retry isn't blocked by a
     // half-created account.
-    await supabaseAdmin.auth.admin.deleteUser(created.user.id).catch(() => {});
+    await supabaseAdmin.auth.admin.deleteUser(newUserId).catch(() => {});
     return NextResponse.json({ ok: false, error: `Login created but linking failed: ${memErr.message}` }, { status: 500 });
   }
 
   return NextResponse.json({
     ok: true,
-    employee: { userId: created.user.id, email, displayName, workerKind, role: 'employee' },
+    mode,
+    employee: { userId: newUserId, email, displayName, workerKind, role: 'employee' },
   });
 }
 

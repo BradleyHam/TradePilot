@@ -30,6 +30,7 @@ export default function TeamPage() {
   const [members, setMembers] = useState<BusinessMember[]>([]);
   const [loadingList, setLoadingList] = useState(true);
 
+  const [mode, setMode] = useState<'invite' | 'password'>('invite');
   const [name, setName] = useState('');
   const [email, setEmail] = useState('');
   const [password, setPassword] = useState(genPassword());
@@ -37,7 +38,7 @@ export default function TeamPage() {
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
-  const [created, setCreated] = useState<{ name: string; email: string; password: string } | null>(null);
+  const [created, setCreated] = useState<{ name: string; email: string; mode: 'invite' | 'password'; password?: string } | null>(null);
 
   const loadMembers = useCallback(async () => {
     // Owner can read all memberships in their business (RLS policy). We
@@ -76,8 +77,12 @@ export default function TeamPage() {
   async function handleAdd() {
     setError(null);
     setCreated(null);
-    if (!name.trim() || !email.trim() || password.length < 8) {
-      setError('Fill in name, a valid email, and a password of at least 8 characters.');
+    if (!name.trim() || !email.trim()) {
+      setError('Fill in a name and a valid email.');
+      return;
+    }
+    if (mode === 'password' && password.length < 8) {
+      setError('Password must be at least 8 characters.');
       return;
     }
     setSubmitting(true);
@@ -85,13 +90,19 @@ export default function TeamPage() {
       const res = await fetch('/api/employees', {
         method: 'POST',
         headers: await authHeader(),
-        body: JSON.stringify({ email, password, displayName: name, workerKind }),
+        body: JSON.stringify({
+          email, displayName: name, workerKind, mode,
+          ...(mode === 'password' ? { password } : {}),
+        }),
       });
       const json = await res.json();
       if (!res.ok || !json.ok) {
         setError(json.error ?? 'Something went wrong.');
       } else {
-        setCreated({ name: name.trim(), email: email.trim().toLowerCase(), password });
+        setCreated({
+          name: name.trim(), email: email.trim().toLowerCase(), mode,
+          ...(mode === 'password' ? { password } : {}),
+        });
         setName(''); setEmail(''); setPassword(genPassword()); setWorkerKind('helper');
         loadMembers();
       }
@@ -154,8 +165,16 @@ export default function TeamPage() {
           )}
         </div>
 
-        {/* Success card with credentials to hand over */}
-        {created && (
+        {/* Success card */}
+        {created && created.mode === 'invite' && (
+          <div className="rounded-2xl border border-primary/40 bg-primary/5 p-4 space-y-2">
+            <p className="text-sm font-semibold flex items-center gap-1.5"><Check size={16} className="text-primary" /> Invite sent to {created.name}</p>
+            <p className="text-xs text-muted-foreground">
+              We emailed <span className="font-medium">{created.email}</span> a link to set their own password. Once they do, they can log in — they&apos;ll only ever see Log Hours + Schedule, never any money.
+            </p>
+          </div>
+        )}
+        {created && created.mode === 'password' && (
           <div className="rounded-2xl border border-primary/40 bg-primary/5 p-4 space-y-2">
             <p className="text-sm font-semibold flex items-center gap-1.5"><Check size={16} className="text-primary" /> {created.name} can now log in</p>
             <p className="text-xs text-muted-foreground">Give them these details (they log in at the same web address):</p>
@@ -171,6 +190,28 @@ export default function TeamPage() {
         <div className="bg-card border border-border rounded-2xl p-4 space-y-3">
           <p className="text-sm font-semibold flex items-center gap-1.5"><UserPlus size={16} className="text-primary" /> Add employee</p>
 
+          {/* How they get their login */}
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1 block">How they sign in</label>
+            <div className="flex gap-2">
+              {([
+                { v: 'invite', label: 'Email them an invite' },
+                { v: 'password', label: 'Set a temp password' },
+              ] as const).map((o) => (
+                <button key={o.v} onClick={() => setMode(o.v)}
+                  className={cn('flex-1 min-h-[44px] rounded-xl border text-xs font-medium transition-colors',
+                    mode === o.v ? 'bg-primary text-primary-foreground border-primary' : 'bg-background border-border text-muted-foreground')}>
+                  {o.label}
+                </button>
+              ))}
+            </div>
+            <p className="text-[11px] text-muted-foreground mt-1">
+              {mode === 'invite'
+                ? 'They get an email with a link to set their own password. (Needs Supabase email set up.)'
+                : 'You set a password and hand it over — works even without email set up.'}
+            </p>
+          </div>
+
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1 block">Name</label>
             <input value={name} onChange={(e) => setName(e.target.value)} placeholder="Suzie"
@@ -183,16 +224,18 @@ export default function TeamPage() {
               className="w-full min-h-[44px] rounded-xl border border-border bg-background px-3 text-sm outline-none focus:border-primary" />
           </div>
 
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1 block">Temporary password</label>
-            <div className="flex gap-2">
-              <input value={password} onChange={(e) => setPassword(e.target.value)}
-                className="flex-1 min-h-[44px] rounded-xl border border-border bg-background px-3 text-sm font-mono outline-none focus:border-primary" />
-              <Button variant="outline" size="sm" className="min-h-[44px]" onClick={() => setPassword(genPassword())}>
-                <RefreshCw size={14} /> New
-              </Button>
+          {mode === 'password' && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1 block">Temporary password</label>
+              <div className="flex gap-2">
+                <input value={password} onChange={(e) => setPassword(e.target.value)}
+                  className="flex-1 min-h-[44px] rounded-xl border border-border bg-background px-3 text-sm font-mono outline-none focus:border-primary" />
+                <Button variant="outline" size="sm" className="min-h-[44px]" onClick={() => setPassword(genPassword())}>
+                  <RefreshCw size={14} /> New
+                </Button>
+              </div>
             </div>
-          </div>
+          )}
 
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1 block">Role on jobs</label>
@@ -210,7 +253,7 @@ export default function TeamPage() {
           {error && <p className="text-sm text-destructive">{error}</p>}
 
           <Button className="w-full min-h-[48px]" disabled={submitting} onClick={handleAdd}>
-            {submitting ? 'Creating…' : 'Create login'}
+            {submitting ? 'Working…' : mode === 'invite' ? 'Send invite' : 'Create login'}
           </Button>
         </div>
       </div>

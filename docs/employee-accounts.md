@@ -80,11 +80,17 @@ timesheet evidence.
 Owner-only **Settings → Team** (`app/(app)/settings/team`). Backed by server route
 `app/api/employees/route.ts`:
 
-- **POST** — verifies the caller is the owner (`businesses.owner_id`), then uses
-  the service-role admin client to create the login (`auth.admin.createUser`,
-  email pre-confirmed) and insert the `employee` membership. Always
-  role=`employee` — it cannot create an owner. Returns the credentials to hand
-  over.
+- **POST** — verifies the caller is the owner (`businesses.owner_id`), then creates
+  the login with the service-role admin client and inserts the `employee`
+  membership. Always role=`employee` — it cannot create an owner. Two `mode`s:
+  - `invite` (default) — `auth.admin.inviteUserByEmail` emails the employee a link
+    that lands on `/set-password` (public page, `app/set-password/page.tsx`) where
+    they set their own password, then get redirected to `/my/hours`. **Requires
+    Supabase email/SMTP configured AND `<origin>/set-password` added to Supabase →
+    Auth → URL Configuration → Redirect URLs.**
+  - `password` — `auth.admin.createUser` with an owner-set temp password (email
+    pre-confirmed). Fallback for when email isn't set up yet; returns the
+    credentials to hand over.
 - **DELETE** — removes the membership row only (revokes access instantly). It
   deliberately does **not** delete the auth user, because
   `entries.logged_by_user_id` references `auth.users(id)` and deleting a user who
@@ -128,7 +134,9 @@ update business_members set role = 'owner' where display_name = 'Brad';
 
 ## Known gaps / future
 
-- No employee self-service password change yet (Brad sets a temp one).
+- Invite emails need Supabase email/SMTP set up (built-in sender is rate-limited);
+  until then use the temp-password mode. No password-reset/change UI yet beyond the
+  invite set-password page.
 - Employees see *all* active jobs (no per-job assignment) — by design for v1.
 - No richer money-free job-detail sheet (scope shows as job notes for now).
 - Removing an employee leaves an inert auth login; add `ON DELETE SET NULL` to
