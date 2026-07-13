@@ -11,7 +11,7 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
-  BusinessMember, MemberRole, WorkerKind,
+  BusinessMember, MemberRole, WorkerKind, ShiftPhoto,
 } from '../types';
 
 type Row = Record<string, unknown>;
@@ -482,6 +482,20 @@ export function jobImportToRow(i: Partial<JobImport>): Row {
 }
 
 // ── Setting ─────────────────────────────────────────────────────────────────
+export function rowToShiftPhoto(r: Row): ShiftPhoto {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: asString(r.job_id),
+    entryId: asString(r.entry_id),
+    uploadedBy: asString(r.uploaded_by),
+    takenOn: r.taken_on as string,
+    storagePath: r.storage_path as string,
+    caption: asString(r.caption),
+    createdAt: r.created_at as string,
+  };
+}
+
 export function rowToBusinessMember(r: Row): BusinessMember {
   return {
     id: r.id as string,

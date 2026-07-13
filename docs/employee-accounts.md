@@ -116,11 +116,28 @@ Code:
 - `app/(app)/my/hours/page.tsx`, `app/(app)/my/schedule/page.tsx`
 - `app/(app)/settings/team/page.tsx`, `app/api/employees/route.ts`
 
+- `components/jobs/shift-photos-panel.tsx` — owner's Site photos grid on the job
+  detail sheet
+
 Database (migrations):
 - `025_business_members.sql` — `business_members` table + RLS + owner backfill
 - `026_employee_access.sql` — `entries.logged_by_user_id`,
   `current_user_business_ids()`, businesses member-read policy, `jobs_public`
   view, employee entries + schedule policies
+- `027_shift_photos.sql` — `shift_photos` table + RLS (owner full; employee
+  insert/read/delete own) + private `shift-photos` storage bucket + member
+  read/write/delete storage policies
+
+## Shift photos
+
+When an employee logs hours, the Log Hours screen offers an optional camera
+picker. On save, `store.uploadShiftPhotos({ jobId, takenOn, files })` compresses
+each image, uploads it to the private `shift-photos` bucket at
+`{businessId}/{jobId}/{uuid}__name`, and inserts a `shift_photos` row attributed
+to the uploader. Photos are keyed to job + date (not the hours entry) so capture
+never waits on the optimistic entry insert. The owner sees them in a grouped,
+signed-URL "Site photos" grid on the job detail sheet (`ShiftPhotosPanel`).
+Employees only ever see/delete their own uploads (RLS); the owner sees all.
 
 ## Testing without a second person
 

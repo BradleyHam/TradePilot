@@ -23,6 +23,7 @@ import { hoursByWorker, blendedTargetRate, allWorkerRates, describeMix } from '@
 import { HourlyRateGauge, IncomeVsExpenses, HoursByActivity } from './job-charts';
 import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
+import { ShiftPhotosPanel } from './shift-photos-panel';
 import { BookedDates } from './booked-dates';
 import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
@@ -782,6 +783,9 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               setShowInvoice(true);
             }}
           />
+
+          {/* Site photos logged by staff on their shifts. */}
+          <ShiftPhotosPanel jobId={liveJob.id} />
 
           <JobMaterialsList jobId={liveJob.id} materials={materials} entries={entries} />
 

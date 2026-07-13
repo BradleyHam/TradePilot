@@ -8,7 +8,7 @@ import { supabase } from '@/lib/supabase/client';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
 import type { ActivityType, JobStatus } from '@/lib/types';
-import { Clock, LogOut, Check, Trash2, Navigation, CalendarDays, ChevronRight } from 'lucide-react';
+import { Clock, LogOut, Check, Trash2, Navigation, CalendarDays, ChevronRight, Camera, X } from 'lucide-react';
 
 // Statuses an employee can log time against.
 const LOGGABLE: JobStatus[] = ['accepted', 'booked', 'in-progress'];
@@ -45,14 +45,18 @@ function mapsHref(location: string) {
 
 export default function MyHoursPage() {
   const router = useRouter();
-  const { jobs, entries, scheduleItems, membership, logMyHours, deleteEntry } = useStore();
+  const { jobs, entries, scheduleItems, membership, logMyHours, deleteEntry, shiftPhotos, uploadShiftPhotos } = useStore();
 
   const [jobId, setJobId] = useState<string>('');
   const [hours, setHours] = useState<string>('');
   const [activity, setActivity] = useState<ActivityType | ''>('');
   const [note, setNote] = useState('');
   const [date, setDate] = useState(todayIso());
+  const [photos, setPhotos] = useState<File[]>([]);
+  const [busy, setBusy] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+
+  const photoPreviews = useMemo(() => photos.map((f) => URL.createObjectURL(f)), [photos]);
 
   const myUid = membership?.userId;
   const firstName = membership?.displayName?.split(' ')[0];
@@ -113,18 +117,38 @@ export default function MyHoursPage() {
     [entries, date, myUid]);
   const totalToday = todaysLogged.reduce((sum, e) => sum + (e.hours ?? 0), 0);
 
-  const canSave = !!selectedId && !!hours && parseFloat(hours) > 0;
+  // Photos already uploaded for this job + day (confirmation count).
+  const uploadedTodayCount = shiftPhotos.filter((p) => p.jobId === selectedId && p.takenOn === date).length;
 
-  function handleSave() {
+  const canSave = !!selectedId && !!hours && parseFloat(hours) > 0 && !busy;
+
+  function onPickPhotos(e: React.ChangeEvent<HTMLInputElement>) {
+    const picked = Array.from(e.target.files ?? []);
+    if (picked.length) setPhotos((prev) => [...prev, ...picked].slice(0, 8));
+    e.target.value = '';
+  }
+  function removePhoto(i: number) {
+    setPhotos((prev) => prev.filter((_, idx) => idx !== i));
+  }
+
+  async function handleSave() {
     if (!canSave) return;
+    const theJob = selectedId;
+    const theDate = date;
+    const toUpload = photos;
     logMyHours({
-      jobId: selectedId,
+      jobId: theJob,
       hours: parseFloat(hours),
       activity: activity || undefined,
       note: note.trim() || undefined,
-      entryDate: date,
+      entryDate: theDate,
     });
-    setHours(''); setActivity(''); setNote('');
+    setHours(''); setActivity(''); setNote(''); setPhotos([]);
+    if (toUpload.length > 0) {
+      setBusy(true);
+      await uploadShiftPhotos({ jobId: theJob, takenOn: theDate, files: toUpload });
+      setBusy(false);
+    }
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
   }
@@ -298,6 +322,37 @@ export default function MyHoursPage() {
         />
       </div>
 
+      {/* Photos */}
+      <div>
+        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+          Photos <span className="normal-case text-[10px]">(optional)</span>
+        </label>
+        <div className="flex flex-wrap gap-2">
+          {photoPreviews.map((src, i) => (
+            <div key={i} className="relative w-20 h-20 rounded-xl overflow-hidden border border-border">
+              {/* eslint-disable-next-line @next/next/no-img-element */}
+              <img src={src} alt="" className="w-full h-full object-cover" />
+              <button
+                onClick={() => removePhoto(i)}
+                className="absolute top-0.5 right-0.5 bg-black/60 text-white rounded-full p-0.5"
+                aria-label="Remove photo"
+              >
+                <X size={12} />
+              </button>
+            </div>
+          ))}
+          <label className="w-20 h-20 rounded-xl border border-dashed border-border flex flex-col items-center justify-center cursor-pointer text-muted-foreground hover:border-primary/50">
+            <Camera size={20} />
+            <span className="text-[10px] mt-0.5">Add</span>
+            <input type="file" accept="image/*" capture="environment" multiple className="hidden" onChange={onPickPhotos} />
+          </label>
+        </div>
+        <p className="text-[11px] text-muted-foreground mt-1">
+          Snap the work you did — Brad sees these on the job.
+          {uploadedTodayCount > 0 && ` · ${uploadedTodayCount} already added.`}
+        </p>
+      </div>
+
       {/* Today's logged list */}
       {todaysLogged.length > 0 && (
         <div className="space-y-2">
@@ -342,7 +397,7 @@ export default function MyHoursPage() {
       <div className="fixed bottom-16 md:bottom-0 left-0 right-0 md:left-60 bg-background/95 backdrop-blur border-t border-border p-3 z-40">
         <div className="max-w-xl mx-auto">
           <Button className="w-full min-h-[52px] text-base" disabled={!canSave} onClick={handleSave}>
-            {justSaved ? (<><Check size={18} /> Saved</>) : `Save ${hours ? hours + 'h' : 'hours'}`}
+            {busy ? 'Uploading photos…' : justSaved ? (<><Check size={18} /> Saved</>) : `Save ${hours ? hours + 'h' : 'hours'}${photos.length ? ` + ${photos.length} photo${photos.length > 1 ? 's' : ''}` : ''}`}
           </Button>
         </div>
       </div>

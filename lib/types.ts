@@ -108,6 +108,28 @@ export interface BusinessMember {
   createdAt: string;
 }
 
+/**
+ * A photo taken on a shift, logged by whoever worked it (usually an
+ * employee). Tied to a job + date rather than strictly to an hours entry,
+ * so the capture flow doesn't depend on the optimistic entry insert
+ * resolving first. Stored in the private `shift-photos` bucket.
+ */
+export interface ShiftPhoto {
+  id: string;
+  businessId: string;
+  jobId?: string;
+  /** Optional link to the hours entry it was logged alongside. */
+  entryId?: string;
+  /** Auth uid of whoever uploaded it. */
+  uploadedBy?: string;
+  /** The shift date the photo belongs to. */
+  takenOn: string;
+  /** Object path inside the `shift-photos` bucket (NOT a URL — signed on demand). */
+  storagePath: string;
+  caption?: string;
+  createdAt: string;
+}
+
 export type QuoteStatus =
   | 'draft'
   | 'sent'

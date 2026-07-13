@@ -9,14 +9,14 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
-  rowToBusinessMember,
+  rowToBusinessMember, rowToShiftPhoto,
 } from './supabase/mappers';
 import type {
   Job, Entry, EntryType, ActivityType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
-  BusinessMember, MemberRole,
+  BusinessMember, MemberRole, ShiftPhoto,
 } from './types';
 import { compressImage } from './image-compress';
 
@@ -180,6 +180,15 @@ interface StoreState {
     note?: string;
     entryDate?: string;
   }) => void;
+  /** Site photos, filtered by RLS (employees see only their own uploads). */
+  shiftPhotos: ShiftPhoto[];
+  uploadShiftPhotos: (input: {
+    jobId: string;
+    takenOn: string;
+    files: File[];
+    entryId?: string;
+  }) => Promise<{ inserted: number; failed: number }>;
+  deleteShiftPhoto: (id: string) => void;
   addScheduleItem: (item: ScheduleItem) => void;
   updateScheduleItem: (id: string, updates: Partial<ScheduleItem>) => void;
   deleteScheduleItem: (id: string) => void;
@@ -542,6 +551,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   jobImportsRef.current = jobImports;
   /* eslint-enable react-hooks/refs */
   const [quoteAttachments, setQuoteAttachments] = useState<QuoteAttachment[]>([]);
+  const [shiftPhotos, setShiftPhotos] = useState<ShiftPhoto[]>([]);
   const [businessId, setBusinessId] = useState<string | null>(null);
   const [role, setRole] = useState<MemberRole>('owner');
   const [membership, setMembership] = useState<BusinessMember | null>(null);
@@ -576,7 +586,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setJobs([]); setEntries([]); setScheduleItems([]);
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
         setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
-        setPaintStock([]);
+        setPaintStock([]); setShiftPhotos([]);
         setLoading(false);
         return;
       }
@@ -633,7 +643,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // the missing money columns (they map to undefined). Owners read the
       // full base table as before.
       const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
-      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp] = await Promise.all([
         supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -655,6 +665,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // if migration 024 hasn't been applied yet.
         supabase.from('paint_stock').select('*').eq('business_id', bizId)
           .order('created_at', { ascending: true }),
+        // Shift photos — employees see only their own (RLS); owner sees all.
+        // Degrades to empty if migration 027 hasn't been applied yet.
+        supabase.from('shift_photos').select('*').eq('business_id', bizId)
+          .order('created_at', { ascending: false }),
       ]);
 
       // Log per-table errors with detail (Supabase errors don't stringify
@@ -667,7 +681,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       collect('materials', m); collect('quotes', q); collect('settings', st);
       collect('invoices', inv); collect('bank_transactions', bnk);
       collect('job_imports', ji); collect('quote_attachments', qa);
-      collect('paint_stock', ps);
+      collect('paint_stock', ps); collect('shift_photos', sp);
 
       if (tableErrors.length > 0) {
         for (const { table, err: tErr } of tableErrors) {
@@ -700,6 +714,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setJobImports((ji.data ?? []).map(rowToJobImport));
       setQuoteAttachments((qa.data ?? []).map(rowToQuoteAttachment));
       setPaintStock((ps.data ?? []).map(rowToPaintStock));
+      setShiftPhotos((sp.data ?? []).map(rowToShiftPhoto));
     } catch (err: unknown) {
       // Top-level catch — only fires for the businesses fetch or completely
       // unexpected throws.
@@ -2482,6 +2497,88 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     addEntry(entry);
   }, [businessId, membership, addEntry]);
 
+  /**
+   * Upload one or more shift photos against a job + date. Compresses each
+   * image, stores it in the private `shift-photos` bucket, and inserts a
+   * `shift_photos` row. Attributed to the signed-in user. Independent of
+   * the hours entry (so it doesn't wait on the optimistic insert), though
+   * an entryId can be passed to link them.
+   */
+  const uploadShiftPhotos = useCallback(async (input: {
+    jobId: string;
+    takenOn: string;
+    files: File[];
+    entryId?: string;
+  }): Promise<{ inserted: number; failed: number }> => {
+    if (!businessId || input.files.length === 0) return { inserted: 0, failed: 0 };
+    const uid = membership?.userId ?? null;
+    let inserted = 0;
+    let failed = 0;
+
+    for (const file of input.files) {
+      try {
+        const prepared = await compressImage(file).then((r) => r.file).catch(() => file);
+        const safeName = (prepared.name || 'photo.jpg').replace(/[^a-zA-Z0-9._-]+/g, '_');
+        const storagePath = `${businessId}/${input.jobId}/${crypto.randomUUID()}__${safeName}`;
+
+        const { error: upErr } = await supabase.storage
+          .from('shift-photos')
+          .upload(storagePath, prepared, { contentType: prepared.type || 'image/jpeg', upsert: false });
+        if (upErr) {
+          console.error('[uploadShiftPhotos] upload failed:', describeError(upErr));
+          failed++;
+          continue;
+        }
+
+        const { data, error: insErr } = await supabase
+          .from('shift_photos')
+          .insert({
+            business_id: businessId,
+            job_id: input.jobId,
+            entry_id: input.entryId ?? null,
+            uploaded_by: uid,
+            taken_on: input.takenOn,
+            storage_path: storagePath,
+          })
+          .select('*')
+          .single();
+        if (insErr || !data) {
+          console.error('[uploadShiftPhotos] insert failed:', describeError(insErr));
+          await supabase.storage.from('shift-photos').remove([storagePath]).catch(() => {});
+          failed++;
+          continue;
+        }
+        setShiftPhotos((prev) => [rowToShiftPhoto(data), ...prev]);
+        inserted++;
+      } catch (err) {
+        console.error('[uploadShiftPhotos] unexpected error:', err);
+        failed++;
+      }
+    }
+    if (failed > 0) setError(`${failed} of ${input.files.length} photos failed to upload.`);
+    return { inserted, failed };
+  }, [businessId, membership]);
+
+  const deleteShiftPhoto = useCallback((id: string) => {
+    let prev: ShiftPhoto | undefined;
+    setShiftPhotos((list) => {
+      prev = list.find((p) => p.id === id);
+      return list.filter((p) => p.id !== id);
+    });
+    (async () => {
+      const { error: delErr } = await supabase.from('shift_photos').delete().eq('id', id);
+      if (delErr) {
+        console.error('[deleteShiftPhoto] failed:', delErr);
+        setError(delErr.message);
+        if (prev) setShiftPhotos((l) => [prev!, ...l]);
+        return;
+      }
+      if (prev?.storagePath) {
+        await supabase.storage.from('shift-photos').remove([prev.storagePath]).catch(() => {});
+      }
+    })();
+  }, []);
+
   const addScheduleItem = useCallback((item: ScheduleItem) => {
     if (!businessId) {
       console.warn('[store] addScheduleItem called with no businessId; ignoring');
@@ -3272,6 +3369,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         businessId, role, membership, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
         addEntry, updateEntry, deleteEntry, logMyHours,
+        shiftPhotos, uploadShiftPhotos, deleteShiftPhoto,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
         confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,
