@@ -25,6 +25,21 @@ import { cn } from '@/lib/utils';
 import { extractPdfText } from '@/lib/pdf/extract-text';
 import { supabase } from '@/lib/supabase/client';
 
+const NZ_GST_RATE = 0.15;
+
+/**
+ * The incl-GST total the customer saw → the ex-GST figure the app stores.
+ * `job.quoteAmount` is EX-GST everywhere money math happens (job-stats
+ * expectedIncome, pipeline value, tax estimator) — writing the incl-GST
+ * total here, as this sheet used to, silently overstated expected income
+ * and pipeline by 15%. Same bug class as Aubrey Road / J16 (AGENTS.md).
+ * The quote row's totalAmountInclGst stays incl-GST — that field is
+ * explicitly the customer-facing number.
+ */
+function inclToExGst(incl: number): number {
+  return Math.round((incl / (1 + NZ_GST_RATE)) * 100) / 100;
+}
+
 /** Add N days to an ISO YYYY-MM-DD date, TZ-safe. Returns the same string on bad input. */
 function addDaysISO(iso: string, n: number): string {
   const m = /^(\d{4})-(\d{2})-(\d{2})$/.exec(iso);
@@ -32,6 +47,18 @@ function addDaysISO(iso: string, n: number): string {
   const d = new Date(Date.UTC(Number(m[1]), Number(m[2]) - 1, Number(m[3])));
   d.setUTCDate(d.getUTCDate() + n);
   return d.toISOString().slice(0, 10);
+}
+
+/**
+ * LOCAL YYYY-MM-DD. Deliberately NOT `toISOString().slice(0,10)`, which gives
+ * the UTC day — in NZ (UTC+12/+13) that's YESTERDAY for anything done before
+ * about noon, so a quote marked as sent at 9am would default to the previous
+ * day and start the follow-up clock a day early. This date is now also the
+ * logged contact's timestamp, so the off-by-one would read as "Yesterday" on
+ * the contact timeline for a quote sent five minutes ago.
+ */
+function localISO(d: Date): string {
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
 }
 
 interface Props {
@@ -49,7 +76,7 @@ interface Props {
 }
 
 export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }: Props) {
-  const { updateJob, ensureJobHasQuote, updateQuote, addQuoteAttachments } = useStore();
+  const { updateJob, ensureJobHasQuote, updateQuote, addQuoteAttachments, logContact } = useStore();
 
   // Form state
   const [totalIncl, setTotalIncl] = useState('');
@@ -74,11 +101,11 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
   // Defaults — today for date sent, +5 calendar days for follow-up.
   // 5 days because tradies typically expect a "we'll think about it"
   // window of a working week. Past that, silence means trouble.
-  const todayISO = useMemo(() => new Date().toISOString().slice(0, 10), []);
+  const todayISO = useMemo(() => localISO(new Date()), []);
   const defaultFollowUp = useMemo(() => {
     const d = new Date();
     d.setDate(d.getDate() + 5);
-    return d.toISOString().slice(0, 10);
+    return localISO(d);
   }, []);
 
   // Hydrate on open. Priority for total:
@@ -87,7 +114,13 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
   //   3. empty (fresh manual quote)
   useEffect(() => {
     if (!open || !job) return;
-    const initial = initialTotal ?? job.quoteAmount;
+    // job.quoteAmount is stored ex-GST; this field is the incl-GST total,
+    // so gross it back up when pre-filling from a previous save.
+    // initialTotal (from the AI drafter) is already incl-GST.
+    const initial = initialTotal
+      ?? (job.quoteAmount != null
+        ? Math.round(job.quoteAmount * (1 + NZ_GST_RATE) * 100) / 100
+        : undefined);
     setTotalIncl(initial ? String(initial) : '');
     setDateSent(todayISO);
     setFollowUpDate(job.followUpDate ?? defaultFollowUp);
@@ -101,6 +134,16 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
     const totalNum = parseFloat(totalIncl);
     if (!Number.isFinite(totalNum) || totalNum <= 0) {
       setError('Enter the total quote amount you sent the customer.');
+      return;
+    }
+    // The date input can be cleared, and an empty/garbled value would make
+    // `new Date(\`${dateSent}T12:00:00\`)` Invalid — whose .toISOString()
+    // THROWS. That throw would land after the quote row and the job status
+    // had already been written, leaving the job flipped to 'quoted' with the
+    // sheet stuck open and no error shown. Validate before anything is saved.
+    if (!/^\d{4}-\d{2}-\d{2}$/.test(dateSent)
+      || Number.isNaN(new Date(`${dateSent}T12:00:00`).getTime())) {
+      setError('Enter the date you sent the quote.');
       return;
     }
     setSaving(true);
@@ -140,15 +183,24 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
         }
       }
 
-      // Flip the job's status + write the headline numbers + bump
-      // contact timestamp. We write quoteAmount on the job (used by
-      // every existing money calc) AND keep it on the quote row
-      // (canonical source of truth going forward).
+      // Flip the job's status + write the headline numbers. We write
+      // quoteAmount on the job (used by every existing money calc) AND keep
+      // it on the quote row (canonical source of truth going forward).
+      // quoteAmount is stored EX-GST — see inclToExGst above.
       updateJob(job.id, {
         status: 'quoted',
-        quoteAmount: totalNum,
+        quoteAmount: inclToExGst(totalNum),
         followUpDate: followUpDate || undefined,
-        lastContactedDate: new Date().toISOString(),
+      });
+
+      // Sending the quote IS a contact — it's the message that starts the
+      // follow-up clock. Dated from `dateSent` rather than now, because this
+      // sheet is routinely used to record a quote that went out days ago.
+      logContact({
+        jobId: job.id,
+        direction: 'out',
+        channel: 'quote-sent',
+        contactedAt: new Date(`${dateSent}T12:00:00`).toISOString(),
       });
 
       if (uploadWarning) {
@@ -291,6 +343,17 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
                 autoFocus
               />
             </div>
+            {/* Echo the ex-GST figure that actually gets stored — the
+                same guard MoneyTileEditor uses. A wrong GST basis is
+                invisible once saved, so show the conversion up front. */}
+            {(() => {
+              const n = parseFloat(totalIncl);
+              return Number.isFinite(n) && n > 0 ? (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  = ${inclToExGst(n).toLocaleString('en-NZ')} ex GST — what profit + pipeline maths uses
+                </p>
+              ) : null;
+            })()}
           </div>
 
           {/* Date sent */}

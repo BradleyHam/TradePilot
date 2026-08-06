@@ -34,6 +34,7 @@ import {
   buildTapiLeadFields,
   normaliseForDedup,
 } from '@/lib/tapi-lead-parser';
+import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -77,27 +78,8 @@ function getAdminClient(): SupabaseClient | { error: string } {
  * free tier works.
  */
 function isAuthenticated(req: Request, expectedSecret: string): boolean {
-  const headerSecret = req.headers.get('x-webhook-secret');
-  if (headerSecret && headerSecret === expectedSecret) return true;
-
-  const basicHeader = req.headers.get('authorization');
-  if (basicHeader?.toLowerCase().startsWith('basic ')) {
-    const b64 = basicHeader.slice('basic '.length).trim();
-    try {
-      const decoded = Buffer.from(b64, 'base64').toString('utf-8');
-      const colonIdx = decoded.indexOf(':');
-      if (colonIdx !== -1) {
-        const user = decoded.slice(0, colonIdx);
-        const pass = decoded.slice(colonIdx + 1);
-        if (user === expectedSecret || pass === expectedSecret) return true;
-      } else if (decoded === expectedSecret) {
-        return true;
-      }
-    } catch {
-      /* malformed base64 → not authenticated */
-    }
-  }
-  return false;
+  // Constant-time comparison via the shared helper (lib/webhook-auth.ts).
+  return webhookRequestAuthenticated(req, expectedSecret);
 }
 
 export async function POST(req: Request) {

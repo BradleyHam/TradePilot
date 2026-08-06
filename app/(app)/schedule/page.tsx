@@ -3,8 +3,8 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useSearchParams } from 'next/navigation';
 import { useStore } from '@/lib/store';
+import { JobPicker } from '@/components/shared/job-picker';
 import { Job, ScheduleItem, ScheduleItemType, Entry, ScheduleSkipReasonKind } from '@/lib/types';
-import { rankJobs } from '@/lib/job-match';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { Button } from '@/components/ui/button';
@@ -27,7 +27,7 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   CalendarDays, Plus, Briefcase, FileText, Bell, AlertCircle, Receipt, CheckCircle2,
   ChevronLeft, ChevronRight, List as ListIcon, Calendar as CalendarIcon, LayoutGrid,
-  Clock, CloudRain, Stethoscope, UserX, MoreHorizontal,
+  Clock, CloudRain, Stethoscope, UserX, MoreHorizontal, Users,
 } from 'lucide-react';
 import {
   format, parseISO, isToday, isTomorrow, isPast, isThisWeek,
@@ -82,7 +82,11 @@ function FormInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
 
 const TYPE_CONFIG: Record<ScheduleItemType, { label: string; icon: React.ElementType; color: string; bg: string; ring: string; bar: string }> = {
   job_booking:  { label: 'Job',       icon: Briefcase,   color: 'text-orange-600', bg: 'bg-orange-50', ring: 'ring-orange-200', bar: 'bg-orange-500' },
-  quote_visit:  { label: 'Quote',     icon: FileText,    color: 'text-blue-600',   bg: 'bg-blue-50',   ring: 'ring-blue-200',   bar: 'bg-blue-500' },
+  // 'Site visit', not 'Quote' — the underlying type is still `quote_visit`
+  // (DB check constraint), but every other surface in the app already calls
+  // this a site visit, and a badge reading "Quote" invites confusion with the
+  // quote document itself.
+  quote_visit:  { label: 'Site visit', icon: FileText,   color: 'text-blue-600',   bg: 'bg-blue-50',   ring: 'ring-blue-200',   bar: 'bg-blue-500' },
   follow_up:    { label: 'Follow up', icon: Bell,        color: 'text-violet-600', bg: 'bg-violet-50', ring: 'ring-violet-200', bar: 'bg-violet-500' },
   bill_due:     { label: 'Bill due',  icon: AlertCircle, color: 'text-red-500',    bg: 'bg-red-50',    ring: 'ring-red-200',    bar: 'bg-red-500' },
   invoice_due:  { label: 'Invoice',   icon: Receipt,     color: 'text-amber-600',  bg: 'bg-amber-50',  ring: 'ring-amber-200',  bar: 'bg-amber-500' },
@@ -192,7 +196,7 @@ type TypeFilter = 'all' | ScheduleItemType;
 const TYPE_FILTERS: { label: string; value: TypeFilter }[] = [
   { label: 'All',         value: 'all' },
   { label: 'Jobs',        value: 'job_booking' },
-  { label: 'Quotes',      value: 'quote_visit' },
+  { label: 'Site visits', value: 'quote_visit' },
   { label: 'Bills',       value: 'bill_due' },
   { label: 'Invoices',    value: 'invoice_due' },
   { label: 'Follow-ups',  value: 'follow_up' },
@@ -470,6 +474,8 @@ export default function SchedulePage() {
     startTime?: string; // HH:mm
     endTime?: string;
     location?: string;
+    clientName?: string;
+    clientPhone?: string;
     notes?: string;
   }>(null);
 
@@ -587,8 +593,9 @@ export default function SchedulePage() {
     const firstVisitIndex = items.findIndex((it) => it.type === 'quote_visit');
     if (firstVisitIndex >= 0) {
       const firstVisit = items[firstVisitIndex];
-      // Try to fill location from the linked job if the user didn't type one.
-      // Most site visits ARE the job's location, so this is a sensible default.
+      // The address typed on the visit itself wins; fall back to the
+      // linked job's location if the user didn't type one — most site
+      // visits ARE the job's location, so that's a sensible default.
       const linkedJob = firstVisit.jobId
         ? jobs.find((j) => j.id === firstVisit.jobId)
         : undefined;
@@ -598,7 +605,9 @@ export default function SchedulePage() {
         date: firstVisit.date,
         startTime: firstVisit.startTime,
         endTime: firstVisit.endTime,
-        location: linkedJob?.location ?? undefined,
+        location: firstVisit.location ?? linkedJob?.location ?? undefined,
+        clientName: firstVisit.clientName ?? linkedJob?.clientName ?? undefined,
+        clientPhone: firstVisit.clientPhone ?? linkedJob?.clientPhone ?? undefined,
         notes: firstVisit.notes,
       });
     }
@@ -627,7 +636,11 @@ export default function SchedulePage() {
       start,
       end,
       location: savedQuoteVisit.location,
-      description: savedQuoteVisit.notes,
+      description: [
+        savedQuoteVisit.clientName && `Client: ${savedQuoteVisit.clientName}`,
+        savedQuoteVisit.clientPhone && `Phone: ${savedQuoteVisit.clientPhone}`,
+        savedQuoteVisit.notes,
+      ].filter(Boolean).join('\n') || undefined,
     });
     // Flag the row so the schedule list can render the "Reminders set"
     // badge. Optimistic — the store mutator rolls back on Supabase failure,
@@ -656,16 +669,23 @@ export default function SchedulePage() {
       const [eh, em] = item.endTime.split(':').map(Number);
       end = new Date(y, m - 1, d, eh, em);
     }
-    // Prefer the linked job's location if the schedule item didn't
-    // capture one of its own — same fallback as the post-save flow.
+    // The item's own address wins; fall back to the linked job's location
+    // if the schedule item didn't capture one of its own — same fallback
+    // as the post-save flow.
     const linkedJob = item.jobId ? jobs.find((j) => j.id === item.jobId) : undefined;
+    const clientName = item.clientName ?? linkedJob?.clientName;
+    const clientPhone = item.clientPhone ?? linkedJob?.clientPhone;
     downloadIcs({
       uid: `${item.id}@tradepilot`,
       title: item.title || 'Site visit',
       start,
       end,
-      location: linkedJob?.location,
-      description: item.notes,
+      location: item.location ?? linkedJob?.location,
+      description: [
+        clientName && `Client: ${clientName}`,
+        clientPhone && `Phone: ${clientPhone}`,
+        item.notes,
+      ].filter(Boolean).join('\n') || undefined,
     });
     updateScheduleItem(item.id, { icsDownloaded: true });
   }
@@ -683,18 +703,44 @@ export default function SchedulePage() {
   }
 
   // Used by the month view's day-detail sheet when the user schedules work
-  // directly from a tapped future/today date. Wraps the same handleAdd
-  // logic but doesn't close the parent's "Add" sheet (it was never opened).
+  // (a job booking OR a site visit) directly from a tapped future/today date.
+  // Wraps the same handleAdd logic but doesn't close the parent's "Add" sheet
+  // (it was never opened). Uses real UUIDs — see handleAdd for why a
+  // "sch_<ts>" string id races against the Supabase insert (Postgres 22P02).
   function handleScheduleFromDay(items: Omit<ScheduleItem, 'id' | 'businessId' | 'createdAt'>[]) {
-    const baseTs = Date.now();
+    const idsByIndex: string[] = [];
     items.forEach((data, i) => {
+      const id = crypto.randomUUID();
+      idsByIndex[i] = id;
       addScheduleItem({
-        id: `sch_${baseTs}_${i}`,
+        id,
         businessId: businessId ?? '',
         createdAt: new Date().toISOString(),
         ...data,
       });
     });
+
+    // If the user booked a site visit from the day, offer the same
+    // "Add to calendar" prompt they'd get from the main Add sheet so the
+    // reminders (night before + 1hr before) can be handed to their phone.
+    const firstVisitIndex = items.findIndex((it) => it.type === 'quote_visit');
+    if (firstVisitIndex >= 0) {
+      const firstVisit = items[firstVisitIndex];
+      const linkedJob = firstVisit.jobId
+        ? jobs.find((j) => j.id === firstVisit.jobId)
+        : undefined;
+      setSavedQuoteVisit({
+        scheduleItemId: idsByIndex[firstVisitIndex],
+        title: firstVisit.title || 'Site visit',
+        date: firstVisit.date,
+        startTime: firstVisit.startTime,
+        endTime: firstVisit.endTime,
+        location: firstVisit.location ?? linkedJob?.location ?? undefined,
+        clientName: firstVisit.clientName ?? linkedJob?.clientName ?? undefined,
+        clientPhone: firstVisit.clientPhone ?? linkedJob?.clientPhone ?? undefined,
+        notes: firstVisit.notes,
+      });
+    }
   }
 
   const totalUpcoming = upcomingItems.length;
@@ -759,7 +805,7 @@ export default function SchedulePage() {
             <EmptyState
               icon={CalendarDays}
               title="Nothing scheduled"
-              description="Add job bookings, quote visits, follow-ups, and bill due dates to stay organised."
+              description="Add job bookings, site visits, follow-ups, and bill due dates to stay organised."
               action={
                 <Button className="bg-primary" onClick={() => setShowAdd(true)}>
                   <Plus size={16} className="mr-1.5" /> Add first item
@@ -1154,6 +1200,25 @@ function RunCard({
 }) {
   const config = TYPE_CONFIG[run.head.type];
   const Icon = config.icon;
+
+  // Who's on this booking — override rows on any day of the run win,
+  // otherwise the job-level team (matches migration 035 semantics).
+  // Owner-only + employees-only so a solo business renders nothing extra.
+  const { role, teamMembers, jobAssignments, scheduleAssignments } = useStore();
+  const crewNames = useMemo(() => {
+    if (run.head.type !== 'job_booking' || role !== 'owner') return [];
+    const employees = teamMembers.filter((m) => m.role === 'employee');
+    if (employees.length === 0) return [];
+    const itemIds = new Set(run.items.map((i) => i.id));
+    const overrideUids = new Set(
+      scheduleAssignments.filter((a) => itemIds.has(a.scheduleItemId)).map((a) => a.userId),
+    );
+    const uids = overrideUids.size > 0
+      ? overrideUids
+      : new Set(jobAssignments.filter((a) => a.jobId === run.head.jobId).map((a) => a.userId));
+    return employees.filter((m) => uids.has(m.userId)).map((m) => m.displayName || 'Employee');
+  }, [run, role, teamMembers, jobAssignments, scheduleAssignments]);
+
   const startDate = parseISO(run.startDate);
   const endDate = parseISO(run.endDate);
   // A run is "skipped" if its representative item has a skip reason. We
@@ -1218,6 +1283,11 @@ function RunCard({
             </span>
           )}
           {job && <span className="text-xs text-muted-foreground truncate">{job.name}</span>}
+          {crewNames.length > 0 && (
+            <span className="text-xs text-muted-foreground inline-flex items-center gap-1">
+              <Users size={11} /> {crewNames.join(', ')}
+            </span>
+          )}
           {overdue && <span className="text-xs font-medium text-red-500">Overdue</span>}
           {isSkipped && (
             <span className="inline-flex items-center gap-1 px-1.5 py-0.5 rounded-md bg-amber-100 text-amber-800 text-[10px] font-semibold uppercase tracking-wide">
@@ -1731,7 +1801,7 @@ function MonthView({
   const [selectedDay, setSelectedDay] = useState<string | null>(null);
   // Which inline action panel is open in the day-detail sheet. Reset whenever
   // the sheet opens on a different day so each day starts collapsed.
-  const [inlineAction, setInlineAction] = useState<'log' | 'schedule' | null>(null);
+  const [inlineAction, setInlineAction] = useState<'log' | 'schedule' | 'visit' | null>(null);
   useEffect(() => { setInlineAction(null); }, [selectedDay]);
 
   const monthStart = startOfMonth(anchor);
@@ -1977,6 +2047,17 @@ function MonthView({
                         Schedule a job
                       </Button>
                     )}
+                    {isTodayOrFuture && (
+                      <Button
+                        size="sm"
+                        variant="outline"
+                        onClick={() => setInlineAction('visit')}
+                        className="h-9"
+                      >
+                        <FileText size={14} className="mr-1.5" />
+                        Book a site visit
+                      </Button>
+                    )}
                   </div>
                 )}
 
@@ -2004,6 +2085,24 @@ function MonthView({
                     </div>
                     <AddScheduleForm
                       jobs={jobs}
+                      defaultDate={selectedDay}
+                      onSave={(scheduleItems) => {
+                        onScheduleItems(scheduleItems);
+                        setInlineAction(null);
+                      }}
+                      onCancel={() => setInlineAction(null)}
+                    />
+                  </div>
+                )}
+
+                {inlineAction === 'visit' && (
+                  <div className="bg-muted/30 border border-border rounded-2xl p-3">
+                    <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
+                      Site visit
+                    </div>
+                    <AddScheduleForm
+                      jobs={jobs}
+                      initialType="quote_visit"
                       defaultDate={selectedDay}
                       onSave={(scheduleItems) => {
                         onScheduleItems(scheduleItems);
@@ -2333,7 +2432,7 @@ function HoursBarNoJob({ hours }: { hours: number }) {
 
 const SCHEDULE_TYPES: { value: ScheduleItemType; label: string }[] = [
   { value: 'job_booking', label: 'Job booking' },
-  { value: 'quote_visit', label: 'Quote visit' },
+  { value: 'quote_visit', label: 'Site visit' },
   { value: 'follow_up', label: 'Follow-up' },
   { value: 'bill_due', label: 'Bill due' },
   { value: 'invoice_due', label: 'Invoice due' },
@@ -2365,7 +2464,7 @@ function AddScheduleForm({
   // 5:30pm-tired-painter rule: don't make Brad navigate away from the
   // schedule entry he's halfway through to set up the job he just
   // remembered needs to exist.
-  const { addJob, businessId } = useStore();
+  const { addJob, businessId, entries } = useStore();
 
   const [type, setType] = useState<ScheduleItemType>(initialType ?? 'job_booking');
   const [title, setTitle] = useState('');
@@ -2378,6 +2477,18 @@ function AddScheduleForm({
   const [jobId, setJobId] = useState('');
   const [notes, setNotes] = useState('');
 
+  // Site-visit-only fields. A visit is a single drop-in at an address,
+  // often booked before a Job row exists — so it gets its own address +
+  // optional client contact rather than reusing the generic Title field.
+  const isVisit = type === 'quote_visit';
+  const [location, setLocation] = useState('');
+  const [clientName, setClientName] = useState('');
+  const [clientEmail, setClientEmail] = useState('');
+  const [clientPhone, setClientPhone] = useState('');
+  // Contact fields start collapsed — none are required, so don't show
+  // three empty inputs by default. One tap reveals them.
+  const [showContact, setShowContact] = useState(false);
+
   // Inline "Create job" mini-form state. `creating` flips on when the
   // user picks the synthetic "__create__" sentinel from the Job select;
   // it stays on until they either save the new job (we auto-select its
@@ -2387,6 +2498,25 @@ function AddScheduleForm({
   const [creatingName, setCreatingName] = useState('');
   const [creatingBusy, setCreatingBusy] = useState(false);
   const [creatingError, setCreatingError] = useState<string | null>(null);
+
+  /**
+   * Open the inline create-job mini-form, pre-naming it from the best
+   * signal available. In priority order:
+   *
+   *   1. `seed` — text the user typed into the picker's search box before
+   *      coming up empty. The most deliberate signal there is: they spelled
+   *      out the job's name looking for it.
+   *   2. The schedule item's Title. Booking "Cromwell Races — Day 1" and
+   *      then creating a job nearly always means a job of roughly that name.
+   *
+   * Never overwrites a name already half-typed in the mini-form, so
+   * re-opening it is harmless.
+   */
+  function openCreateJob(seed?: string) {
+    setCreating(true);
+    setCreatingError(null);
+    setCreatingName((cur) => (cur.trim() ? cur : (seed?.trim() || title.trim())));
+  }
 
   /**
    * Mint a new Job and auto-select it in the Job picker. Status follows
@@ -2430,15 +2560,9 @@ function AddScheduleForm({
     setCreatingName('');
   }
 
-  const supportsRange = type === 'job_booking' || type === 'quote_visit' || type === 'reminder';
-
-  const ranked = useMemo(() => rankJobs(jobs), [jobs]);
-
-  const jobNameById = useMemo(() => {
-    const map: Record<string, string> = {};
-    for (const j of jobs) map[j.id] = j.name;
-    return map;
-  }, [jobs]);
+  // Site visits are always a single drop-in — never multi-day — so they're
+  // excluded here even though the DB/type layer would technically allow it.
+  const supportsRange = type === 'job_booking' || type === 'reminder';
 
   const effectiveEnd = multiDay && endDate ? endDate : date;
   const dayCount = multiDay ? datesBetween(date, effectiveEnd).length : 1;
@@ -2447,28 +2571,39 @@ function AddScheduleForm({
     SCHEDULE_TYPES.map((t) => [t.value, t.label])
   );
 
-  const TIER_LABELS: Record<string, string> = {
-    'active-match':      'Best matches',
-    'active':            'Active',
-    'recent':            'Recently completed',
-    'older':             'Older',
-  };
+  const selectedJob = jobId ? jobs.find((j) => j.id === jobId) : undefined;
+
+  // Visits don't have a manual Title field — it's derived so there's one
+  // fewer thing to type. Prefers the job name, falls back to the address,
+  // falls back to a plain "Site visit".
+  const visitTitle = selectedJob
+    ? `Site visit — ${selectedJob.name}`
+    : location.trim()
+      ? `Site visit — ${location.trim()}`
+      : 'Site visit';
 
   function handleSubmit() {
-    const days = multiDay && endDate
+    // `!isVisit` guards against stale multiDay state carried over from
+    // switching away from job_booking/reminder — a visit is always one day.
+    const days = !isVisit && multiDay && endDate
       ? datesBetween(date, endDate)
       : [date];
 
     const items = days.map((d, i) => ({
       type,
-      title:
-        days.length > 1 && type === 'job_booking'
+      title: isVisit
+        ? visitTitle
+        : days.length > 1 && type === 'job_booking'
           ? `${title.trim()} (Day ${i + 1}/${days.length})`
           : title.trim(),
       date: d,
       startTime: startTime || undefined,
       endTime: endTime || undefined,
       jobId: jobId || undefined,
+      location: location.trim() || undefined,
+      clientName: clientName.trim() || undefined,
+      clientEmail: clientEmail.trim() || undefined,
+      clientPhone: clientPhone.trim() || undefined,
       notes: notes || undefined,
       completed: false,
     }));
@@ -2492,9 +2627,13 @@ function AddScheduleForm({
         </Select>
       </FormField>
 
-      <FormField label="Title *">
-        <FormInput placeholder="e.g. Smith Exterior - Day 1" value={title} onChange={(e) => setTitle(e.target.value)} />
-      </FormField>
+      {/* Visits skip the manual Title — it's derived from the job/address
+          (see visitTitle) so there's one fewer thing to type on-site. */}
+      {!isVisit && (
+        <FormField label="Title *">
+          <FormInput placeholder="e.g. Smith Exterior - Day 1" value={title} onChange={(e) => setTitle(e.target.value)} />
+        </FormField>
+      )}
 
       {multiDay ? (
         <div className="grid grid-cols-2 gap-3">
@@ -2552,69 +2691,80 @@ function AddScheduleForm({
         </FormField>
       </div>
 
-      <FormField label="Job (optional)">
-        <Select
-          value={jobId}
-          onValueChange={(v) => {
-            // "__create__" is a sentinel value — when chosen, open the
-            // inline mini-form instead of writing it into jobId. Anything
-            // else (real job id, '' for "No job") flows through normally.
-            if (v === '__create__') {
-              setCreating(true);
-              setCreatingError(null);
-              return;
-            }
-            setJobId(v ?? '');
-          }}
-        >
-          <SelectTrigger className="h-9 text-sm">
-            <SelectValue placeholder="No job">
-              {(value) => {
-                if (!value) return 'No job';
-                return jobNameById[value as string] ?? 'No job';
-              }}
-            </SelectValue>
-          </SelectTrigger>
-          <SelectContent>
-            <SelectItem value="">No job</SelectItem>
-            {/* Synthetic "Create new job…" row. Sits at the top of the
-                list so it's the first non-"No job" option Brad sees. The
-                "__create__" value is intercepted in onValueChange above —
-                it never lands in jobId state. */}
-            <SelectItem value="__create__">
-              <span className="flex items-center gap-1.5 text-primary font-medium">
-                <Plus size={12} strokeWidth={2.4} />
-                Create new job…
-              </span>
-            </SelectItem>
-            {(() => {
-              const tiers: Array<'active-match' | 'active' | 'recent' | 'older'> = [
-                'active-match', 'active', 'recent', 'older',
-              ];
-              const hasActive = ranked.some((r) => r.tier === 'active' || r.tier === 'active-match');
-              const selectedIsOlder = !!jobId && ranked.find((r) => r.job.id === jobId)?.tier === 'older';
+      {isVisit && (
+        <FormField label="Address">
+          <FormInput
+            placeholder="e.g. 12 Ballantyne Rd, Wanaka"
+            value={location}
+            onChange={(e) => setLocation(e.target.value)}
+          />
+        </FormField>
+      )}
 
-              return tiers.flatMap((tier) => {
-                const items = ranked.filter((r) => r.tier === tier);
-                if (items.length === 0) return [];
-                if (tier === 'older' && hasActive && !selectedIsOlder) return [];
-                return [
-                  <div
-                    key={`${tier}-label`}
-                    className="px-2 pt-2 pb-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wide"
-                  >
-                    {TIER_LABELS[tier]}
-                  </div>,
-                  ...items.map((r) => (
-                    <SelectItem key={r.job.id} value={r.job.id}>
-                      {r.job.name}
-                    </SelectItem>
-                  )),
-                ];
-              });
-            })()}
-          </SelectContent>
-        </Select>
+      {/* Job field — two peer actions on one row: PICK an existing job,
+          or make a NEW one. The create path used to live only inside the
+          dropdown, which quietly framed the whole field as "choose from
+          what exists"; someone scheduling work for a customer who isn't
+          in the app yet has no reason to open a list to find out it can
+          also create. Sitting the button beside the picker states both
+          options without a tap, and the 44px target survives a phone in
+          the van. The button is the primary path; the picker's empty-
+          search fallback catches whoever searched first. */}
+      <div>
+        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+          Job (optional)
+        </label>
+        <div className="flex items-stretch gap-2">
+          <div className="flex-1 min-w-0">
+            <JobPicker
+              jobs={jobs}
+              entries={entries}
+              value={jobId}
+              onChange={(id) => {
+                setJobId(id);
+                // Prefill from the job so Brad doesn't retype what's already
+                // on file — only when the field is still empty, so it never
+                // clobbers something he already typed for this visit.
+                if (isVisit && id) {
+                  const picked = jobs.find((j) => j.id === id);
+                  if (picked) {
+                    if (!location.trim() && picked.location) setLocation(picked.location);
+                    const gotContact =
+                      (!clientName.trim() && !!picked.clientName) ||
+                      (!clientEmail.trim() && !!picked.clientEmail) ||
+                      (!clientPhone.trim() && !!picked.clientPhone);
+                    if (!clientName.trim() && picked.clientName) setClientName(picked.clientName);
+                    if (!clientEmail.trim() && picked.clientEmail) setClientEmail(picked.clientEmail);
+                    if (!clientPhone.trim() && picked.clientPhone) setClientPhone(picked.clientPhone);
+                    // Reveal the contact block so the prefilled values are
+                    // visible rather than silently hidden behind the toggle.
+                    if (gotContact) setShowContact(true);
+                  }
+                }
+              }}
+              placeholder="No job"
+              hideOlderWhenActive
+              onCreateNew={openCreateJob}
+            />
+          </div>
+          <button
+            type="button"
+            // Wrapped, not passed directly: onClick would hand the mouse
+            // event straight into the `seed` param.
+            onClick={() => openCreateJob()}
+            aria-expanded={creating}
+            title="Create a new job and attach it to this booking"
+            className={cn(
+              'shrink-0 h-11 px-3 rounded-lg border text-sm font-semibold inline-flex items-center gap-1.5 transition-colors',
+              creating
+                ? 'border-primary bg-primary/10 text-primary'
+                : 'border-input bg-background text-foreground hover:bg-accent',
+            )}
+          >
+            <Plus size={15} strokeWidth={2.4} />
+            New
+          </button>
+        </div>
 
         {/* Inline "Create job" mini-form. Single name field + Create /
             Cancel buttons. On Create we mint the job, then auto-select
@@ -2675,7 +2825,48 @@ function AddScheduleForm({
             </div>
           </div>
         )}
-      </FormField>
+      </div>
+
+      {/* Optional client contact — collapsed by default since none of the
+          three fields are required. One tap reveals them; useful mainly
+          for visits booked against a lead that doesn't have a Job yet. */}
+      {isVisit && !showContact && (
+        <button
+          type="button"
+          onClick={() => setShowContact(true)}
+          className="flex items-center gap-1.5 text-xs text-primary py-1"
+        >
+          <Plus size={13} strokeWidth={2.4} />
+          Add client contact (optional)
+        </button>
+      )}
+
+      {isVisit && showContact && (
+        <div className="rounded-xl border border-border bg-muted/20 p-3 space-y-2">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide block">
+            Client contact (optional)
+          </label>
+          <FormInput
+            placeholder="Name"
+            value={clientName}
+            onChange={(e) => setClientName(e.target.value)}
+          />
+          <div className="grid grid-cols-2 gap-2">
+            <FormInput
+              type="email"
+              placeholder="Email"
+              value={clientEmail}
+              onChange={(e) => setClientEmail(e.target.value)}
+            />
+            <FormInput
+              type="tel"
+              placeholder="Phone"
+              value={clientPhone}
+              onChange={(e) => setClientPhone(e.target.value)}
+            />
+          </div>
+        </div>
+      )}
 
       <FormField label="Notes">
         <Textarea
@@ -2692,9 +2883,9 @@ function AddScheduleForm({
         <Button
           className="flex-1 bg-primary"
           disabled={
-            !title.trim() ||
+            (!isVisit && !title.trim()) ||
             !date ||
-            (multiDay && (!endDate || parseISODate(endDate) < parseISODate(date)))
+            (!isVisit && multiDay && (!endDate || parseISODate(endDate) < parseISODate(date)))
           }
           onClick={handleSubmit}
         >

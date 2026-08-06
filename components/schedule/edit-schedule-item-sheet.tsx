@@ -142,7 +142,7 @@ function setsEqual(a: Set<number>, b: Set<number>): boolean {
 // ── Schedule-type labels (mirrors page.tsx) ──────────────────────────────
 const TYPE_LABELS: Record<ScheduleItemType, string> = {
   job_booking: 'Job booking',
-  quote_visit: 'Quote visit',
+  quote_visit: 'Site visit',
   follow_up: 'Follow-up',
   bill_due: 'Bill due',
   invoice_due: 'Invoice due',
@@ -215,8 +215,10 @@ function EditForm({
   jobs: Job[];
   onClose: () => void;
 }) {
-  const { addScheduleItem, deleteScheduleItem, updateScheduleItem, businessId } =
-    useStore();
+  const {
+    addScheduleItem, deleteScheduleItem, updateScheduleItem, businessId,
+    role, teamMembers, jobAssignments, scheduleAssignments, setBookingAssignees,
+  } = useStore();
 
   // Sort once so the first item is the run's start and the last is its end.
   // The schedule page passes already-sorted items, but we don't rely on it.
@@ -254,6 +256,54 @@ function EditForm({
 
   const [days, setDays] = useState<Set<number>>(initialDays);
   const [preset, setPreset] = useState<Preset>(() => presetFor(initialDays));
+
+  // ── Who's on this booking (per-day override of the job team) ──────────
+  // Only meaningful for job bookings, and only shown to the owner when
+  // employees exist. Semantics match migration 035: no override rows →
+  // the booking inherits the job-level team; any rows → exactly those
+  // people. The picker therefore has an "inherit" mode and a "custom"
+  // mode; custom with nobody selected falls back to inherit (an empty
+  // override can't be expressed at the DB level).
+  const employees = useMemo(
+    () => teamMembers.filter((m) => m.role === 'employee'),
+    [teamMembers],
+  );
+  const showAssignees =
+    role === 'owner' && first.type === 'job_booking' && employees.length > 0;
+  const initialOverride = useMemo(
+    () =>
+      scheduleAssignments
+        .filter((a) => a.scheduleItemId === first.id)
+        .map((a) => a.userId),
+    // Deliberately snapshot on open — live updates mid-edit would fight
+    // the user's in-progress picks.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+    [first.id],
+  );
+  const [assignMode, setAssignMode] = useState<'inherit' | 'custom'>(
+    initialOverride.length > 0 ? 'custom' : 'inherit',
+  );
+  const [overrideIds, setOverrideIds] = useState<string[]>(initialOverride);
+
+  function toggleOverride(userId: string) {
+    setAssignMode('custom');
+    setOverrideIds((prev) =>
+      prev.includes(userId) ? prev.filter((u) => u !== userId) : [...prev, userId],
+    );
+  }
+
+  // Names on the job-level team for the selected job — the "inherit" hint.
+  const jobTeamNames = useMemo(() => {
+    if (!jobId) return [];
+    const onJob = new Set(
+      jobAssignments.filter((a) => a.jobId === jobId).map((a) => a.userId),
+    );
+    return employees.filter((m) => onJob.has(m.userId)).map((m) => m.displayName || 'Employee');
+  }, [jobId, jobAssignments, employees]);
+
+  /** The override to persist: [] when inheriting (clears any rows). */
+  const effectiveOverride =
+    assignMode === 'custom' && overrideIds.length > 0 ? overrideIds : [];
 
   // Split mode — when true, the form swaps for a cutoff-date picker. Only
   // offered for multi-day job_booking runs (a single-day or non-job run
@@ -315,6 +365,7 @@ function EditForm({
         notes: notes || undefined,
         completed,
       });
+      if (showAssignees) void setBookingAssignees(first.id, effectiveOverride);
       onClose();
       return;
     }
@@ -327,12 +378,13 @@ function EditForm({
 
     const dates = supportsRange ? previewDates : [startDate];
     dates.forEach((d, i) => {
+      const newId = crypto.randomUUID();
       addScheduleItem({
         // Real uuid client-side — schedule_items.id is a uuid column in
         // Supabase. Using "sch_<ts>" string ids would race against the
         // post-insert id-swap if any code tries to update the row before
         // the insert response lands. See schedule/page.tsx handleAdd.
-        id: crypto.randomUUID(),
+        id: newId,
         businessId,
         createdAt: new Date().toISOString(),
         type: first.type,
@@ -350,6 +402,12 @@ function EditForm({
         notes: notes || undefined,
         completed,
       });
+      // Re-apply the per-day override to the recreated booking. The old
+      // rows die with the deleted items (DB cascade); setBookingAssignees
+      // retries briefly if the optimistic booking insert hasn't landed.
+      if (showAssignees && effectiveOverride.length > 0) {
+        void setBookingAssignees(newId, effectiveOverride);
+      }
     });
 
     onClose();
@@ -563,6 +621,56 @@ function EditForm({
           </SelectContent>
         </Select>
       </FormField>
+
+      {/* Who's on this booking — per-day override of the job team */}
+      {showAssignees && (
+        <div>
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+            Who&apos;s on it
+          </label>
+          <div className="flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={() => { setAssignMode('inherit'); setOverrideIds([]); }}
+              aria-pressed={assignMode === 'inherit'}
+              className={cn(
+                'min-h-[44px] px-4 rounded-full border text-sm font-medium transition-colors',
+                assignMode === 'inherit'
+                  ? 'bg-primary text-primary-foreground border-primary'
+                  : 'bg-card text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
+              )}
+            >
+              Job team
+            </button>
+            {employees.map((m) => {
+              const on = assignMode === 'custom' && overrideIds.includes(m.userId);
+              return (
+                <button
+                  key={m.userId}
+                  type="button"
+                  onClick={() => toggleOverride(m.userId)}
+                  aria-pressed={on}
+                  className={cn(
+                    'min-h-[44px] px-4 rounded-full border text-sm font-medium transition-colors',
+                    on
+                      ? 'bg-primary text-primary-foreground border-primary'
+                      : 'bg-card text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
+                  )}
+                >
+                  {m.displayName || 'Employee'}
+                </button>
+              );
+            })}
+          </div>
+          <p className="text-[11px] text-muted-foreground mt-1.5">
+            {assignMode === 'inherit' || overrideIds.length === 0
+              ? jobTeamNames.length > 0
+                ? `Job team: ${jobTeamNames.join(', ')}. Pick names to override just ${sorted.length > 1 ? 'these days' : 'this day'}.`
+                : 'Nobody is on this job yet — assign people on the job page, or pick names here for just this booking.'
+              : `Only the picked ${overrideIds.length === 1 ? 'person' : 'people'} will see ${sorted.length > 1 ? 'these days' : 'this day'}.`}
+          </p>
+        </div>
+      )}
 
       <FormField label="Notes">
         <Textarea

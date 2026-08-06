@@ -8,7 +8,8 @@ import { Badge } from '@/components/ui/badge';
 import { cn } from '@/lib/utils';
 import { rowToBusinessMember } from '@/lib/supabase/mappers';
 import type { BusinessMember, WorkerKind } from '@/lib/types';
-import { UserPlus, Trash2, Check, RefreshCw, Shield } from 'lucide-react';
+import { UserPlus, Trash2, Check, RefreshCw, Shield, ChevronRight } from 'lucide-react';
+import { EmployeeDetailSheet } from '@/components/team/employee-detail-sheet';
 
 const WORKER_KINDS: { value: WorkerKind; label: string }[] = [
   { value: 'helper', label: 'Helper (prep, sanding, masking)' },
@@ -38,6 +39,8 @@ export default function TeamPage() {
 
   const [submitting, setSubmitting] = useState(false);
   const [error, setError] = useState<string | null>(null);
+  // Tap an employee row → their detail sheet (assigned jobs, hours, photos).
+  const [viewing, setViewing] = useState<BusinessMember | null>(null);
   const [created, setCreated] = useState<{ name: string; email: string; mode: 'invite' | 'password'; password?: string } | null>(null);
 
   const loadMembers = useCallback(async () => {
@@ -140,7 +143,20 @@ export default function TeamPage() {
           ) : (
             <div className="divide-y divide-border">
               {members.map((m) => (
-                <div key={m.id} className="flex items-center gap-3 px-4 py-3">
+                <div
+                  key={m.id}
+                  onClick={m.role === 'employee' ? () => setViewing(m) : undefined}
+                  role={m.role === 'employee' ? 'button' : undefined}
+                  tabIndex={m.role === 'employee' ? 0 : undefined}
+                  onKeyDown={(e) => {
+                    if (m.role !== 'employee') return;
+                    if (e.key === 'Enter' || e.key === ' ') { e.preventDefault(); setViewing(m); }
+                  }}
+                  className={cn(
+                    'flex items-center gap-3 px-4 py-3',
+                    m.role === 'employee' && 'cursor-pointer hover:bg-muted/40 transition-colors',
+                  )}
+                >
                   <div className="w-9 h-9 rounded-full bg-muted flex items-center justify-center shrink-0">
                     {m.role === 'owner'
                       ? <Shield size={16} className="text-primary" />
@@ -155,9 +171,16 @@ export default function TeamPage() {
                   {m.role === 'owner'
                     ? <Badge variant="secondary" className="text-xs">You</Badge>
                     : (
-                      <button onClick={() => handleRemove(m)} className="text-muted-foreground hover:text-destructive p-2" aria-label="Remove">
-                        <Trash2 size={16} />
-                      </button>
+                      <>
+                        <button
+                          onClick={(e) => { e.stopPropagation(); handleRemove(m); }}
+                          className="text-muted-foreground hover:text-destructive p-2"
+                          aria-label="Remove"
+                        >
+                          <Trash2 size={16} />
+                        </button>
+                        <ChevronRight size={16} className="text-muted-foreground shrink-0" />
+                      </>
                     )}
                 </div>
               ))}
@@ -257,6 +280,13 @@ export default function TeamPage() {
           </Button>
         </div>
       </div>
+
+      {/* Per-employee detail: assigned jobs, hours, photos */}
+      <EmployeeDetailSheet
+        member={viewing}
+        open={!!viewing}
+        onClose={() => setViewing(null)}
+      />
     </div>
   );
 }

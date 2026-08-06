@@ -14,9 +14,11 @@
 //
 //   1. A schedule_item of type 'quote_visit' is added so the visit
 //      shows up on the Schedule tab and the upcoming-work surfaces.
-//   2. The lead's lastContactedDate is bumped — booking a visit IS
-//      contact, so the chase-list / "leads to contact" inbox stops
-//      nagging about a lead Brad has actively engaged with.
+//   2. A contact is logged (migration 042) — booking a visit IS contact,
+//      so the chase-list / "leads to contact" inbox stops nagging about a
+//      lead Brad has actively engaged with. logContact also keeps the
+//      job's lastContactedDate cache in step, which is what those
+//      surfaces actually read.
 //   3. The .ics file is downloaded so Brad can add it to his phone's
 //      calendar for native reminders (night before + 1 hour before).
 //
@@ -115,7 +117,7 @@ function BookVisitForm({
   onSaved: () => void;
   onCancel: () => void;
 }) {
-  const { addScheduleItem, updateJob, businessId } = useStore();
+  const { addScheduleItem, businessId, logContact } = useStore();
 
   // Defaults — tomorrow 9am, 30-min visit. Most site visits get booked
   // for the next morning, and 30 min is the right size for a walk-around
@@ -179,7 +181,12 @@ function BookVisitForm({
       createdAt: new Date().toISOString(),
     });
 
-    updateJob(job.id, { lastContactedDate: new Date().toISOString() });
+    // Arranging the visit is the contact — dated NOW, not on the visit date.
+    // The conversation that booked it is what reset the chase clock; the
+    // visit itself is a future event, and nothing logs a contact when it
+    // actually happens (the wrap-up flow doesn't call logContact), so the
+    // timeline under-reports site visits by design for now.
+    logContact({ jobId: job.id, direction: 'out', channel: 'visit' });
 
     // Build the calendar invite. Local-time Date constructed from the
     // form inputs — no UTC funny business, so the event lands on the

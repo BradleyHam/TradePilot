@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { Job, JobStatus, WorkType, PrepLevel, LeadSource } from '@/lib/types';
+import { SELECTABLE_WORK_TYPES, WORK_TYPE_LABELS, jobWorkTypes } from '@/lib/types';
 import { JOB_STATUSES } from '@/lib/mock-data';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -10,14 +11,11 @@ import {
 } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
 
-const WORK_TYPES: { value: WorkType; label: string }[] = [
-  { value: 'interior',   label: 'Interior'   },
-  { value: 'exterior',   label: 'Exterior'   },
-  { value: 'cedar',      label: 'Cedar'      },
-  { value: 'wallpaper',  label: 'Wallpaper'  },
-  { value: 'roof',       label: 'Roof'       },
-  { value: 'mixed',      label: 'Mixed'      },
-];
+// 'mixed' is absent by design — it's derived from picking more than one
+// (see deriveWorkType in lib/types.ts), not something a user selects.
+const WORK_TYPES: { value: WorkType; label: string }[] = SELECTABLE_WORK_TYPES.map(
+  (value) => ({ value, label: WORK_TYPE_LABELS[value] }),
+);
 
 const PREP_LEVELS: { value: PrepLevel; label: string }[] = [
   { value: 'light',      label: 'Light'      },
@@ -84,7 +82,15 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
   const [notes, setNotes] = useState(defaultValues?.notes ?? '');
   // Optional scope fields. Power the "estimating coach" data layer — the
   // values feed downstream insights ($/m² benchmarks, win-rate by work type).
-  const [workType, setWorkType] = useState<WorkType | ''>(defaultValues?.workType ?? '');
+  // Legacy 'mixed' rows carry no breakdown, so they start with nothing
+  // selected rather than a chip that no longer exists.
+  const [workTypes, setWorkTypes] = useState<Set<WorkType>>(
+    () => new Set(
+      defaultValues
+        ? jobWorkTypes(defaultValues).filter((t) => t !== 'mixed')
+        : [],
+    ),
+  );
   const [surfaceAreaM2, setSurfaceAreaM2] = useState(defaultValues?.surfaceAreaM2?.toString() ?? '');
   const [prepLevel, setPrepLevel] = useState<PrepLevel | ''>(defaultValues?.prepLevel ?? '');
   // Lead provenance — when the enquiry came in (drives the Leads per-week/month
@@ -107,7 +113,8 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
       leadDate: leadDate || undefined,
       source: source || undefined,
       notes: notes || undefined,
-      workType: workType || undefined,
+      // Set only — `workType` is derived downstream (store + jobToRow).
+      workTypes: Array.from(workTypes),
       surfaceAreaM2: surfaceAreaM2 ? parseFloat(surfaceAreaM2) : undefined,
       prepLevel: prepLevel || undefined,
     });
@@ -185,29 +192,39 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
       {/* Scope — drives downstream $/m² benchmarks and win-rate stats.
           All optional; tap-and-skip if you don't have the data yet. */}
       <div className={cn('grid gap-3', isLead ? 'grid-cols-1' : 'grid-cols-2')}>
+        {/* Work type — chips, not a Select, because it's multi-select now:
+            a job can be interior AND exterior. A dropdown can't express
+            that without checkbox rows, and the chip row matches how the
+            same field renders on the job detail sheet and the wrap-up. */}
         <Field label="Work type">
-          {/*
-            base-ui treats `value={undefined}` as uncontrolled. If we then
-            switch to a real string after selection, it warns about flipping
-            uncontrolled → controlled. Use `null` for the empty state so the
-            Select stays controlled the whole time, and render the label
-            ourselves so SelectValue doesn't show the raw enum.
-          */}
-          <Select value={workType || null} onValueChange={(v) => setWorkType((v ?? '') as WorkType | '')}>
-            <SelectTrigger className="h-9 text-sm">
-              <SelectValue placeholder="Pick one">
-                {(value) => {
-                  if (!value) return 'Pick one';
-                  return WORK_TYPES.find((wt) => wt.value === value)?.label ?? 'Pick one';
-                }}
-              </SelectValue>
-            </SelectTrigger>
-            <SelectContent>
-              {WORK_TYPES.map((wt) => (
-                <SelectItem key={wt.value} value={wt.value}>{wt.label}</SelectItem>
-              ))}
-            </SelectContent>
-          </Select>
+          <div className="flex flex-wrap gap-1.5">
+            {WORK_TYPES.map((wt) => {
+              const selected = workTypes.has(wt.value);
+              return (
+                <button
+                  key={wt.value}
+                  type="button"
+                  aria-pressed={selected}
+                  onClick={() =>
+                    setWorkTypes((prev) => {
+                      const next = new Set(prev);
+                      if (next.has(wt.value)) next.delete(wt.value);
+                      else next.add(wt.value);
+                      return next;
+                    })
+                  }
+                  className={cn(
+                    'px-3 min-h-[36px] rounded-full text-sm font-medium border transition-colors',
+                    selected
+                      ? 'bg-primary text-primary-foreground border-primary'
+                      : 'bg-background text-muted-foreground border-border hover:border-primary/40',
+                  )}
+                >
+                  {wt.label}
+                </button>
+              );
+            })}
+          </div>
         </Field>
         {!isLead && (
           <Field label="Prep level">

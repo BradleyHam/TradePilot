@@ -11,8 +11,11 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
-  BusinessMember, MemberRole, WorkerKind, ShiftPhoto,
+  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, PayRun,
+  JobAssignment, ScheduleAssignment,
+  JobContact, ContactDirection, ContactChannel,
 } from '../types';
+import { deriveWorkType } from '../types';
 
 type Row = Record<string, unknown>;
 
@@ -52,8 +55,13 @@ export function rowToJob(r: Row): Job {
     leadDate: asString(r.lead_date),
     lastContactedDate: asString(r.last_contacted_date),
     notes: asString(r.notes),
+    coverPhotoPath: asString(r.cover_photo_path),
+    coverPhotoSource: asString(r.cover_photo_source),
+    scopeIncluded: Array.isArray(r.scope_included) ? (r.scope_included as string[]) : undefined,
+    scopeExcluded: Array.isArray(r.scope_excluded) ? (r.scope_excluded as string[]) : undefined,
     source: (asString(r.source) as LeadSource | undefined),
     workType: (asString(r.work_type) as WorkType | undefined),
+    workTypes: Array.isArray(r.work_types) ? (r.work_types as WorkType[]) : undefined,
     surfaceAreaM2: asNumber(r.surface_area_m2),
     prepLevel: (asString(r.prep_level) as PrepLevel | undefined),
     scopeNotes: asString(r.scope_notes),
@@ -69,6 +77,12 @@ export function rowToJob(r: Row): Job {
     lostReason: (asString(r.lost_reason) as LostReason | undefined),
     wonReason: (asString(r.won_reason) as WonReason | undefined),
     outcomeNotes: asString(r.outcome_notes),
+    acceptedAt: asString(r.accepted_at),
+    declinedAt: asString(r.declined_at),
+    declineReasons: Array.isArray(r.decline_reasons) ? (r.decline_reasons as string[]) : undefined,
+    declineReason: asString(r.decline_reason),
+    declinedFromStatus: asString(r.declined_from_status) as JobStatus | undefined,
+    snoozeUntil: asString(r.snooze_until),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };
@@ -103,8 +117,26 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.leadDate !== undefined) out.lead_date = j.leadDate || null;
   if (j.lastContactedDate !== undefined) out.last_contacted_date = j.lastContactedDate || null;
   if (j.notes !== undefined) out.notes = j.notes;
+  if (j.coverPhotoPath !== undefined) out.cover_photo_path = j.coverPhotoPath || null;
+  if (j.coverPhotoSource !== undefined) out.cover_photo_source = j.coverPhotoSource || null;
+  if (j.scopeIncluded !== undefined) {
+    out.scope_included = j.scopeIncluded && j.scopeIncluded.length > 0 ? j.scopeIncluded : null;
+  }
+  if (j.scopeExcluded !== undefined) {
+    out.scope_excluded = j.scopeExcluded && j.scopeExcluded.length > 0 ? j.scopeExcluded : null;
+  }
   if (j.source !== undefined) out.source = j.source || null;
   if (j.workType !== undefined) out.work_type = j.workType || null;
+  // work_types is the source of truth; work_type is its single-value
+  // summary. Deriving it HERE — at the one choke point every job write
+  // passes through — means no caller can update the set and forget to
+  // update the summary, leaving the leads filter and insights reading a
+  // stale bucket. An explicit workType in the same patch still wins, so
+  // legacy single-field callers are unaffected.
+  if (j.workTypes !== undefined) {
+    out.work_types = j.workTypes && j.workTypes.length > 0 ? j.workTypes : null;
+    if (j.workType === undefined) out.work_type = deriveWorkType(j.workTypes) ?? null;
+  }
   if (j.surfaceAreaM2 !== undefined) out.surface_area_m2 = j.surfaceAreaM2 ?? null;
   if (j.prepLevel !== undefined) out.prep_level = j.prepLevel || null;
   if (j.scopeNotes !== undefined) out.scope_notes = j.scopeNotes || null;
@@ -133,6 +165,35 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.lostReason !== undefined) out.lost_reason = j.lostReason || null;
   if (j.wonReason !== undefined) out.won_reason = j.wonReason || null;
   if (j.outcomeNotes !== undefined) out.outcome_notes = j.outcomeNotes || null;
+  // Write-once in practice — updateJob only ever sends this on the transition
+  // into 'accepted', and only when it isn't already set. An explicit '' still
+  // clears it, so a mis-click that gets walked back can be corrected.
+  if (j.acceptedAt !== undefined) out.accepted_at = j.acceptedAt || null;
+  // The three decline fields move as a unit. An ISO timestamp records when
+  // the job was turned down; setting it to '' means "put it back on the
+  // list", which MUST also wipe the reason and the restore-target — a job
+  // that isn't declined has no decline record, and a stale
+  // declined_from_status would silently re-route a future decline.
+  //
+  // Clearing all three here (rather than making each caller remember) is why
+  // `declinedFromStatus: undefined` in a restore patch is enough: the local
+  // optimistic merge drops it, and this drops the column.
+  if (j.declinedAt !== undefined) {
+    out.declined_at = j.declinedAt || null;
+    if (!j.declinedAt) {
+      out.decline_reason = null;
+      out.decline_reasons = null;
+      out.declined_from_status = null;
+    }
+  }
+  // Empty array clears the chips (all deselected is a valid answer).
+  if (j.declineReasons !== undefined) {
+    out.decline_reasons = j.declineReasons && j.declineReasons.length ? j.declineReasons : null;
+  }
+  if (j.declineReason !== undefined) out.decline_reason = j.declineReason || null;
+  if (j.declinedFromStatus !== undefined) out.declined_from_status = j.declinedFromStatus || null;
+  // Empty string un-snoozes; a YYYY-MM-DD date snoozes until then.
+  if (j.snoozeUntil !== undefined) out.snooze_until = j.snoozeUntil || null;
   return out;
 }
 
@@ -225,6 +286,10 @@ export function rowToScheduleItem(r: Row): ScheduleItem {
     startTime: asString(r.start_time),
     endTime: asString(r.end_time),
     notes: asString(r.notes),
+    location: asString(r.location),
+    clientName: asString(r.client_name),
+    clientEmail: asString(r.client_email),
+    clientPhone: asString(r.client_phone),
     completed: asBool(r.completed, false),
     skipReasonKind: asString(r.skip_reason_kind) as ScheduleSkipReasonKind | undefined,
     skipReason: asString(r.skip_reason),
@@ -243,6 +308,10 @@ export function scheduleItemToRow(s: Partial<ScheduleItem>): Row {
   if (s.startTime !== undefined) out.start_time = s.startTime || null;
   if (s.endTime !== undefined) out.end_time = s.endTime || null;
   if (s.notes !== undefined) out.notes = s.notes || null;
+  if (s.location !== undefined) out.location = s.location || null;
+  if (s.clientName !== undefined) out.client_name = s.clientName || null;
+  if (s.clientEmail !== undefined) out.client_email = s.clientEmail || null;
+  if (s.clientPhone !== undefined) out.client_phone = s.clientPhone || null;
   if (s.completed !== undefined) out.completed = s.completed;
   // Skip-reason columns added in migration 020. `|| null` so passing
   // an empty string OR undefined both clear the row (used by the
@@ -481,6 +550,24 @@ export function jobImportToRow(i: Partial<JobImport>): Row {
   return out;
 }
 
+// ── Job contacts ────────────────────────────────────────────────────────────
+export function rowToJobContact(r: Row): JobContact {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    contactedAt: r.contacted_at as string,
+    // Defaults rather than trusting the row: these two columns are NOT NULL
+    // with defaults in 042, but a row written by a future importer that skips
+    // them shouldn't produce `undefined` on a non-optional field.
+    direction: (asString(r.direction) as ContactDirection | undefined) ?? 'out',
+    channel: (asString(r.channel) as ContactChannel | undefined) ?? 'unknown',
+    note: asString(r.note),
+    loggedBy: asString(r.logged_by),
+    createdAt: r.created_at as string,
+  };
+}
+
 // ── Setting ─────────────────────────────────────────────────────────────────
 export function rowToShiftPhoto(r: Row): ShiftPhoto {
   return {
@@ -508,6 +595,26 @@ export function rowToBusinessMember(r: Row): BusinessMember {
   };
 }
 
+export function rowToJobAssignment(r: Row): JobAssignment {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    userId: r.user_id as string,
+    createdAt: r.created_at as string,
+  };
+}
+
+export function rowToScheduleAssignment(r: Row): ScheduleAssignment {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    scheduleItemId: r.schedule_item_id as string,
+    userId: r.user_id as string,
+    createdAt: r.created_at as string,
+  };
+}
+
 export function rowToSetting(r: Row): Setting {
   return {
     businessId: r.business_id as string,
@@ -516,6 +623,51 @@ export function rowToSetting(r: Row): Setting {
     notes: asString(r.notes),
     updatedAt: r.updated_at as string,
   };
+}
+
+// ── PayRun ──────────────────────────────────────────────────────────────────
+export function rowToPayRun(r: Row): PayRun {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    memberId: asString(r.member_id),
+    employeeName: (r.employee_name as string) ?? 'Employee',
+    periodStart: r.period_start as string,
+    periodEnd: r.period_end as string,
+    hours: asNumber(r.hours),
+    rate: asNumber(r.rate),
+    gross: asNumber(r.gross) ?? 0,
+    paye: asNumber(r.paye),
+    net: asNumber(r.net),
+    paid: asBool(r.paid, false),
+    paidDate: asString(r.paid_date),
+    eiFiled: asBool(r.ei_filed, false),
+    payePaid: asBool(r.paye_paid, false),
+    expenseEntryId: asString(r.expense_entry_id),
+    notes: asString(r.notes),
+    createdAt: r.created_at as string,
+  };
+}
+
+export function payRunToRow(p: Partial<PayRun>): Row {
+  const out: Row = {};
+  if (p.businessId !== undefined)     out.business_id      = p.businessId;
+  if (p.memberId !== undefined)       out.member_id        = p.memberId ?? null;
+  if (p.employeeName !== undefined)   out.employee_name    = p.employeeName;
+  if (p.periodStart !== undefined)    out.period_start     = p.periodStart;
+  if (p.periodEnd !== undefined)      out.period_end       = p.periodEnd;
+  if (p.hours !== undefined)          out.hours            = p.hours ?? null;
+  if (p.rate !== undefined)           out.rate             = p.rate ?? null;
+  if (p.gross !== undefined)          out.gross            = p.gross;
+  if (p.paye !== undefined)           out.paye             = p.paye ?? null;
+  if (p.net !== undefined)            out.net              = p.net ?? null;
+  if (p.paid !== undefined)           out.paid             = p.paid;
+  if (p.paidDate !== undefined)       out.paid_date        = p.paidDate || null;
+  if (p.eiFiled !== undefined)        out.ei_filed         = p.eiFiled;
+  if (p.payePaid !== undefined)       out.paye_paid        = p.payePaid;
+  if (p.expenseEntryId !== undefined) out.expense_entry_id = p.expenseEntryId ?? null;
+  if (p.notes !== undefined)          out.notes            = p.notes || null;
+  return out;
 }
 
 // ── Invoice ─────────────────────────────────────────────────────────────────
@@ -578,6 +730,7 @@ export function rowToBankTransaction(r: Row): BankTransaction {
     fingerprint: r.fingerprint as string,
     status: (r.status as BankTransactionStatus) ?? 'unreconciled',
     entryId: asString(r.entry_id),
+    taxKind: asString(r.tax_kind) as BankTransaction['taxKind'] | undefined,
     notes: asString(r.notes),
     importedAt: r.imported_at as string,
   };
@@ -599,6 +752,7 @@ export function bankTransactionToRow(t: Partial<BankTransaction>): Row {
   if (t.fingerprint !== undefined)       out.fingerprint         = t.fingerprint;
   if (t.status !== undefined)            out.status              = t.status;
   if (t.entryId !== undefined)           out.entry_id            = t.entryId || null;
+  if (t.taxKind !== undefined)           out.tax_kind            = t.taxKind || null;
   if (t.notes !== undefined)             out.notes               = t.notes || null;
   return out;
 }

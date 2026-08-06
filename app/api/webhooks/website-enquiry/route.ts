@@ -17,6 +17,7 @@
 
 import { NextResponse } from 'next/server';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
+import { secretMatches } from '@/lib/webhook-auth';
 
 // Don't try to prerender or static-optimise this route. It runs on demand.
 export const dynamic = 'force-dynamic';
@@ -82,8 +83,8 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
-  const presentedSecret = req.headers.get('x-webhook-secret');
-  if (presentedSecret !== expectedSecret) {
+  // Constant-time comparison via the shared helper (lib/webhook-auth.ts).
+  if (!secretMatches(req.headers.get('x-webhook-secret'), expectedSecret)) {
     return NextResponse.json(
       { ok: false, error: 'Invalid or missing webhook secret.' },
       { status: 401 },

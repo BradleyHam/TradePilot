@@ -44,6 +44,7 @@ import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import { useStore } from '@/lib/store';
 import { Job, WorkType, PrepLevel, QuoteAttachmentKind } from '@/lib/types';
+import { WORK_TYPE_LABELS, jobWorkTypes } from '@/lib/types';
 import { Camera, X, MapPin, CalendarClock, FileText } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -68,14 +69,12 @@ const ACCESS_CHIPS: { value: string; label: string }[] = [
   { value: 'tenants',           label: 'Tenanted'         },
 ];
 
-const WORK_TYPES: { value: WorkType; label: string }[] = [
-  { value: 'exterior',  label: 'Exterior'  },
-  { value: 'interior',  label: 'Interior'  },
-  { value: 'cedar',     label: 'Cedar'     },
-  { value: 'roof',      label: 'Roof'      },
-  { value: 'wallpaper', label: 'Wallpaper' },
-  { value: 'mixed',     label: 'Mixed'     },
-];
+// Multi-select, and no 'Mixed' — a job that's interior AND exterior says
+// so by tagging both; 'mixed' is just what the derived summary calls that
+// (see deriveWorkType). Exterior leads because it's the bulk of the work.
+const WORK_TYPES: { value: WorkType; label: string }[] = (
+  ['exterior', 'interior', 'cedar', 'roof', 'wallpaper'] as WorkType[]
+).map((value) => ({ value, label: WORK_TYPE_LABELS[value] }));
 
 const PREP_LEVELS: { value: PrepLevel; label: string; hint: string }[] = [
   { value: 'light',       label: 'Light',       hint: 'wash + spot-fill' },
@@ -187,23 +186,43 @@ export type WrapUpTarget =
       visitNotes?: string;
     };
 
+/** Extra context handed back to the parent on save. */
+export interface WrapUpSavedMeta {
+  /**
+   * The date the visit actually happened (YYYY-MM-DD). Only populated in
+   * catch-up mode (`askVisitDate`) — the normal flow already has a
+   * schedule_item carrying the date, so there's nothing to report.
+   */
+  visitDate?: string;
+}
+
 interface SiteVisitWrapUpSheetProps {
   open: boolean;
   /** What the wrap-up is for. null = sheet stays closed regardless of `open`. */
   target: WrapUpTarget | null;
+  /**
+   * Catch-up mode. Normally the wrap-up is opened by ticking a booked
+   * quote_visit, so the app already knows when the visit happened. When
+   * Brad's been slack and the visit was never in the app at all ("Already
+   * visited" on the Mark-contacted prompt), there's no schedule_item to
+   * read a date off — so we ask, and hand it back via onSaved's meta.
+   */
+  askVisitDate?: boolean;
+  /** Overrides the sheet title. Defaults to "Site visit wrap-up". */
+  title?: string;
   /**
    * Called after a successful save. The parent uses this to complete
    * the underlying schedule_item. Receives the resolved jobId (either
    * the pre-existing one or the just-created one) so the parent can
    * patch the schedule_item's jobId if it was previously null.
    */
-  onSaved: (jobId: string) => void;
+  onSaved: (jobId: string, meta: WrapUpSavedMeta) => void;
   /** Called when the user dismisses without saving. */
   onCancel: () => void;
 }
 
 export function SiteVisitWrapUpSheet({
-  open, target, onSaved, onCancel,
+  open, target, askVisitDate = false, title, onSaved, onCancel,
 }: SiteVisitWrapUpSheetProps) {
   const {
     updateJob, addJob, addQuoteAttachments, ensureJobHasQuote, businessId,
@@ -216,12 +235,15 @@ export function SiteVisitWrapUpSheet({
   // Initialised from the job's existing fields when the sheet opens, so
   // re-opening the wrap-up after a previous save reflects the saved state.
   // Reset whenever `open` flips true with a different job id.
-  const [workType, setWorkType] = useState<WorkType | ''>('');
+  const [workTypes, setWorkTypes] = useState<Set<WorkType>>(new Set());
   const [prepLevel, setPrepLevel] = useState<PrepLevel | ''>('');
   const [surfaceAreaM2, setSurfaceAreaM2] = useState('');
   const [accessChips, setAccessChips] = useState<Set<string>>(new Set());
   const [scopeNotes, setScopeNotes] = useState('');
   const [quoteReadyBy, setQuoteReadyBy] = useState('');
+  // Catch-up mode only — when the visit happened. Defaults to today
+  // because "I did it earlier and forgot to log it" is usually same-day.
+  const [visitDate, setVisitDate] = useState('');
 
   // New structured-data fields — feed Tier-2 quote drafting. Numbers
   // kept as strings in form state so empty / partial input works
@@ -264,6 +286,14 @@ export function SiteVisitWrapUpSheet({
     return d.toISOString().slice(0, 10);
   }, []);
 
+  // Local-time today, for the catch-up visit-date default. Deliberately
+  // NOT toISOString() — that's UTC, which reads as "yesterday" in NZ for
+  // anything logged before ~noon.
+  const todayLocalISO = useMemo(() => {
+    const d = new Date();
+    return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+  }, []);
+
   // Stable identity for what's being wrapped up. We hydrate the form
   // exactly once per "open for THIS target" — keyed by job id (for
   // existing-job mode) or visit title (for create-from-visit). Without
@@ -292,7 +322,9 @@ export function SiteVisitWrapUpSheet({
     if (!open || !target) return;
     if (target.mode === 'existing-job') {
       const j = target.job;
-      setWorkType(j.workType ?? '');
+      // Legacy 'mixed' rows carry no breakdown, so they hydrate as empty
+      // rather than pre-selecting a chip that no longer exists.
+      setWorkTypes(new Set(jobWorkTypes(j).filter((t) => t !== 'mixed')));
       setPrepLevel(j.prepLevel ?? '');
       setSurfaceAreaM2(j.surfaceAreaM2 ? String(j.surfaceAreaM2) : '');
       setAccessChips(new Set(j.accessNotes ?? []));
@@ -314,7 +346,7 @@ export function SiteVisitWrapUpSheet({
       setCommercialChips(new Set(j.commercialSignals ?? []));
     } else {
       // create-from-visit
-      setWorkType('');
+      setWorkTypes(new Set());
       setPrepLevel('');
       setSurfaceAreaM2('');
       setAccessChips(new Set());
@@ -328,10 +360,11 @@ export function SiteVisitWrapUpSheet({
       setSiteLogisticsChips(new Set());
       setCommercialChips(new Set());
     }
+    setVisitDate(todayLocalISO);
     setStagedPhotos([]);
     setStagedPlans([]);
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, targetKey, defaultQuoteReadyBy]);
+  }, [open, targetKey, defaultQuoteReadyBy, todayLocalISO]);
 
   function toggleAccessChip(value: string) {
     setAccessChips((prev) => toggleInSet(prev, value));
@@ -477,7 +510,9 @@ export function SiteVisitWrapUpSheet({
       // strings here — empty inputs become undefined so we don't write
       // 0 / NaN into the DB.
       const structuredFields: Partial<Job> = {
-        workType: (workType || undefined) as WorkType | undefined,
+        // Only the set is written — the store and jobToRow derive
+        // `workType` from it, so the summary can't drift.
+        workTypes: Array.from(workTypes),
         prepLevel: (prepLevel || undefined) as PrepLevel | undefined,
         surfaceAreaM2: surfaceAreaM2 ? parseFloat(surfaceAreaM2) : undefined,
         accessNotes: Array.from(accessChips),
@@ -581,8 +616,10 @@ export function SiteVisitWrapUpSheet({
       }
 
       // Let the parent finish (typically: complete the schedule_item
-      // AND link it to the resolved job).
-      onSaved(resolvedJobId);
+      // AND link it to the resolved job). In catch-up mode the parent
+      // also needs the visit date so it can backfill a completed
+      // quote_visit that was never booked in the first place.
+      onSaved(resolvedJobId, askVisitDate ? { visitDate } : {});
     } finally {
       setSaving(false);
     }
@@ -597,7 +634,7 @@ export function SiteVisitWrapUpSheet({
         className="rounded-t-2xl max-h-[92dvh] overflow-y-auto"
       >
         <SheetHeader>
-          <SheetTitle>Site visit wrap-up</SheetTitle>
+          <SheetTitle>{title ?? 'Site visit wrap-up'}</SheetTitle>
         </SheetHeader>
 
         <div className="mt-4 space-y-4 pb-6">
@@ -626,6 +663,32 @@ export function SiteVisitWrapUpSheet({
               </>
             )}
           </div>
+
+          {/* Visit date — catch-up mode only. The normal flow reads the
+              date off the schedule_item that was ticked; here there is
+              no schedule_item yet, so we ask and the parent backfills a
+              completed quote_visit on this date. Sits first because it's
+              the one thing that must be right for the history to make
+              sense. */}
+          {askVisitDate && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block flex items-center gap-1.5">
+                <CalendarClock size={11} strokeWidth={1.8} />
+                When did you visit?
+              </label>
+              <input
+                type="date"
+                value={visitDate}
+                max={todayLocalISO}
+                onChange={(e) => setVisitDate(e.target.value)}
+                className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+                We&apos;ll add this to your schedule as a completed site visit so
+                the history is right.
+              </p>
+            </div>
+          )}
 
           {/* Photos — first because it's the highest-friction action
               (camera permissions, picking from library) and we want it
@@ -780,19 +843,25 @@ export function SiteVisitWrapUpSheet({
             )}
           </div>
 
-          {/* Work type — quick chip select. Less typing than a dropdown. */}
+          {/* Work type — multi-select chips. A renovation is routinely
+              interior AND exterior; making it choose one meant the honest
+              answer was 'mixed', which tells the benchmarks nothing. */}
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
               Work type
+              <span className="ml-1.5 normal-case font-normal text-muted-foreground/70">
+                — pick as many as apply
+              </span>
             </label>
             <div className="flex flex-wrap gap-2">
               {WORK_TYPES.map(({ value, label }) => {
-                const selected = workType === value;
+                const selected = workTypes.has(value);
                 return (
                   <button
                     key={value}
                     type="button"
-                    onClick={() => setWorkType(selected ? '' : value)}
+                    aria-pressed={selected}
+                    onClick={() => setWorkTypes((prev) => toggleInSet(prev, value))}
                     className={cn(
                       'px-3 py-2 rounded-lg text-sm font-medium border transition-colors min-h-[40px]',
                       selected
@@ -1123,7 +1192,10 @@ export function SiteVisitWrapUpSheet({
             <Button
               className="flex-1 bg-primary"
               onClick={handleSave}
-              disabled={saving}
+              // Every field here is optional by design — except the
+              // catch-up visit date, which the parent needs to write the
+              // backfilled schedule_item.
+              disabled={saving || (askVisitDate && !visitDate)}
             >
               {saving
                 ? 'Saving…'

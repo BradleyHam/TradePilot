@@ -111,6 +111,14 @@ export function computeQuoteFollowUps(
   for (const job of jobs) {
     if (job.status !== 'quoted') continue;
 
+    // Snoozed = Brad has consciously decided not to chase yet. Nagging him
+    // anyway defeats the point of the snooze, and it's worst for the case
+    // snoozing exists for: a quote to a builder who's tendering for the
+    // main contract can't be hurried, so a weekly "2nd follow-up due" flag
+    // is pure noise. The ladder resumes by itself the day the snooze ends
+    // (or never, for an indefinite one, until it's cleared).
+    if (job.snoozeUntil && job.snoozeUntil > todayISO) continue;
+
     const sent = sentDateFor(job, quotes);
     const daysSinceSent = daysBetween(sent, todayISO);
     if (daysSinceSent < 0) continue; // future-dated — clock hasn't started

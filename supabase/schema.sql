@@ -45,7 +45,10 @@ create table if not exists jobs (
   client_phone    text,
   location        text,
   status          text not null default 'lead'
-                    check (status in ('lead','quoted','accepted','booked','in-progress','completed','invoiced','paid','lost')),
+                    -- 'lost' = we didn't get it. 'declined' = we said no.
+                    -- Kept apart so turning work down doesn't dent the win
+                    -- rate. See migration 040.
+                    check (status in ('lead','quoted','accepted','booked','in-progress','completed','invoiced','paid','lost','declined')),
   estimated_value numeric(10,2),
   quote_amount    numeric(10,2),
   invoice_amount  numeric(10,2),

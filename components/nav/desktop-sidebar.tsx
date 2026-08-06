@@ -40,7 +40,7 @@ export function DesktopSidebar() {
   const navItems = isEmployee ? EMPLOYEE_NAV_ITEMS : NAV_ITEMS;
 
   return (
-    <aside className="hidden md:flex md:flex-col w-60 shrink-0 border-r border-border bg-card h-screen sticky top-0">
+    <aside className="hidden md:flex md:flex-col w-64 shrink-0 border-r border-border bg-card h-screen sticky top-0">
       {/* Logo */}
       <div className="flex items-center gap-2.5 px-6 py-5 border-b border-border">
         <div className="w-8 h-8 rounded-lg bg-primary flex items-center justify-center">
@@ -53,7 +53,7 @@ export function DesktopSidebar() {
       </div>
 
       {/* Nav */}
-      <nav className="flex-1 px-3 py-4 space-y-1">
+      <nav className="flex-1 px-5 py-4 space-y-1">
         {navItems.map(({ href, label, icon: Icon }) => {
           const active = pathname === href || pathname.startsWith(href + '/');
           return (
@@ -76,7 +76,7 @@ export function DesktopSidebar() {
 
       {/* Settings — owner only. Employees have no settings page (it exposes
           GST + business config); they sign out from their Hours screen. */}
-      <div className={cn('px-3 pb-4 border-t border-border pt-4', isEmployee && 'hidden')}>
+      <div className={cn('px-5 pb-4 border-t border-border pt-4', isEmployee && 'hidden')}>
         <Link
           href="/settings"
           className={cn(

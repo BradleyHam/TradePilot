@@ -170,6 +170,130 @@ export function downloadIcs(event: IcsEvent): void {
   setTimeout(() => URL.revokeObjectURL(url), 1000);
 }
 
+// =============================================================
+// Calendar FEED (subscription) generator
+// =============================================================
+//
+// The single-event builder above is for the "tap → download one .ics"
+// flow. This section builds a *feed*: one VCALENDAR containing many
+// VEVENTs, served from a stable URL that Apple/Google Calendar subscribes
+// to and re-fetches on its own. That's how the app's job bookings show up
+// (read-only) in Brad's Mac calendar and, via iCloud, his iPhone.
+//
+// Differences from buildIcs():
+//   - Many events, no per-event VALARM (a subscribed calendar full of
+//     alarms is noisy; the calendar app's own defaults handle alerts).
+//   - Supports all-day events (a booking with no start time) via
+//     DTSTART;VALUE=DATE, as well as timed events.
+//   - Times are formatted directly from the stored 'YYYY-MM-DD' + 'HH:MM'
+//     strings — NOT via a Date object — so the output never depends on the
+//     server's timezone (Vercel runs in UTC). Floating local time again:
+//     the numbers on the clock are what Brad sees, wherever he is.
+
+/** One row in the feed. Maps a job booking onto a VEVENT. */
+export interface IcsFeedEvent {
+  /** Stable unique id — use the schedule_item id so re-fetches update, not duplicate. */
+  uid: string;
+  /** Event title. */
+  summary: string;
+  /** Date portion, 'YYYY-MM-DD'. */
+  date: string;
+  /** Optional start time, 'HH:MM' or 'HH:MM:SS'. Omit for an all-day event. */
+  startTime?: string;
+  /** Optional end time, 'HH:MM' or 'HH:MM:SS'. Defaults to start + 1h for timed events. */
+  endTime?: string;
+  /** Optional location (job site address) — powers the maps tap in Calendar. */
+  location?: string;
+  /** Optional notes shown as the event description. */
+  description?: string;
+}
+
+export interface IcsFeedOptions {
+  /** Name the calendar shows in the subscription list. */
+  calendarName?: string;
+  /**
+   * Hint (minutes) for how often the client should re-fetch. Apple honours
+   * X-PUBLISHED-TTL loosely; the real cadence is up to the client, but it's
+   * polite to state one. Default 60.
+   */
+  refreshMinutes?: number;
+}
+
+/**
+ * Build a subscribable VCALENDAR feed from many events. CRLF line endings,
+ * folded lines, escaped text — same RFC 5545 rigour as buildIcs().
+ */
+export function buildIcsFeed(events: IcsFeedEvent[], opts: IcsFeedOptions = {}): string {
+  const calendarName = opts.calendarName ?? 'TradePilot — Job bookings';
+  const ttl = Math.max(1, Math.round(opts.refreshMinutes ?? 60));
+  const now = new Date();
+
+  const lines: string[] = [
+    'BEGIN:VCALENDAR',
+    'VERSION:2.0',
+    'PRODID:-//Lakeside Painting//TradePilot//EN',
+    'METHOD:PUBLISH',
+    'CALSCALE:GREGORIAN',
+    `X-WR-CALNAME:${escapeText(calendarName)}`,
+    `NAME:${escapeText(calendarName)}`,
+    `X-PUBLISHED-TTL:PT${ttl}M`,
+    `REFRESH-INTERVAL;VALUE=DURATION:PT${ttl}M`,
+  ];
+
+  for (const ev of events) {
+    lines.push('BEGIN:VEVENT');
+    lines.push(`UID:${escapeText(ev.uid)}`);
+    lines.push(`DTSTAMP:${formatUtcStamp(now)}`);
+
+    if (ev.startTime) {
+      const start = dateTimeStamp(ev.date, ev.startTime);
+      const end = ev.endTime
+        ? dateTimeStamp(ev.date, ev.endTime)
+        : dateTimeStamp(ev.date, addOneHour(ev.startTime));
+      lines.push(`DTSTART:${start}`);
+      lines.push(`DTEND:${end}`);
+    } else {
+      // All-day event. DTEND is exclusive, so it's the next day.
+      lines.push(`DTSTART;VALUE=DATE:${dateStamp(ev.date)}`);
+      lines.push(`DTEND;VALUE=DATE:${dateStamp(addOneDay(ev.date))}`);
+    }
+
+    lines.push(`SUMMARY:${escapeText(ev.summary)}`);
+    if (ev.location) lines.push(`LOCATION:${escapeText(ev.location)}`);
+    if (ev.description) lines.push(`DESCRIPTION:${escapeText(ev.description)}`);
+    lines.push('END:VEVENT');
+  }
+
+  lines.push('END:VCALENDAR');
+  return lines.map(foldLine).join('\r\n') + '\r\n';
+}
+
+/** 'YYYY-MM-DD' → 'YYYYMMDD'. */
+function dateStamp(date: string): string {
+  return date.replace(/-/g, '');
+}
+
+/** 'YYYY-MM-DD' + 'HH:MM[:SS]' → 'YYYYMMDDTHHMMSS' (floating local, no Z). */
+function dateTimeStamp(date: string, time: string): string {
+  const [hh = '00', mm = '00', ss = '00'] = time.split(':');
+  return `${dateStamp(date)}T${hh.padStart(2, '0')}${mm.padStart(2, '0')}${ss.padStart(2, '0')}`;
+}
+
+/** Add one hour to an 'HH:MM[:SS]' string, clamping at 23:59:59 (no day rollover). */
+function addOneHour(time: string): string {
+  const [hh = '0', mm = '00', ss = '00'] = time.split(':');
+  const nextH = Number(hh) + 1;
+  if (nextH > 23) return '23:59:59';
+  return `${String(nextH).padStart(2, '0')}:${mm}:${ss}`;
+}
+
+/** Add one calendar day to a 'YYYY-MM-DD' string (UTC math, date-only — tz-safe). */
+function addOneDay(date: string): string {
+  const d = new Date(`${date}T00:00:00Z`);
+  d.setUTCDate(d.getUTCDate() + 1);
+  return d.toISOString().slice(0, 10);
+}
+
 // ─── Internals ─────────────────────────────────────────────────────────────
 
 /**

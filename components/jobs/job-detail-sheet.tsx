@@ -2,6 +2,7 @@
 
 import { useState, useRef, useEffect } from 'react';
 import { Job, Entry, Material, Quote, QuoteAttachment, QuoteAttachmentKind, ActivityType, Unit, WorkType } from '@/lib/types';
+import { SELECTABLE_WORK_TYPES, WORK_TYPE_LABELS, jobWorkTypes } from '@/lib/types';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -13,7 +14,9 @@ import {
   Phone, Mail, MapPin, Clock, DollarSign, Receipt, FileText, MessageSquare,
   AlertCircle, StickyNote, TrendingUp, Edit3, Plus, Package, ExternalLink, X,
   Camera, Trash2, Loader2, CalendarDays, CalendarPlus, Sparkles, Send,
+  Download, FileWarning, Archive, RotateCcw,
 } from 'lucide-react';
+import { downloadJobPhotos, isPhotoAttachment } from '@/lib/download-job-photos';
 import { cn } from '@/lib/utils';
 import { formatEntryDate } from '@/lib/format-date';
 import { JOB_STATUSES } from '@/lib/mock-data';
@@ -24,9 +27,13 @@ import { HourlyRateGauge, IncomeVsExpenses, HoursByActivity } from './job-charts
 import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
 import { ShiftPhotosPanel } from './shift-photos-panel';
+import { JobTeamPanel } from './job-team-panel';
+import { ContactTimeline } from './contact-timeline';
+import { JobScopePanel } from './job-scope-panel';
 import { BookedDates } from './booked-dates';
 import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
+import { DeclineJobSheet } from './decline-job-sheet';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
@@ -131,6 +138,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const [prepWithAIOpen, setPrepWithAIOpen] = useState(false);
   // Book-a-site-visit sheet, opened from the lead-stage action strip.
   const [bookVisitOpen, setBookVisitOpen] = useState(false);
+  // "Turn it down" — the reason sheet. Opens either as part of declining
+  // (status flip already applied) or to edit the reason on a job that's
+  // already declined; `declineEditing` tells the sheet which copy to show.
+  const [declineOpen, setDeclineOpen] = useState(false);
+  const [declineEditing, setDeclineEditing] = useState(false);
   // Inline rename of the job title in the header. Self-contained editor;
   // reset whenever the sheet switches to a different job so a half-finished
   // rename on job A doesn't carry over to job B. Done during render (React's
@@ -163,11 +175,104 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const stats = jobStats(liveJob, entries, materials);
   const { totalHours, totalExpenses, totalIncome, expectedIncome, expectedProfit, expectedIsConfident, expectedHourlyRate } = stats;
 
+  // Does this job already have a real record of the quote behind it?
+  // Three places the evidence can live, any one of which counts:
+  //   - job.quoteAmount — the headline number every money calc reads
+  //   - a quote row carrying a sent total
+  //   - an uploaded quote_pdf attachment on one of the job's quotes
+  //
+  // Used to decide whether flipping the status to 'quoted' is a
+  // complete action or an empty label. A job sitting at 'quoted' with
+  // none of the above is invisible to the pipeline value, the quote
+  // follow-up chase-list, and the win-rate maths — it looks handled
+  // while quietly doing nothing.
+  const jobQuoteIds = new Set(quotes.filter((q) => q.jobId === liveJob.id).map((q) => q.id));
+  const hasQuoteOnRecord =
+    (liveJob.quoteAmount != null && liveJob.quoteAmount > 0)
+    || quotes.some((q) => q.jobId === liveJob.id && q.totalAmountInclGst != null)
+    || quoteAttachments.some((a) => jobQuoteIds.has(a.quoteId) && a.kind === 'quote_pdf');
+
+  /**
+   * Turn the job down. One entry point for both the dropdown and the
+   * "Turn this one down" button, so a declined job always ends up with the
+   * full record: the status, when the call was made, and — critically —
+   * where to put it back if Brad changes his mind.
+   *
+   * `declinedFromStatus` is only stamped on the way IN. Re-declining a job
+   * that's already declined (can't happen from the UI, but cheap to guard)
+   * would otherwise overwrite the restore-target with 'declined' itself.
+   *
+   * The reason sheet opens straight after and is skippable — the decline
+   * stands either way. Same "don't block the flip on an answer" rule the
+   * OutcomeSheet follows for 'lost'.
+   */
+  function declineJob() {
+    if (liveJob.status !== 'declined') {
+      updateJob(liveJob.id, {
+        status: 'declined',
+        declinedAt: new Date().toISOString(),
+        declinedFromStatus: liveJob.status,
+      });
+    }
+    setDeclineEditing(false);
+    setDeclineOpen(true);
+  }
+
+  /**
+   * Put a declined job back on the list, at the exact stage it left from.
+   * Falls back to 'lead' for jobs declined before 040 (or migrated from the
+   * old park flow with no recorded stage) — the safest landing spot, since
+   * a lead just needs chasing rather than claiming to be quoted work.
+   */
+  function undeclineJob() {
+    updateJob(liveJob.id, {
+      status: liveJob.declinedFromStatus ?? 'lead',
+      declinedAt: '',
+      declineReason: '',
+      declinedFromStatus: undefined,
+    });
+  }
+
   function handleStatusChange(s: string | null) {
     if (!s) return;
     const newStatus = s as JobStatus;
     const prevStatus = liveJob.status;
-    updateJob(liveJob.id, { status: newStatus });
+
+    // 'declined' carries three fields, not one — the stamp, the reason, and
+    // where to put the job back to. Route it through the same helper the
+    // "Turn this one down" button uses so the dropdown can't produce a
+    // half-declined job with no way home. Returns early: declineJob does
+    // its own updateJob, and the reason sheet opens on top.
+    if (newStatus === 'declined' && prevStatus !== 'declined') {
+      declineJob();
+      return;
+    }
+
+    // Coming OUT of declined via the dropdown (rather than the banner's
+    // "Put it back") must clear the decline fields too, or the job keeps a
+    // stale "turned down on 5 Aug" stamp it no longer deserves.
+    if (prevStatus === 'declined' && newStatus !== 'declined') {
+      updateJob(liveJob.id, {
+        status: newStatus,
+        declinedAt: '',
+        declineReason: '',
+        declinedFromStatus: undefined,
+      });
+    } else {
+      updateJob(liveJob.id, { status: newStatus });
+    }
+
+    // Flipped to 'quoted' with nothing to back it up → open the
+    // mark-as-quoted sheet so the amount, send date, follow-up date and
+    // (optionally) the PDF get captured. Brad hit this on a lead he'd
+    // already quoted outside the app: setting the dropdown to 'quoted'
+    // looked done but left the quote itself nowhere, and the "attach
+    // the PDF" affordance is buried in the Documents panel further down
+    // the sheet. The status flip above still stands if he cancels — the
+    // dropdown shouldn't silently snap back — he just gets asked once.
+    if (newStatus === 'quoted' && prevStatus !== 'quoted' && !hasQuoteOnRecord) {
+      setMarkAsQuotedOpen(true);
+    }
 
     // Once the status flip is in flight, prompt for outcome reason. We don't
     // re-prompt if the user already filled it in for this job — they can
@@ -258,12 +363,14 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
 
   return (
     <Sheet open={open} onOpenChange={onClose}>
-      <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
+      {/* [--desktop-sheet-w:46rem] — desktop drawer width (see ui/sheet.tsx).
+          Sized so the inner max-w-2xl content column fits with its padding. */}
+      <SheetContent side="bottom" className="rounded-t-2xl p-0 [--desktop-sheet-w:46rem]" showCloseButton={false}>
         {/* h-[92dvh] (dynamic viewport height) instead of vh so the sheet
             shrinks/grows with Safari's URL bar on iOS — otherwise the top
             of the sheet (and its sticky header) sits hidden behind the URL
             bar when it's showing. */}
-        <div className="h-[92dvh] flex flex-col overflow-hidden">
+        <div className="h-[92dvh] md:h-full flex flex-col overflow-hidden">
           {/* Fixed header — always visible. Inner wrapper caps width on desktop
               so the title/status row doesn't sprawl across a 27" monitor.
               Top padding uses safe-area-inset-top so the status dropdown
@@ -339,7 +446,9 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               client name. */}
           <WorkTypeRow
             job={liveJob}
-            onChange={(workType) => updateJob(liveJob.id, { workType })}
+            // Only workTypes is written — jobToRow derives work_type from
+            // it, so the summary can never drift out of sync with the set.
+            onChange={(workTypes) => updateJob(liveJob.id, { workTypes })}
           />
 
           {/* Lead-received date — fixes the Leads "per week" trend for
@@ -349,11 +458,59 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             onChange={(leadDate) => updateJob(liveJob.id, { leadDate })}
           />
 
-          {/* Lead-stage action strip — only on leads. The two CTAs are
-              the entire user-facing API for the quote flow today:
-                'Prep with AI' for jobs with wrap-up data; and
-                'Mark as quoted' for jobs you've handled outside the
-                app. Both flip the funnel forward. */}
+          {/* Declined banner. A declined job disappears from the Leads
+              chase-list entirely, so without this the detail sheet would look
+              identical to an active lead and there'd be no way back from here
+              — you'd have to hunt through the Declined drawer. Sits above the
+              action strip so the state reads before the actions do. Quiet
+              muted styling, not red: turning work down is a deliberate
+              decision, not a problem to fix.
+
+              Keyed off `status`, not `declinedAt`, so it's the status that
+              tells the truth — one source, no chance of a job reading
+              "declined" in the dropdown and active in the body. */}
+          {liveJob.status === 'declined' && (() => {
+            // Chips first, then the free-text note — all joined into one
+            // readable line. `filter(Boolean)` covers a job declined with no
+            // reason at all, which is a valid one-tap answer.
+            const why = [...(liveJob.declineReasons ?? []), liveJob.declineReason]
+              .filter(Boolean).join(' · ');
+            return (
+            <div className="rounded-xl border border-border bg-muted/50 px-3 py-3">
+              <div className="flex items-start gap-2.5">
+                <Archive size={16} className="text-muted-foreground shrink-0 mt-0.5" strokeWidth={1.9} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-foreground">You turned this one down</p>
+                  <p className="text-xs text-muted-foreground leading-snug mt-0.5">
+                    {liveJob.declinedAt
+                      ? `Declined ${formatEntryDate(liveJob.declinedAt.slice(0, 10))}`
+                      : 'Declined'}
+                    {why ? ` · ${why}` : ''}
+                    . Off the leads list, and not counted as a lost job.
+                  </p>
+                  <div className="mt-2.5 flex flex-col sm:flex-row gap-2">
+                    <button
+                      type="button"
+                      onClick={undeclineJob}
+                      className="inline-flex items-center justify-center gap-2 min-h-[40px] px-4 rounded-lg bg-foreground text-background text-sm font-semibold hover:bg-foreground/90 transition-colors"
+                    >
+                      <RotateCcw size={14} strokeWidth={2} />
+                      Put back on the list
+                    </button>
+                    <button
+                      type="button"
+                      onClick={() => { setDeclineEditing(true); setDeclineOpen(true); }}
+                      className="inline-flex items-center justify-center gap-2 min-h-[40px] px-4 rounded-lg border border-border bg-background text-foreground text-sm font-medium hover:bg-accent transition-colors"
+                    >
+                      <Edit3 size={14} strokeWidth={2} />
+                      {why ? 'Edit reason' : 'Add a reason'}
+                    </button>
+                  </div>
+                </div>
+              </div>
+            </div>
+            );
+          })()}
 
           {/* Lead-stage action strip — only on leads. The two CTAs are
               the entire user-facing API for the quote flow today:
@@ -401,6 +558,70 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             </div>
           )}
 
+          {/* "Quoted, but no quote" nudge. The status dropdown prompts
+              at the moment of the flip, but that only helps going
+              forward — plenty of jobs are already sitting at 'quoted'
+              with no amount and no PDF, and re-triggering the prompt
+              would mean flipping the status away and back. This banner
+              is the standing version: visible for as long as the gap
+              exists, gone the moment it's filled.
+
+              Scoped to 'quoted' ONLY. Its button opens the mark-as-quoted
+              sheet, which sets status='quoted' on save — firing that on an
+              accepted or booked job would drag it backwards through the
+              funnel. Those stages record their number by tapping the
+              Agreed price tile in Financials instead. */}
+          {liveJob.status === 'quoted' && !hasQuoteOnRecord && (
+            <div className="rounded-xl border border-amber-200 bg-amber-50 px-3 py-3">
+              <div className="flex items-start gap-2.5">
+                <FileWarning size={16} className="text-amber-700 shrink-0 mt-0.5" strokeWidth={1.9} />
+                <div className="min-w-0 flex-1">
+                  <p className="text-sm font-semibold text-amber-900">No quote recorded</p>
+                  <p className="text-xs text-amber-800 leading-snug mt-0.5">
+                    This job is marked quoted, but there&apos;s no amount or
+                    quote PDF saved against it — so it won&apos;t count towards your
+                    pipeline or show up in quote follow-ups.
+                  </p>
+                  <button
+                    type="button"
+                    onClick={() => setMarkAsQuotedOpen(true)}
+                    className="mt-2.5 w-full sm:w-auto inline-flex items-center justify-center gap-2 min-h-[40px] px-4 rounded-lg bg-amber-600 text-white text-sm font-semibold hover:bg-amber-700 transition-colors"
+                  >
+                    <Send size={14} strokeWidth={2} />
+                    Add the quote
+                  </button>
+                </div>
+              </div>
+            </div>
+          )}
+
+          {/* "Turn this one down" — the shortcut into declining, so Brad
+              doesn't have to know the status dropdown has a Declined entry.
+              (It does, and it works — this is the same action with the
+              reason sheet attached.)
+
+              Deliberately understated: a quiet full-width row under the
+              primary actions, not a competing CTA. The point is that it's
+              findable, not that it's tempting — most leads should be chased.
+
+              Offered on lead/quoted/accepted/booked. That's wider than the
+              old park button, which stopped at 'quoted': a builder pulling
+              a job after you'd accepted it isn't a competitive loss either,
+              and Brad had no honest way to record it. It stops at 'booked' —
+              once you're on the tools, walking away is a different
+              conversation than declining the work. */}
+          {(['lead', 'quoted', 'accepted', 'booked'] as JobStatus[]).includes(liveJob.status) && (
+            <button
+              type="button"
+              onClick={declineJob}
+              className="w-full inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl text-sm font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+              title="Take this off the leads list without marking it lost. Recoverable anytime from Declined."
+            >
+              <Archive size={15} strokeWidth={1.9} />
+              Turn this one down
+            </button>
+          )}
+
           {/* Outcome panel — shows the captured win/loss reason and any
               freeform notes once Brad has answered the OutcomeSheet prompt.
               This is where the data we collect when a status flips to
@@ -409,6 +630,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               same OutcomeSheet in edit mode (initial values come from the
               live job). Hidden if no reason has been recorded yet. */}
           {(() => {
+            // Declined jobs have their own banner further up, which already
+            // shows the reason. Bail before the won/lost branching below —
+            // otherwise a declined job carrying old outcomeNotes would fall
+            // through to the isWon:false path and render "Why we won it".
+            if (liveJob.status === 'declined') return null;
             const isLost = liveJob.status === 'lost';
             const isWon = (['accepted','booked','in-progress','completed','invoiced','paid'] as JobStatus[])
               .includes(liveJob.status);
@@ -487,13 +713,19 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               still have plan-level schedule items hanging around. Lets the
               user retroactively clean up "I marked this done but the calendar
               still shows the original plan" cases.
-              For non-lost jobs we open the completion-date prompt first so
-              the user can pick the actual finish day; for lost jobs we just
-              prune future plans (no date needed). */}
+              For jobs that finished we open the completion-date prompt first
+              so the user can pick the actual finish day; for jobs that never
+              happened (lost or declined) we just prune future plans — there's
+              no finish date to ask about. */}
           {(() => {
-            const TERMINAL: JobStatus[] = ['completed', 'invoiced', 'paid', 'lost'];
+            const TERMINAL: JobStatus[] = ['completed', 'invoiced', 'paid', 'lost', 'declined'];
             if (!TERMINAL.includes(liveJob.status)) return null;
-            const isLost = liveJob.status === 'lost';
+            // "Never happened" — lost and declined behave identically here:
+            // prune the future, leave the past alone, don't ask for a date.
+            // (Declining a booked job is exactly the case that leaves stale
+            // work days on the calendar, so this branch earns its keep.)
+            const isDeclined = liveJob.status === 'declined';
+            const isLost = liveJob.status === 'lost' || isDeclined;
             const today = new Date().toISOString().split('T')[0];
             // Resolve the same effective completion date the reconcile would
             // use, so the "X items out of date" count is accurate.
@@ -527,7 +759,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                 </p>
                 <p className="text-xs text-amber-800/80 mb-2">
                   {isLost
-                    ? 'This job was lost — the calendar still has future bookings for it. Tidy them up.'
+                    ? `${isDeclined ? 'You turned this job down' : 'This job was lost'} — the calendar still has future bookings for it. Tidy them up.`
                     : liveJob.endDate
                       ? `Using ${liveJob.endDate} as the finish date. Days after that will be removed; days on or before will be marked done.`
                       : 'Set the actual finish date so the calendar can tidy up days that didn\'t happen.'}
@@ -666,13 +898,32 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
 
                 return (
                   <>
-                    <StatCard label="Quote" value={liveJob.quoteAmount ? `$${liveJob.quoteAmount.toLocaleString('en-NZ')}` : '—'} />
-                    <StatCard
-                      label={incomeLabel}
-                      value={expectedIncome > 0 ? `$${expectedIncome.toLocaleString('en-NZ')}` : '—'}
-                      valueClass="text-green-600"
-                      subvalue={incomeSubvalue}
+                    <AgreedPriceCard
+                      job={liveJob}
+                      onSave={(amount) => updateJob(liveJob.id, { quoteAmount: amount })}
                     />
+                    {/* `expectedIsConfident` is false in exactly the two cases
+                        where the tile is showing a guess: the ladder fell all
+                        the way to `estimatedValue`, or there's no number at
+                        all. Both are the ballpark, and the ballpark had no
+                        editor anywhere in the app — so that's the one case the
+                        tile itself takes the input. Anywhere higher up the
+                        ladder the figure is real and stays read-only. */}
+                    {!expectedIsConfident ? (
+                      <BallparkCard
+                        job={liveJob}
+                        label={incomeLabel}
+                        value={expectedIncome > 0 ? `$${expectedIncome.toLocaleString('en-NZ')}` : '—'}
+                        onSave={(amount) => updateJob(liveJob.id, { estimatedValue: amount })}
+                      />
+                    ) : (
+                      <StatCard
+                        label={incomeLabel}
+                        value={expectedIncome > 0 ? `$${expectedIncome.toLocaleString('en-NZ')}` : '—'}
+                        valueClass="text-green-600"
+                        subvalue={incomeSubvalue}
+                      />
+                    )}
                     <StatCard
                       label="Expenses"
                       value={totalExpenses > 0 ? `$${totalExpenses.toLocaleString('en-NZ')}` : '—'}
@@ -775,6 +1026,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               empty. */}
           <JobAttachmentsList
             jobId={liveJob.id}
+            jobName={liveJob.name}
             quotes={quotes}
             attachments={quoteAttachments}
             onRecordInvoice={(file) => {
@@ -783,6 +1035,16 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               setShowInvoice(true);
             }}
           />
+
+          {/* What the crew on site needs to know the job covers. */}
+          <JobScopePanel
+            jobId={liveJob.id}
+            attachments={quoteAttachments.filter((a) =>
+              quotes.some((q) => q.jobId === liveJob.id && q.id === a.quoteId))}
+          />
+
+          {/* Who's on this job — owner-only, hidden with no employees. */}
+          <JobTeamPanel jobId={liveJob.id} />
 
           {/* Site photos logged by staff on their shifts. */}
           <ShiftPhotosPanel jobId={liveJob.id} />
@@ -797,6 +1059,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             value={liveJob.notes ?? ''}
             onSave={(next) => updateJob(liveJob.id, { notes: next })}
           />
+
+          {/* Contact history — every conversation with this customer, both
+              directions. Self-hiding when the job has no logged contacts,
+              which is why the Separator lives inside it rather than here. */}
+          <ContactTimeline jobId={liveJob.id} />
 
           {/* Entries */}
           {jobEntries.length > 0 && (
@@ -905,14 +1172,14 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               always one tap away no matter how far you've scrolled. The
               tired-painter UX rule: logging today's hours on a known job
               should NEVER require navigation.
-              Hidden for jobs that are done-and-dusted: 'lost' (never
-              happened), 'paid' (closed out), 'invoiced' / 'completed'
+              Hidden for jobs that are done-and-dusted: 'lost' / 'declined'
+              (never happened), 'paid' (closed out), 'invoiced' / 'completed'
               (work is finished — rare touch-ups can still be logged via
               /entry). Also hidden on lead/quoted because you don't log
               hours against a job that hasn't even been accepted yet —
               keeps the lead-stage CTAs (Prep with AI / Mark as quoted)
               as the only action buttons. */}
-          {!(['lost','paid','invoiced','completed','lead','quoted'] as JobStatus[]).includes(liveJob.status) && (
+          {!(['lost','declined','paid','invoiced','completed','lead','quoted'] as JobStatus[]).includes(liveJob.status) && (
             <LogHoursBar
               lastActivity={lastActivityForJob(liveJob.id, entries)}
               onSave={(fields) => {
@@ -986,6 +1253,23 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
           setMarkAsQuotedOpen(false);
           setAiSuggestedTotal(null);
         }}
+      />
+
+      {/* Decline reason. The status flip already happened (declineJob), so
+          this only ever writes the reason — cancelling leaves the job
+          declined with no reason, which is a valid answer. `declinedAt` is
+          never touched here, so editing the reason months later doesn't
+          rewrite the date the call was actually made. */}
+      <DeclineJobSheet
+        open={declineOpen}
+        editing={declineEditing}
+        initialReasons={liveJob.declineReasons}
+        initialNote={liveJob.declineReason}
+        onSave={(reasons, note) => {
+          updateJob(liveJob.id, { declineReasons: reasons, declineReason: note ?? '' });
+          setDeclineOpen(false);
+        }}
+        onCancel={() => setDeclineOpen(false)}
       />
 
       {/* Real AI quote drafter — calls /api/draft-quote with the job
@@ -1126,34 +1410,53 @@ function JobNameEditor({
 // (win-rate / leads-per-week by type) — historically a lot of jobs came in
 // untyped, which made those breakdowns lie. Tapping the already-active chip
 // clears it back to untyped. Sets immediately via updateJob (optimistic).
-const WORK_TYPE_OPTIONS: { value: WorkType; label: string }[] = [
-  { value: 'interior', label: 'Interior' },
-  { value: 'exterior', label: 'Exterior' },
-  { value: 'cedar', label: 'Cedar' },
-  { value: 'wallpaper', label: 'Wallpaper' },
-  { value: 'roof', label: 'Roof' },
-  { value: 'mixed', label: 'Mixed' },
-];
+// No 'mixed' chip — see WORK_TYPE_LABELS / deriveWorkType. Mixed is what
+// picking two or more is CALLED, not something you pick.
+const WORK_TYPE_OPTIONS: { value: WorkType; label: string }[] = SELECTABLE_WORK_TYPES.map(
+  (value) => ({ value, label: WORK_TYPE_LABELS[value] }),
+);
 
 function WorkTypeRow({
   job, onChange,
 }: {
   job: Job;
-  onChange: (workType: WorkType) => void;
+  /** Fires with the full new set — [] when everything's been untoggled. */
+  onChange: (workTypes: WorkType[]) => void;
 }) {
+  const selected = jobWorkTypes(job);
+  // Legacy rows tagged 'mixed' before migration 034 have no breakdown to
+  // show. Rather than render them as "nothing selected" (which invites an
+  // accidental re-tag that silently drops the only signal we have), we
+  // surface the state and let Brad replace it by picking real types.
+  const legacyMixed = selected.length === 1 && selected[0] === 'mixed';
+
+  function toggle(value: WorkType) {
+    // Picking anything at all clears a legacy 'mixed' — it's a
+    // placeholder, and keeping it alongside real types would leave the
+    // derived summary permanently stuck on 'mixed'.
+    const base = legacyMixed ? [] : selected;
+    const next = base.includes(value)
+      ? base.filter((v) => v !== value)
+      : [...base, value];
+    onChange(next);
+  }
+
   return (
     <div>
       <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
         Job type
+        <span className="ml-1.5 normal-case font-normal text-muted-foreground/70">
+          — pick as many as apply
+        </span>
       </p>
       <div className="flex flex-wrap gap-1.5">
         {WORK_TYPE_OPTIONS.map(({ value, label }) => {
-          const active = job.workType === value;
+          const active = !legacyMixed && selected.includes(value);
           return (
             <button
               key={value}
               type="button"
-              onClick={() => onChange(value)}
+              onClick={() => toggle(value)}
               aria-pressed={active}
               className={cn(
                 'px-3 min-h-[36px] rounded-full text-sm font-medium border transition-colors',
@@ -1167,6 +1470,12 @@ function WorkTypeRow({
           );
         })}
       </div>
+      {legacyMixed && (
+        <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
+          Tagged <span className="font-medium text-foreground">Mixed</span> before
+          multi-select existed. Pick the actual types to replace it.
+        </p>
+      )}
     </div>
   );
 }
@@ -1360,6 +1669,284 @@ function ClientInfoBlock({
         </Button>
       </div>
     </div>
+  );
+}
+
+const NZ_GST_RATE = 0.15;
+
+/**
+ * Parse a money figure typed into one of the financial tiles.
+ *
+ * Forgiving by design (golden rule 1): accepts "$10,000", "10 000", "10000.50"
+ * and the shorthand that actually gets typed on a phone — "10k", "2.5K". The
+ * old digits-only strip turned "10k" into 10, which is precisely how a $10,000
+ * job can end up reading as a ten-dollar job on every screen in the app.
+ *
+ * Returns null when the input isn't a usable positive amount.
+ */
+function parseMoneyDraft(raw: string): number | null {
+  // Only a genuine trailing k counts as thousands — a stray letter mid-string
+  // is a typo, not an order of magnitude.
+  const thousands = /k\s*$/i.test(raw.trim());
+  const parsed = parseFloat(raw.replace(/[^\d.]/g, ''));
+  if (!Number.isFinite(parsed) || parsed <= 0) return null;
+  return thousands ? parsed * 1000 : parsed;
+}
+
+/** What we store: always ex-GST, rounded to the cent. */
+function toExGst(amount: number, basis: 'ex' | 'incl'): number {
+  return basis === 'incl'
+    ? Math.round((amount / (1 + NZ_GST_RATE)) * 100) / 100
+    : amount;
+}
+
+/**
+ * Edit mode for the money tiles (Quote / Agreed price, Expected income).
+ *
+ * Shared so the tiles can't drift apart: same keypad, same GST question, same
+ * confirmation line. Enter saves, Escape backs out, clearing the field and
+ * saving stores nothing rather than zero.
+ */
+function MoneyTileEditor({
+  label, initial, onCommit, onCancel,
+}: {
+  label: string;
+  /** Current stored ex-GST amount, or undefined when unset. */
+  initial: number | undefined;
+  /** Fires with the ex-GST amount, or undefined when the field is cleared. */
+  onCommit: (amount: number | undefined) => void;
+  onCancel: () => void;
+}) {
+  const [draft, setDraft] = useState(initial != null ? String(initial) : '');
+  /**
+   * Which way the typed figure is quoted. Amounts are stored EX-GST (every
+   * money calc in the app is ex-GST), but a price arrives either way —
+   * "twenty-five hundred plus GST" from a builder, "$2,875 all up" from a
+   * homeowner. Silently assuming ex-GST is exactly how Aubrey Road, McLeod Ave
+   * and J16 ended up needing hand-written SQL to unpick. So ask, and convert.
+   *
+   * Defaults to ex-GST: it matches the stored convention, the panel header
+   * says "all amounts ex GST", and it's what trade-to-trade prices are.
+   */
+  const [basis, setBasis] = useState<'ex' | 'incl'>('ex');
+
+  const parsed = parseMoneyDraft(draft);
+
+  function commit() {
+    onCommit(parsed != null ? toExGst(parsed, basis) : undefined);
+  }
+
+  return (
+    <div className="bg-muted/50 rounded-xl px-3 py-2.5">
+      <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wide">
+        {label}
+      </p>
+      <div className="relative mt-1">
+        <span className="absolute left-2 top-1/2 -translate-y-1/2 text-sm text-muted-foreground pointer-events-none">
+          $
+        </span>
+        <input
+          autoFocus
+          type="text"
+          inputMode="decimal"
+          value={draft}
+          onChange={(e) => setDraft(e.target.value)}
+          onKeyDown={(e) => {
+            if (e.key === 'Enter') { e.preventDefault(); commit(); }
+            if (e.key === 'Escape') { e.preventDefault(); onCancel(); }
+          }}
+          placeholder="0"
+          className="w-full h-9 pl-5 pr-2 rounded-lg border border-input bg-background text-base font-bold"
+        />
+      </div>
+
+      {/* Is that figure before or after GST? Getting this wrong throws out
+          profit, $/h and the tax estimate, so it's an explicit choice rather
+          than a silent assumption. */}
+      <div className="flex gap-1 mt-1.5">
+        {([
+          { v: 'ex' as const, label: '+ GST' },
+          { v: 'incl' as const, label: 'incl GST' },
+        ]).map((o) => (
+          <button
+            key={o.v}
+            type="button"
+            onClick={() => setBasis(o.v)}
+            aria-pressed={basis === o.v}
+            className={cn(
+              'flex-1 h-8 rounded-lg border text-[11px] font-medium transition-colors',
+              basis === o.v
+                ? 'bg-primary text-primary-foreground border-primary'
+                : 'bg-background border-input text-muted-foreground',
+            )}
+          >
+            {o.label}
+          </button>
+        ))}
+      </div>
+
+      {/* Always echo the figure back, not only on a GST conversion. A mistyped
+          amount is invisible once saved — it just reads as a small number on a
+          tile — so this line is the guard against storing $10 for $10,000. */}
+      {parsed != null && (
+        <p className="mt-1 text-[10px] text-muted-foreground">
+          Saves as ${toExGst(parsed, basis).toLocaleString('en-NZ')} ex GST
+        </p>
+      )}
+
+      <div className="flex gap-1.5 mt-2">
+        <button
+          type="button"
+          onClick={onCancel}
+          className="flex-1 h-9 rounded-lg border border-input text-xs font-medium text-muted-foreground"
+        >
+          Cancel
+        </button>
+        <button
+          type="button"
+          onClick={commit}
+          className="flex-1 h-9 rounded-lg bg-primary text-primary-foreground text-xs font-semibold"
+        >
+          Save
+        </button>
+      </div>
+    </div>
+  );
+}
+
+/**
+ * The Quote tile, made editable in place.
+ *
+ * Not every job gets quoted. Plenty of work — especially for builders and
+ * repeat trade clients — is agreed on a phone call: "here's my budget",
+ * "yep, we'll do it". There was no way to record that number. The job's
+ * `quoteAmount` is the field that feeds expected income, expected profit
+ * and $/h, so with it blank the whole Financials block sits at "—" on a
+ * job that has a perfectly well-known price.
+ *
+ * The only routes to `quoteAmount` were the mark-as-quoted flow (leads
+ * only) and the imports parser — neither reachable on a booked job. So
+ * the tile itself becomes the entry point: tap the value, type the
+ * number, done.
+ *
+ * The label follows the job's stage, because the same field means
+ * different things either side of acceptance: a "Quote" is a number you
+ * sent and are waiting on, an "Agreed price" is one both parties have
+ * settled. Calling it Quote on a booked job invites the reasonable
+ * conclusion that there's nowhere to put a handshake price.
+ */
+function AgreedPriceCard({
+  job, onSave,
+}: {
+  job: Job;
+  /** Fires with the parsed amount, or undefined when the field is cleared. */
+  onSave: (amount: number | undefined) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+
+  // Past acceptance the number is settled, not outstanding — see the
+  // component doc for why the wording matters.
+  const AGREED: JobStatus[] = ['accepted', 'booked', 'in-progress', 'completed', 'invoiced', 'paid'];
+  const label = AGREED.includes(job.status) ? 'Agreed price' : 'Quote';
+
+  if (editing) {
+    return (
+      <MoneyTileEditor
+        label={label}
+        initial={job.quoteAmount ?? undefined}
+        onCommit={(amount) => { onSave(amount); setEditing(false); }}
+        onCancel={() => setEditing(false)}
+      />
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      // Was `onClick={open}` — which resolved to window.open (opened a
+      // junk tab) and failed the production typecheck. Meant: edit mode.
+      onClick={() => setEditing(true)}
+      title={`Set the ${label.toLowerCase()} for this job`}
+      className="bg-muted/50 rounded-xl px-3 py-2.5 text-left hover:bg-muted transition-colors group"
+    >
+      <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wide flex items-center gap-1">
+        {label}
+        <Edit3
+          size={9}
+          strokeWidth={2.4}
+          className="opacity-0 group-hover:opacity-70 transition-opacity"
+        />
+      </p>
+      <p className="text-base font-bold mt-0.5 text-foreground">
+        {job.quoteAmount ? `$${job.quoteAmount.toLocaleString('en-NZ')}` : '—'}
+      </p>
+      {job.quoteAmount == null && (
+        <p className="text-[10px] text-primary mt-0.5 font-medium">Tap to set</p>
+      )}
+    </button>
+  );
+}
+
+/**
+ * The Expected income tile, made editable when — and only when — the number
+ * it's showing is a ballpark.
+ *
+ * Expected income isn't a stored field. `jobStats` derives it down a ladder:
+ * invoice → income received → quote → `estimatedValue`. The bottom rung is the
+ * rough figure typed into the enquiry form, and until now that was effectively
+ * write-once — `JobForm` only ever runs in create mode, so there was no route
+ * back to it from anywhere in the app. A lead logged as "$10" when the job is
+ * $10,000 then reads as a ten-dollar job on every screen that touches it:
+ * expected profit, expected $/h, pipeline value on Leads, the Money forecast.
+ *
+ * So the tile becomes the way back in: tap it, retype the ballpark. On every
+ * other rung it stays a plain read-only StatCard, because those numbers are
+ * real — an invoice you sent, money in the bank, a quote the customer has —
+ * and shouldn't be typed over here. They each have their own editor.
+ */
+function BallparkCard({
+  job, label, value, onSave,
+}: {
+  job: Job;
+  label: string;
+  /** Pre-formatted value from the stats ladder, or '—' when nothing is set. */
+  value: string;
+  /** Fires with the ex-GST amount, or undefined when the field is cleared. */
+  onSave: (amount: number | undefined) => void;
+}) {
+  const [editing, setEditing] = useState(false);
+
+  if (editing) {
+    return (
+      <MoneyTileEditor
+        label={label}
+        initial={job.estimatedValue ?? undefined}
+        onCommit={(amount) => { onSave(amount); setEditing(false); }}
+        onCancel={() => setEditing(false)}
+      />
+    );
+  }
+
+  return (
+    <button
+      type="button"
+      onClick={() => setEditing(true)}
+      title="Set the ballpark value for this job"
+      className="bg-muted/50 rounded-xl px-3 py-2.5 text-left hover:bg-muted transition-colors group"
+    >
+      <p className="text-[10px] text-muted-foreground font-medium uppercase tracking-wide flex items-center gap-1">
+        {label}
+        <Edit3
+          size={9}
+          strokeWidth={2.4}
+          className="opacity-0 group-hover:opacity-70 transition-opacity"
+        />
+      </p>
+      <p className="text-base font-bold mt-0.5 text-green-600">{value}</p>
+      <p className="text-[10px] mt-0.5 font-medium text-primary">
+        {job.estimatedValue ? 'estimated — tap to edit' : 'Tap to set'}
+      </p>
+    </button>
   );
 }
 
@@ -2219,16 +2806,28 @@ function QuoteEditForm({
 // generic scope photos last.
 
 function JobAttachmentsList({
-  jobId, quotes, attachments, onRecordInvoice,
+  jobId, jobName, quotes, attachments, onRecordInvoice,
 }: {
   jobId: string;
+  /** Used to name the downloaded photos zip. */
+  jobName: string;
   quotes: Quote[];
   attachments: QuoteAttachment[];
   /** Hand a dropped/picked invoice PDF to the Issue-invoice flow so it's
    *  recorded (updates the money) rather than just filed as a document. */
   onRecordInvoice?: (file: File) => void;
 }) {
-  const { addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment } = useStore();
+  const {
+    addQuoteAttachments, ensureJobHasQuote, deleteQuoteAttachment,
+    jobs: allJobs, role, setJobCoverPhoto,
+  } = useStore();
+  // Which ORIGINAL image is pinned as the job's main image. Covers pinned
+  // from this (owner-only) bucket are copied into shift-photos, so match
+  // on the remembered source path rather than the cover path itself.
+  const thisJob = allJobs.find((j) => j.id === jobId);
+  const coverSourcePaths = new Set(
+    thisJob?.coverPhotoSource ? [thisJob.coverPhotoSource] : [],
+  );
   const fileInputRef = useRef<HTMLInputElement>(null);
   // Staged files = picked but not yet uploaded. Each has an editable kind.
   const [staged, setStaged] = useState<{ id: string; file: File; kind: QuoteAttachmentKind }[]>([]);
@@ -2247,6 +2846,11 @@ function JobAttachmentsList({
   // Which image the lightbox is showing (index into `imageAttachments`), or
   // null when the lightbox is closed.
   const [lightboxIndex, setLightboxIndex] = useState<number | null>(null);
+  // "Download all photos" state. `downloading` holds a live x-of-y counter so
+  // the button can show progress on a slow connection instead of looking
+  // hung; `downloadError` surfaces failures on screen rather than in console.
+  const [downloading, setDownloading] = useState<{ done: number; total: number; zipping: boolean } | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
 
   // Set of quote ids on this job — used to filter attachments + know
   // whether we already have a quote to attach to.
@@ -2261,6 +2865,36 @@ function JobAttachmentsList({
   const grouped: Record<string, QuoteAttachment[]> = {};
   for (const a of jobAttachments) {
     (grouped[a.kind] ??= []).push(a);
+  }
+
+  // Photos only — plans and quote/invoice PDFs are excluded from the zip.
+  const photoAttachments = jobAttachments.filter(isPhotoAttachment);
+
+  /**
+   * Pull every photo on this job down as one .zip. Photos get uploaded from
+   * Brad's phone on site; this is how they get onto the laptop without
+   * tapping through the thumbnails one at a time.
+   */
+  async function handleDownloadPhotos() {
+    if (downloading) return;
+    setDownloadError(null);
+    setDownloading({ done: 0, total: photoAttachments.length, zipping: false });
+    try {
+      const result = await downloadJobPhotos(photoAttachments, jobName, setDownloading);
+      if (!result.ok) {
+        setDownloadError(result.error ?? "Couldn't download the photos.");
+      } else if (result.failed > 0) {
+        // Partial success — the zip saved, but say what's missing from it.
+        setDownloadError(
+          `${result.downloaded} photo${result.downloaded === 1 ? '' : 's'} downloaded. ${result.failed} couldn't be fetched — try again for those.`,
+        );
+      }
+    } catch (err) {
+      console.error('[job-attachments] Photo download failed:', err);
+      setDownloadError("Something went wrong downloading the photos. Try again.");
+    } finally {
+      setDownloading(null);
+    }
   }
 
   const scopePhotoCount = (grouped.scope_photo?.length ?? 0) + staged.filter((s) => s.kind === 'scope_photo').length;
@@ -2427,18 +3061,64 @@ function JobAttachmentsList({
           <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">
             Documents &amp; photos {jobAttachments.length > 0 ? `(${jobAttachments.length})` : ''}
           </p>
-          <Button
-            type="button"
-            variant="ghost"
-            size="sm"
-            className="h-7 px-2 text-xs gap-1"
-            onClick={() => fileInputRef.current?.click()}
-            disabled={uploading}
-          >
-            <FileText size={13} strokeWidth={2} />
-            Add files
-          </Button>
+          <div className="flex items-center gap-1">
+            {/* Only offer the download once there's actually something to
+                download — an empty job shouldn't show a dead button. */}
+            {photoAttachments.length > 0 && (
+              <Button
+                type="button"
+                variant="ghost"
+                size="sm"
+                className="h-9 px-2.5 text-xs gap-1"
+                onClick={handleDownloadPhotos}
+                disabled={!!downloading}
+                title={`Download all ${photoAttachments.length} photos as a zip`}
+              >
+                {downloading ? (
+                  <>
+                    <Loader2 size={13} strokeWidth={2} className="animate-spin" />
+                    {downloading.zipping
+                      ? 'Zipping…'
+                      : `${downloading.done}/${downloading.total}`}
+                  </>
+                ) : (
+                  <>
+                    <Download size={13} strokeWidth={2} />
+                    Download {photoAttachments.length}
+                  </>
+                )}
+              </Button>
+            )}
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              className="h-9 px-2.5 text-xs gap-1"
+              onClick={() => fileInputRef.current?.click()}
+              disabled={uploading}
+            >
+              <FileText size={13} strokeWidth={2} />
+              Add files
+            </Button>
+          </div>
         </div>
+
+        {/* Loud failure — a silent console error would leave Brad thinking
+            the download worked. */}
+        {downloadError && (
+          <div className="mb-2 flex items-start gap-2 rounded-lg bg-amber-500/10 border border-amber-500/30 px-2.5 py-2">
+            <AlertCircle size={14} strokeWidth={2} className="text-amber-600 shrink-0 mt-0.5" />
+            <p className="text-[11px] text-amber-800 dark:text-amber-300 flex-1">{downloadError}</p>
+            <button
+              type="button"
+              onClick={() => setDownloadError(null)}
+              className="text-amber-700 dark:text-amber-400 shrink-0"
+              aria-label="Dismiss"
+            >
+              <X size={13} strokeWidth={2} />
+            </button>
+          </div>
+        )}
 
         {/* Persistent drag hint. The empty-state message below already
             invites a drop, but it disappears once the section has any
@@ -2499,6 +3179,16 @@ function JobAttachmentsList({
                           fileName={a.fileName ?? a.storagePath.split('/').pop() ?? 'photo'}
                           onOpen={() => setLightboxIndex(indexOfImageId.get(a.id) ?? 0)}
                           onDelete={() => deleteQuoteAttachment(a.id)}
+                          // Owner-only. Pinning copies the image into the
+                          // staff-readable bucket (quote-attachments is
+                          // owner-only — see store.setJobCoverPhoto).
+                          onMakeCover={role === 'owner'
+                            ? (make) => setJobCoverPhoto(
+                                jobId,
+                                make ? { bucket: 'quote-attachments', path: a.storagePath } : null,
+                              )
+                            : undefined}
+                          isCover={coverSourcePaths.has(a.storagePath)}
                         />
                       ))}
                     </div>

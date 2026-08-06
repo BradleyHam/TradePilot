@@ -259,8 +259,10 @@ export function ProjectPreviewSheet({
       <SheetContent
         side="bottom"
         showCloseButton={false}
-        className="p-0 gap-0 overflow-hidden"
-        style={{ height: '94vh' }}
+        // Height via class (not inline style) so the desktop-drawer md:h-full
+        // override in ui/sheet.tsx can win. Wide drawer — it previews a
+        // website project page.
+        className="p-0 gap-0 overflow-hidden h-[94vh] [--desktop-sheet-w:52rem]"
       >
         {/* Header (non-shrinking) */}
         <div className="shrink-0 border-b border-border px-4 py-3">

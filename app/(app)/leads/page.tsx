@@ -11,7 +11,8 @@
 //
 // Scope on purpose:
 //   - Open leads only (status = 'lead' or 'quoted'). Once a lead is
-//     accepted/lost/cancelled it has its own resting place in Jobs.
+//     accepted/lost/declined it has its own resting place in Jobs — with
+//     declined ones also listed in a recoverable drawer at the bottom.
 //   - Sorted by stale-ness, coldest first. The whole point is to act
 //     on the most-at-risk one before anything else.
 //   - One-tap actions inline: call, email, mark contacted, open in
@@ -31,7 +32,8 @@
 import { useMemo, useState } from 'react';
 import Link from 'next/link';
 import { useStore } from '@/lib/store';
-import { Job, LeadSource, ScheduleItem, WorkType } from '@/lib/types';
+import { Job, LeadSource, ScheduleItem, WorkType, ContactChannel } from '@/lib/types';
+import { jobHasWorkType, SNOOZE_INDEFINITE, isWaitingIndefinitely } from '@/lib/types';
 import { LeadInsights } from '@/components/leads/lead-insights';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
@@ -44,7 +46,8 @@ import { Button } from '@/components/ui/button';
 import {
   Phone, Mail, MapPin, MessageCircle, Sparkles, Snowflake, Flame, Clock,
   ChevronRight, Globe, Search, UserPlus, Inbox, CalendarPlus, CalendarDays,
-  CalendarCheck, FileText, Send, X, Plus,
+  CalendarCheck, FileText, Send, X, Plus, Archive, RotateCcw, AlarmClock, Check,
+  CornerDownLeft,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
@@ -94,7 +97,7 @@ const SOURCE_PILL: Record<LeadSource, { label: string; Icon: typeof Globe } | nu
 };
 
 export default function LeadsPage() {
-  const { jobs, updateJob, addJob, businessId, scheduleItems, quotes } = useStore();
+  const { jobs, updateJob, addJob, businessId, scheduleItems, quotes, logContact } = useStore();
   const [openJob, setOpenJob] = useState<Job | null>(null);
   // Manual "Add lead" sheet — for enquiries that didn't come in via the
   // website form or Tapi (phone, walk-in, referral).
@@ -112,6 +115,11 @@ export default function LeadsPage() {
   // the bird's-eye read.
   const [workFilter, setWorkFilter] = useState<WorkType | 'all'>('all');
   const [insightsOpen, setInsightsOpen] = useState(false);
+  // Declined ("turned down") jobs live in a collapsed drawer at the bottom.
+  // Closed by default so the chase view stays clean; opens to restore.
+  const [declinedOpen, setDeclinedOpen] = useState(false);
+  // Snoozed leads get their own collapsed drawer, same pattern.
+  const [snoozedOpen, setSnoozedOpen] = useState(false);
 
   // Three buckets, mutually exclusive. Each answers a different
   // "what do I do next?" question:
@@ -163,6 +171,13 @@ export default function LeadsPage() {
     return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
   }, [today]);
 
+  // A lead is snoozed while its snoozeUntil date is still in the future. On or
+  // after that date it's active again — no code moves it, the filters below
+  // just stop hiding it, so it reappears in its normal bucket on the day.
+  function isSnoozed(j: Job): boolean {
+    return Boolean(j.snoozeUntil && j.snoozeUntil > todayISO);
+  }
+
   // jobId → the soonest upcoming quote_visit (not completed, not skipped,
   // today or later). Drives the "Visit booked" section + card badge so a
   // lead with a scheduled visit no longer looks identical to a fresh one.
@@ -180,7 +195,7 @@ export default function LeadsPage() {
 
   const toQuote = useMemo<RankedLead[]>(() => {
     return jobs
-      .filter((j) => j.status === 'lead' && hasWrapUpData(j))
+      .filter((j) => j.status === 'lead' && hasWrapUpData(j) && !isSnoozed(j))
       .map((j) => rankBy(j, 'lastContactedDate'))
       // Sort by quoteReadyBy ascending — sooner promised = more urgent.
       // Falls back to days-since-contact for jobs with no promised date.
@@ -197,7 +212,7 @@ export default function LeadsPage() {
 
   const awaitingReply = useMemo<RankedLead[]>(() => {
     return jobs
-      .filter((j) => j.status === 'quoted')
+      .filter((j) => j.status === 'quoted' && !isSnoozed(j))
       .map((j) => rankBy(j, 'lastContactedDate'))
       .sort((a, b) => b.daysSinceContact - a.daysSinceContact);
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -220,7 +235,7 @@ export default function LeadsPage() {
   // Sorted soonest-visit-first — the next thing on the calendar is top.
   const visitBooked = useMemo<RankedLead[]>(() => {
     return jobs
-      .filter((j) => j.status === 'lead' && !hasWrapUpData(j) && nextVisitByJob.has(j.id))
+      .filter((j) => j.status === 'lead' && !hasWrapUpData(j) && nextVisitByJob.has(j.id) && !isSnoozed(j))
       .map((j) => rankBy(j, 'lastContactedDate'))
       .sort((a, b) => {
         const av = nextVisitByJob.get(a.job.id)!;
@@ -232,27 +247,53 @@ export default function LeadsPage() {
 
   const newEnquiries = useMemo<RankedLead[]>(() => {
     return jobs
-      .filter((j) => j.status === 'lead' && !hasWrapUpData(j) && !nextVisitByJob.has(j.id))
+      .filter((j) => j.status === 'lead' && !hasWrapUpData(j) && !nextVisitByJob.has(j.id) && !isSnoozed(j))
       .map((j) => rankBy(j, 'lastContactedDate'))
       .sort((a, b) => b.daysSinceContact - a.daysSinceContact);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [jobs, today, nextVisitByJob]);
 
+  // Declined — jobs Brad turned down. They're their own status now, so they
+  // drop out of the buckets above for free (those all filter on 'lead' /
+  // 'quoted'). Kept here so the decision is always reversible — a "don't
+  // delete, just take it off the list" bin — newest-declined first.
+  // Not scoped by the work-type filter: it's a recovery list, always complete.
+  const declined = useMemo<Job[]>(() => {
+    return jobs
+      .filter((j) => j.status === 'declined')
+      .sort((a, b) => (b.declinedAt ?? '').localeCompare(a.declinedAt ?? ''));
+  }, [jobs]);
+
+  // Snoozed leads — open leads deferred to a future date. Hidden from the
+  // buckets while snoozed, listed here soonest-wake first so Brad can see
+  // what's coming back and chase early if he wants. A declined job can't
+  // appear here — declining moves it off 'lead'/'quoted' entirely.
+  const snoozed = useMemo<Job[]>(() => {
+    return jobs
+      .filter((j) => (j.status === 'lead' || j.status === 'quoted') && isSnoozed(j))
+      .sort((a, b) => (a.snoozeUntil ?? '').localeCompare(b.snoozeUntil ?? ''));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [jobs, todayISO]);
+
   // Apply the insights panel's work-type filter to the chase-list too, so
   // picking "Cedar" focuses the whole page on cedar leads. 'all' = no-op.
   // Jobs with no work-type only show under 'all' (we can't honestly file an
   // untyped lead under a specific type).
+  //
+  // Matches on the job's full TYPE SET, not the single-value summary — a
+  // job tagged interior+exterior shows under both filters rather than
+  // vanishing into 'mixed', which nobody thinks to filter for.
   const fToQuote = useMemo(
-    () => toQuote.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    () => toQuote.filter((r) => workFilter === 'all' || jobHasWorkType(r.job, workFilter)),
     [toQuote, workFilter]);
   const fVisitBooked = useMemo(
-    () => visitBooked.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    () => visitBooked.filter((r) => workFilter === 'all' || jobHasWorkType(r.job, workFilter)),
     [visitBooked, workFilter]);
   const fAwaitingReply = useMemo(
-    () => awaitingReply.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    () => awaitingReply.filter((r) => workFilter === 'all' || jobHasWorkType(r.job, workFilter)),
     [awaitingReply, workFilter]);
   const fNewEnquiries = useMemo(
-    () => newEnquiries.filter((r) => workFilter === 'all' || r.job.workType === workFilter),
+    () => newEnquiries.filter((r) => workFilter === 'all' || jobHasWorkType(r.job, workFilter)),
     [newEnquiries, workFilter]);
 
   // Unfiltered open count — lets the empty state tell "no leads at all" apart
@@ -275,10 +316,23 @@ export default function LeadsPage() {
     return { openCount, pipelineValue, coldOrDead };
   }, [fToQuote, fVisitBooked, fAwaitingReply, fNewEnquiries]);
 
-  function markContacted(jobId: string) {
-    // Stamp "now" as the last contact moment. The chase-list re-ranks
-    // immediately because the store update flows through useMemo above.
-    updateJob(jobId, { lastContactedDate: new Date().toISOString() });
+  // Every contact goes through logContact, which appends to the history AND
+  // keeps job.lastContactedDate in step — so the chase-list re-ranks
+  // immediately exactly as it did before, but the touch is no longer erased
+  // by the next one.
+  //
+  // Channel is inferred from WHICH button was tapped rather than asked for.
+  // A prompt would cost a tap on every contact, and a tap Brad has to spend
+  // is a tap he eventually stops spending — at which point there's no data
+  // at all. An inferred channel that's occasionally wrong beats an accurate
+  // one that's usually missing.
+  function markContacted(jobId: string, channel: ContactChannel = 'other') {
+    logContact({ jobId, direction: 'out', channel });
+  }
+
+  /** The customer came back to us. The other half of the response-time clock. */
+  function markReplied(jobId: string) {
+    logContact({ jobId, direction: 'in', channel: 'other' });
   }
 
   function handleAddLead(data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) {
@@ -300,6 +354,59 @@ export default function LeadsPage() {
     // silence after the "either way" message). Recoverable from the
     // job detail sheet if the client resurfaces.
     updateJob(jobId, { status: 'lost', lostReason: 'no-reply' });
+  }
+
+  function declineLead(job: Job) {
+    // "I'm not taking this on" — moves the job to its own terminal status.
+    // Deliberately NOT 'lost': Brad turned it down, nobody outbid him, so
+    // it counts neither way in the win rate. `declinedFromStatus` records
+    // where it came from so Restore below can put it back exactly there.
+    //
+    // No reason captured from this card — declining is one tap here, and
+    // the reason (optional anyway) is added from the job detail sheet.
+    updateJob(job.id, {
+      status: 'declined',
+      declinedAt: new Date().toISOString(),
+      declinedFromStatus: job.status,
+    });
+  }
+
+  function restoreLead(job: Job) {
+    // Put it back at the stage it left from, and clear the whole decline
+    // record — it described a decision that's just been reversed, and
+    // leaving it behind would mislabel the job if it's declined again.
+    // Pre-040 rows (and old parked leads with no recorded stage) land on
+    // 'lead', the safest spot: it just needs chasing.
+    updateJob(job.id, {
+      status: job.declinedFromStatus ?? 'lead',
+      declinedAt: '',
+      declineReason: '',
+      declinedFromStatus: undefined,
+    });
+  }
+
+  function snoozeLead(jobId: string, days: number) {
+    // "Give them more time" — hide the lead from the chase-list until
+    // `days` from today. Stored as a local YYYY-MM-DD so it reappears on
+    // the morning of that date, no timezone drift.
+    const d = new Date(today);
+    d.setDate(d.getDate() + days);
+    const iso = `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+    updateJob(jobId, { snoozeUntil: iso });
+  }
+
+  function waitOnLead(jobId: string) {
+    // "Waiting on them" — snooze with no wake date. Uses the SNOOZE_INDEFINITE
+    // sentinel so every existing snooze filter/sort keeps working unchanged.
+    // Status is untouched: this is still a LIVE quote that can be won, which
+    // is exactly why it must not be 'declined'.
+    updateJob(jobId, { snoozeUntil: SNOOZE_INDEFINITE });
+  }
+
+  function unsnoozeLead(jobId: string) {
+    // Chase now — clear the snooze so the lead returns to its bucket
+    // immediately (empty string maps to null in the mapper).
+    updateJob(jobId, { snoozeUntil: '' });
   }
 
   return (
@@ -325,6 +432,7 @@ export default function LeadsPage() {
             quiet week with no open leads. */}
         <LeadInsights
           jobs={jobs}
+          quotes={quotes}
           filter={workFilter}
           onFilter={setWorkFilter}
           open={insightsOpen}
@@ -401,9 +509,13 @@ export default function LeadsPage() {
               key={r.job.id}
               ranked={r}
               variant="to-quote"
-              onMarkContacted={() => markContacted(r.job.id)}
+              onMarkContacted={(channel) => markContacted(r.job.id, channel)}
+              onReplied={() => markReplied(r.job.id)}
               onBookVisit={() => setVisitForJob(r.job)}
               onMarkQuoted={() => setMarkQuotedForJob(r.job)}
+              onDismiss={() => declineLead(r.job)}
+              onSnooze={(days) => snoozeLead(r.job.id, days)}
+              onWaitIndefinitely={() => waitOnLead(r.job.id)}
               onOpen={() => setOpenJob(r.job)}
             />
           )}
@@ -422,8 +534,12 @@ export default function LeadsPage() {
               ranked={r}
               variant="visit-booked"
               bookedVisit={nextVisitByJob.get(r.job.id)}
-              onMarkContacted={() => markContacted(r.job.id)}
+              onMarkContacted={(channel) => markContacted(r.job.id, channel)}
+              onReplied={() => markReplied(r.job.id)}
               onBookVisit={() => setVisitForJob(r.job)}
+              onDismiss={() => declineLead(r.job)}
+              onSnooze={(days) => snoozeLead(r.job.id, days)}
+              onWaitIndefinitely={() => waitOnLead(r.job.id)}
               onOpen={() => setOpenJob(r.job)}
             />
           )}
@@ -442,9 +558,13 @@ export default function LeadsPage() {
               ranked={r}
               variant="awaiting-reply"
               followUp={followUpByJob.get(r.job.id)}
-              onMarkContacted={() => markContacted(r.job.id)}
+              onMarkContacted={(channel) => markContacted(r.job.id, channel)}
+              onReplied={() => markReplied(r.job.id)}
               onBookVisit={() => setVisitForJob(r.job)}
               onMarkLost={() => markLost(r.job.id)}
+              onDismiss={() => declineLead(r.job)}
+              onSnooze={(days) => snoozeLead(r.job.id, days)}
+              onWaitIndefinitely={() => waitOnLead(r.job.id)}
               onOpen={() => setOpenJob(r.job)}
             />
           )}
@@ -462,12 +582,112 @@ export default function LeadsPage() {
               key={r.job.id}
               ranked={r}
               variant="new-enquiry"
-              onMarkContacted={() => markContacted(r.job.id)}
+              onMarkContacted={(channel) => markContacted(r.job.id, channel)}
+              onReplied={() => markReplied(r.job.id)}
               onBookVisit={() => setVisitForJob(r.job)}
+              onMarkQuoted={() => setMarkQuotedForJob(r.job)}
+              onDismiss={() => declineLead(r.job)}
+              onSnooze={(days) => snoozeLead(r.job.id, days)}
+              onWaitIndefinitely={() => waitOnLead(r.job.id)}
               onOpen={() => setOpenJob(r.job)}
             />
           )}
         />
+
+        {/* Snoozed — leads deferred to a future date. Collapsed drawer; each
+            row shows when it comes back and a one-tap "Chase now". Only shown
+            when something's snoozed. */}
+        {snoozed.length > 0 && (
+          <section className="pt-2">
+            <button
+              type="button"
+              onClick={() => setSnoozedOpen((v) => !v)}
+              className="w-full flex items-center gap-2.5 px-0.5 py-1 text-left"
+            >
+              <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 text-indigo-500 bg-indigo-50">
+                <AlarmClock size={14} strokeWidth={1.8} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">Snoozed</h3>
+                  <span className="text-[11px] font-medium text-muted-foreground bg-muted px-1.5 py-0.5 rounded-md">
+                    {snoozed.length}
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground leading-snug">
+                  {/* `snoozed` is sorted soonest-wake first, so an indefinite
+                      one only leads when it's the ONLY one — never render the
+                      9999 sentinel as a date. */}
+                  {isWaitingIndefinitely(snoozed[0])
+                    ? 'Waiting on them — no date yet'
+                    : `Coming back ${formatDueDate(snoozed[0].snoozeUntil!)}`}
+                  {snoozed.length > 1 ? ' + more' : ''}
+                </p>
+              </div>
+              <ChevronRight
+                size={16}
+                className={cn('text-muted-foreground transition-transform', snoozedOpen && 'rotate-90')}
+              />
+            </button>
+
+            {snoozedOpen && (
+              <div className="space-y-2 mt-2">
+                {snoozed.map((job) => (
+                  <SnoozedCard
+                    key={job.id}
+                    job={job}
+                    onChaseNow={() => unsnoozeLead(job.id)}
+                    onOpen={() => setOpenJob(job)}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
+
+        {/* Declined — jobs Brad turned down. Off the chase-list but kept here
+            so nothing is ever lost and the call is always reversible.
+            Collapsed drawer; only rendered when there's something in it, per
+            the "no empty visualisations" rule. */}
+        {declined.length > 0 && (
+          <section className="pt-2">
+            <button
+              type="button"
+              onClick={() => setDeclinedOpen((v) => !v)}
+              className="w-full flex items-center gap-2.5 px-0.5 py-1 text-left"
+            >
+              <div className="w-7 h-7 rounded-lg flex items-center justify-center shrink-0 text-slate-500 bg-slate-100">
+                <Archive size={14} strokeWidth={1.8} />
+              </div>
+              <div className="flex-1 min-w-0">
+                <div className="flex items-center gap-2">
+                  <h3 className="text-sm font-semibold text-foreground">Declined</h3>
+                  <span className="text-[11px] font-medium text-muted-foreground bg-muted px-1.5 py-0.5 rounded-md">
+                    {declined.length}
+                  </span>
+                </div>
+                <p className="text-xs text-muted-foreground leading-snug">Turned down — put any back anytime</p>
+              </div>
+              <ChevronRight
+                size={16}
+                className={cn('text-muted-foreground transition-transform', declinedOpen && 'rotate-90')}
+              />
+            </button>
+
+            {declinedOpen && (
+              <div className="space-y-2 mt-2">
+                {declined.map((job) => (
+                  <DeclinedCard
+                    key={job.id}
+                    job={job}
+                    onRestore={() => restoreLead(job)}
+                    onOpen={() => setOpenJob(job)}
+                  />
+                ))}
+              </div>
+            )}
+          </section>
+        )}
       </div>
 
       {/* Add a lead by hand — for enquiries that didn't arrive via the
@@ -541,14 +761,38 @@ interface LeadCardProps {
   /** Follow-up ladder stage for awaiting-reply cards (undefined = nothing
    *  due right now). Drives the stage pill + the Mark lost action. */
   followUp?: QuoteFollowUp;
-  onMarkContacted: () => void;
+  /**
+   * Log an outbound contact. The channel says HOW — inferred from which
+   * control was tapped, never asked for. Tapping Call or Email now logs a
+   * contact as a side effect: opening the dialler or a compose window IS
+   * reaching out, and making Brad tap Call and then Mark contacted was
+   * always two taps for one event (which is why the Call button recorded
+   * nothing at all before).
+   */
+  onMarkContacted: (channel?: ContactChannel) => void;
+  /** Log that the customer came back to us — the response-time signal. */
+  onReplied: () => void;
   onBookVisit: () => void;
   /** Mark the job lost (no reply). Only rendered when the follow-up
    *  ladder reaches the 'close' stage. */
   onMarkLost?: () => void;
-  /** Open the inline 'Mark as quoted' sheet. Only meaningful for
-   *  to-quote variant — others ignore it. Optional so existing
-   *  awaiting-reply / new-enquiry callers don't have to pass it. */
+  /** Turn this job down — moves it to the 'declined' status, off the
+   *  chase-list and out of the win/loss stats entirely (Brad said no;
+   *  nobody outbid him). Two-tap confirm inside the card. Reversible from
+   *  the Declined drawer. Available on every variant. */
+  onDismiss?: () => void;
+  /** "Waiting on them" — snooze with no wake date, for quotes that depend
+   *  on someone else's outcome (a builder tendering for the main contract).
+   *  Stays a live quote in the pipeline; only the chasing stops. */
+  onWaitIndefinitely?: () => void;
+  /** Snooze this lead for `days` from today — hide it from the chase-list
+   *  until then, when it returns automatically. Called from the snooze
+   *  tray's preset buttons. Available on every variant. */
+  onSnooze?: (days: number) => void;
+  /** Open the inline 'Mark as quoted' sheet. Meaningful for the
+   *  to-quote variant (secondary primary CTA) and new-enquiry (utility
+   *  row — commercial leads quoted off plans with no site visit).
+   *  Optional so awaiting-reply / visit-booked callers can skip it. */
   onMarkQuoted?: () => void;
   /** The upcoming quote_visit for this lead — only passed for the
    *  'visit-booked' variant. Drives the date badge + 'Reschedule' label. */
@@ -558,12 +802,29 @@ interface LeadCardProps {
 
 function LeadCard({
   ranked, variant = 'awaiting-reply', followUp,
-  onMarkContacted, onBookVisit, onMarkQuoted, onMarkLost, onOpen, bookedVisit,
+  onMarkContacted, onReplied, onBookVisit, onMarkQuoted, onMarkLost, onDismiss, onSnooze,
+  onWaitIndefinitely, onOpen, bookedVisit,
 }: LeadCardProps) {
   const { job, daysSinceContact, temperature } = ranked;
   // Two-tap Mark lost — first tap arms, second confirms. Fat-finger
   // protection without a modal (5:30pm rule).
   const [lostArmed, setLostArmed] = useState(false);
+  // Same two-tap protection for "Turn this one down". Separate flag so
+  // arming one doesn't arm the other.
+  const [dismissArmed, setDismissArmed] = useState(false);
+  // "Snooze" opens an inline tray with preset durations + the decline action.
+  // One tap to open, one tap to choose — keeps the button row uncluttered.
+  const [snoozeOpen, setSnoozeOpen] = useState(false);
+  // Mark contacted writes `lastContactedDate` and nothing else, so on a lead
+  // already touched today it changes NOTHING on screen — same "Today" badge,
+  // same position in the list. It read as a dead button. Even on a stale
+  // lead the only tells are a small badge and a re-sort that can happen
+  // off-screen. So the button confirms itself for a moment. Purely local:
+  // the write is optimistic in the store and rolls back on failure, and if
+  // it does roll back the staleness badge snaps back to tell the real story.
+  const [contactedTick, setContactedTick] = useState(false);
+  // Same reasoning as contactedTick, for the inbound button.
+  const [repliedTick, setRepliedTick] = useState(false);
   const value = job.quoteAmount ?? job.estimatedValue;
   const sourceCfg = job.source ? SOURCE_PILL[job.source] : null;
   // 'To quote' rows: also show the promised delivery date as a
@@ -717,9 +978,9 @@ function LeadCard({
               {job.clientPhone && (
                 <a
                   href={`tel:${job.clientPhone}`}
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); onMarkContacted('phone'); }}
                   className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-medium text-foreground hover:bg-accent transition-colors"
-                  title={`Call ${job.clientName}`}
+                  title={`Call ${job.clientName} — also logs the contact`}
                 >
                   <Phone size={13} strokeWidth={1.8} /> Call
                 </a>
@@ -729,9 +990,9 @@ function LeadCard({
                   href={gmailComposeUrl(job.clientEmail)}
                   target="_blank"
                   rel="noopener noreferrer"
-                  onClick={(e) => e.stopPropagation()}
+                  onClick={(e) => { e.stopPropagation(); onMarkContacted('email'); }}
                   className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-medium text-foreground hover:bg-accent transition-colors"
-                  title={`Email ${job.clientName} in Gmail`}
+                  title={`Email ${job.clientName} in Gmail — also logs the contact`}
                 >
                   <Mail size={13} strokeWidth={1.8} /> Email
                 </a>
@@ -747,9 +1008,9 @@ function LeadCard({
           {variant === 'to-quote' && job.clientPhone && (
             <a
               href={`tel:${job.clientPhone}`}
-              onClick={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); onMarkContacted('phone'); }}
               className="flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-              title={`Call ${job.clientName}`}
+              title={`Call ${job.clientName} — also logs the contact`}
             >
               <Phone size={12} strokeWidth={1.8} /> Call
             </a>
@@ -759,24 +1020,86 @@ function LeadCard({
               href={gmailComposeUrl(job.clientEmail)}
               target="_blank"
               rel="noopener noreferrer"
-              onClick={(e) => e.stopPropagation()}
+              onClick={(e) => { e.stopPropagation(); onMarkContacted('email'); }}
               className="flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
-              title={`Email ${job.clientName} in Gmail`}
+              title={`Email ${job.clientName} in Gmail — also logs the contact`}
             >
               <Mail size={12} strokeWidth={1.8} /> Email
             </a>
+          )}
+          {/* "Sent quote" on a raw enquiry — the no-site-visit path.
+              Commercial leads (builders, PMs) get quoted straight off
+              plans; without this the lead sits in "New enquiries" and
+              Home's to-contact inbox nagging about a job that's already
+              been priced. Opens the same MarkAsQuotedSheet as To-quote. */}
+          {variant === 'new-enquiry' && onMarkQuoted && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                onMarkQuoted();
+              }}
+              className="flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+              title="Quote already sent (no visit needed) — record it and move this lead to 'Quoted, awaiting reply'"
+            >
+              <Send size={12} strokeWidth={1.8} /> Sent quote
+            </button>
           )}
           <button
             type="button"
             onClick={(e) => {
               e.stopPropagation();
-              onMarkContacted();
+              // 'other' — this button is the catch-all for a contact that
+              // didn't happen through Call or Email (in person, a text from
+              // his own phone). Guessing a specific channel here would be
+              // fiction; 'other' is honest and still counts as a touch.
+              onMarkContacted('other');
+              setContactedTick(true);
+              setTimeout(() => setContactedTick(false), 1800);
             }}
-            className="flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+            className={cn(
+              'flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium transition-colors',
+              contactedTick
+                ? 'text-emerald-700 bg-emerald-50'
+                : 'text-muted-foreground hover:text-foreground hover:bg-accent',
+            )}
             title="Mark as contacted now — resets the staleness timer without booking anything"
           >
-            <MessageCircle size={12} strokeWidth={1.8} /> Mark contacted
+            {contactedTick
+              ? <><Check size={12} strokeWidth={2.4} /> Contacted just now</>
+              : <><MessageCircle size={12} strokeWidth={1.8} /> Mark contacted</>}
           </button>
+          {/* They replied — the inbound half of the clock. Without this every
+              contact in the log is Brad talking into the void, and "how long
+              until they come back?" is unanswerable. Same 1-tap + confirm
+              pattern as Mark contacted, since the visible result is the
+              same (the lead goes quiet on the chase-list).
+
+              Only shown once Brad has actually reached out. A reply to
+              nothing is a contradiction, and on a brand-new enquiry the tap
+              would drop it out of Home's "leads to contact" inbox (which
+              filters on `!lastContactedDate`) while Brad still owes them an
+              answer — losing the lead to a button that looked harmless. */}
+          {job.lastContactedDate && <button
+            type="button"
+            onClick={(e) => {
+              e.stopPropagation();
+              onReplied();
+              setRepliedTick(true);
+              setTimeout(() => setRepliedTick(false), 1800);
+            }}
+            className={cn(
+              'flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium transition-colors',
+              repliedTick
+                ? 'text-sky-700 bg-sky-50'
+                : 'text-muted-foreground hover:text-foreground hover:bg-accent',
+            )}
+            title="They got back to me — logs their reply and resets the staleness timer"
+          >
+            {repliedTick
+              ? <><Check size={12} strokeWidth={2.4} /> Reply logged</>
+              : <><CornerDownLeft size={12} strokeWidth={1.8} /> They replied</>}
+          </button>}
           {followUp?.stage === 'close' && onMarkLost && (
             <button
               type="button"
@@ -800,6 +1123,24 @@ function LeadCard({
               <X size={12} strokeWidth={2} /> {lostArmed ? 'Sure?' : 'Mark lost'}
             </button>
           )}
+          {(onSnooze || onDismiss) && (
+            <button
+              type="button"
+              onClick={(e) => {
+                e.stopPropagation();
+                setSnoozeOpen((v) => !v);
+              }}
+              className={cn(
+                'flex-1 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium transition-colors',
+                snoozeOpen
+                  ? 'bg-accent text-foreground'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-accent',
+              )}
+              title="Give this lead more time before chasing — or stop chasing it"
+            >
+              <AlarmClock size={12} strokeWidth={1.8} /> Snooze
+            </button>
+          )}
           <button
             type="button"
             onClick={(e) => {
@@ -812,6 +1153,218 @@ function LeadCard({
             Details <ChevronRight size={11} />
           </button>
         </div>
+
+        {/* Snooze tray — inline, revealed by the Snooze button. Preset
+            durations "give them more time"; declining ("Turn this one down")
+            lives here too since it's the same "not now" family. Keeps the
+            action rows above uncluttered on a 380px phone. */}
+        {snoozeOpen && (
+          <div className="rounded-lg bg-muted/50 p-2 space-y-2">
+            {onSnooze && (
+              <div>
+                <p className="text-[11px] font-medium text-muted-foreground px-0.5 pb-1.5">Give them more time</p>
+                <div className="flex items-center gap-1">
+                  {/* Longer presets than the original 3/7/14. A builder
+                      tendering for a main contract won't know for a month
+                      or three, and re-snoozing a fortnight at a time six
+                      times over is the opposite of the 5:30pm rule. */}
+                  {([[3, '3 days'], [7, '1 week'], [14, '2 weeks'], [30, '1 month'], [90, '3 months']] as const).map(([days, label]) => (
+                    <button
+                      key={days}
+                      type="button"
+                      onClick={(e) => {
+                        e.stopPropagation();
+                        onSnooze(days);
+                        setSnoozeOpen(false);
+                      }}
+                      className="flex-1 min-h-[36px] inline-flex items-center justify-center gap-1 px-1 rounded-lg text-[11px] font-semibold text-primary bg-primary/10 hover:bg-primary/15 transition-colors"
+                      title={`Hide until ${label.toLowerCase()} from now, then bring it back`}
+                    >
+                      {label}
+                    </button>
+                  ))}
+                </div>
+                {/* The tender case: no date to give, because it depends on
+                    someone else's outcome. Keeps the quote LIVE (still
+                    'quoted', still in pipeline, still able to be won) —
+                    it just stops the chase-list and the follow-up ladder
+                    from nagging about something Brad can't hurry. */}
+                {onWaitIndefinitely && (
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onWaitIndefinitely();
+                      setSnoozeOpen(false);
+                    }}
+                    className="w-full mt-1.5 min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+                    title="No known date — e.g. they're tendering for the main contract. Stays a live quote; just stops the chasing."
+                  >
+                    <AlarmClock size={12} strokeWidth={1.8} /> Waiting on them — no date yet
+                  </button>
+                )}
+              </div>
+            )}
+            {onDismiss && (
+              <button
+                type="button"
+                onClick={(e) => {
+                  e.stopPropagation();
+                  if (!dismissArmed) {
+                    setDismissArmed(true);
+                    setTimeout(() => setDismissArmed(false), 4000);
+                  } else {
+                    onDismiss();
+                    setSnoozeOpen(false);
+                  }
+                }}
+                className={cn(
+                  'w-full min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium transition-colors',
+                  dismissArmed
+                    ? 'bg-foreground text-background'
+                    : 'text-muted-foreground hover:text-foreground hover:bg-accent',
+                )}
+                title="Turn it down — off the chase-list, and not counted as a lost job. Recoverable from Declined below."
+              >
+                <Archive size={12} strokeWidth={1.8} /> {dismissArmed ? 'Sure? Turn this one down' : 'Turn this one down'}
+              </button>
+            )}
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+// ─── Declined card ─────────────────────────────────────────────────────────
+// A stripped-back row for a job Brad turned down. Deliberately quieter than a
+// LeadCard — no temperature, no chase actions — since the whole point is that
+// he's decided not to take it. Just enough to recognise it, plus a one-tap
+// Restore that puts it back at the stage it left from.
+
+function DeclinedCard({ job, onRestore, onOpen }: { job: Job; onRestore: () => void; onOpen: () => void }) {
+  const value = job.quoteAmount ?? job.estimatedValue;
+  return (
+    <div className="bg-muted/30 rounded-2xl border border-border">
+      <button type="button" onClick={onOpen} className="w-full text-left p-4 pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="font-semibold text-foreground truncate">{job.name}</h3>
+              {/* Show the stage it was at when declined, not 'Declined' —
+                  the drawer heading already says that, and "Quoted" tells
+                  Brad how much work he'd sunk in before turning it down. */}
+              <StatusChip status={job.declinedFromStatus ?? job.status} />
+            </div>
+            <p className="text-sm text-muted-foreground mt-0.5">{job.clientName}</p>
+            {job.location && (
+              <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1">
+                <MapPin size={11} strokeWidth={1.8} /> {job.location}
+              </p>
+            )}
+            {/* Why it was turned down, when a reason was given. This is the
+                whole point of recording one — a drawer of anonymous declined
+                jobs tells you nothing three months later. Chips first, then
+                the free-text note, joined into one line. */}
+            {(() => {
+              const why = [...(job.declineReasons ?? []), job.declineReason]
+                .filter(Boolean).join(' · ');
+              return why ? (
+                <p className="text-xs text-muted-foreground/90 mt-1 italic">{why}</p>
+              ) : null;
+            })()}
+          </div>
+          {value !== undefined && value > 0 && (
+            <span className="shrink-0 inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-[11px] text-muted-foreground font-medium">
+              {formatNZD(value)}
+            </span>
+          )}
+        </div>
+      </button>
+      <div className="border-t border-border/60 px-2 py-1.5 flex items-center gap-1">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onRestore();
+          }}
+          className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 transition-colors"
+          title="Put this job back where it was before you turned it down"
+        >
+          <RotateCcw size={13} strokeWidth={2} /> Put it back
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen();
+          }}
+          className="min-h-[40px] inline-flex items-center justify-center gap-0.5 px-3 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+          title="Open full job detail"
+        >
+          Details <ChevronRight size={11} />
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ─── Snoozed card ──────────────────────────────────────────────────────────
+// A declined-style row for a snoozed lead, but with the wake date up front and a
+// "Chase now" that un-snoozes immediately (drops it back into its bucket).
+
+function SnoozedCard({ job, onChaseNow, onOpen }: { job: Job; onChaseNow: () => void; onOpen: () => void }) {
+  const value = job.quoteAmount ?? job.estimatedValue;
+  return (
+    <div className="bg-muted/30 rounded-2xl border border-border">
+      <button type="button" onClick={onOpen} className="w-full text-left p-4 pb-3">
+        <div className="flex items-start justify-between gap-3">
+          <div className="flex-1 min-w-0">
+            <div className="flex items-center gap-2 flex-wrap">
+              <h3 className="font-semibold text-foreground truncate">{job.name}</h3>
+              <StatusChip status={job.status} />
+            </div>
+            <p className="text-sm text-muted-foreground mt-0.5">{job.clientName}</p>
+          </div>
+          {job.snoozeUntil && (
+            <span className="shrink-0 inline-flex items-center gap-1 px-2 py-1 rounded-lg border border-indigo-200 bg-indigo-50 text-[11px] font-semibold text-indigo-700 whitespace-nowrap">
+              <AlarmClock size={12} strokeWidth={2} />
+              {/* Never render the sentinel as a date — it'd read "31 Dec 9999". */}
+              {isWaitingIndefinitely(job) ? 'Waiting on them' : formatDueDate(job.snoozeUntil)}
+            </span>
+          )}
+        </div>
+        {value !== undefined && value > 0 && (
+          <div className="mt-2">
+            <span className="inline-flex items-center px-2 py-0.5 rounded-md bg-muted text-[11px] text-muted-foreground font-medium">
+              {formatNZD(value)}
+            </span>
+          </div>
+        )}
+      </button>
+      <div className="border-t border-border/60 px-2 py-1.5 flex items-center gap-1">
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onChaseNow();
+          }}
+          className="flex-1 min-h-[40px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 transition-colors"
+          title="Un-snooze now — put this lead back on the chase-list today"
+        >
+          <RotateCcw size={13} strokeWidth={2} /> Chase now
+        </button>
+        <button
+          type="button"
+          onClick={(e) => {
+            e.stopPropagation();
+            onOpen();
+          }}
+          className="min-h-[40px] inline-flex items-center justify-center gap-0.5 px-3 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+          title="Open full job detail"
+        >
+          Details <ChevronRight size={11} />
+        </button>
       </div>
     </div>
   );

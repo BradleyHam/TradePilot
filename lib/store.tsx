@@ -9,15 +9,20 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
-  rowToBusinessMember, rowToShiftPhoto,
+  rowToBusinessMember, rowToShiftPhoto, rowToJobContact,
+  rowToPayRun, payRunToRow,
+  rowToJobAssignment, rowToScheduleAssignment,
 } from './supabase/mappers';
 import type {
   Job, Entry, EntryType, ActivityType, ScheduleItem, Material, Quote, Setting, Invoice, BankTransaction,
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
-  BusinessMember, MemberRole, ShiftPhoto,
+  BusinessMember, MemberRole, ShiftPhoto, PayRun,
+  JobAssignment, ScheduleAssignment,
+  JobContact, ContactDirection, ContactChannel,
 } from './types';
+import { deriveWorkType } from './types';
 import { compressImage } from './image-compress';
 
 /**
@@ -107,6 +112,20 @@ interface StoreState {
   role: MemberRole;
   /** The signed-in user's membership row for this business, if resolved. */
   membership: BusinessMember | null;
+  /**
+   * ALL membership rows for the business (owner + employees). Populated
+   * for owners only — employee RLS restricts them to their own row, and
+   * the employee UI never needs the list. Drives the payroll flags and
+   * the Settings → Team page.
+   */
+  teamMembers: BusinessMember[];
+  /**
+   * Wage payments to employees (fortnightly pay runs for Suzie). Rows
+   * exist only for PAID periods — pending periods are computed on the
+   * fly by lib/payroll.ts. Owner-only at the database (RLS); employees
+   * always see an empty array.
+   */
+  payRuns: PayRun[];
   loading: boolean;
   error: string | null;
 
@@ -174,12 +193,51 @@ interface StoreState {
    * use it too (defaults workerKind to 'owner').
    */
   logMyHours: (input: {
-    jobId: string;
+    /**
+     * Omit for off-site work (admin / website / marketing / training):
+     * those hours belong to no job, matching the app's overhead
+     * convention. RLS permits a null job_id for hours (migration 038).
+     */
+    jobId?: string;
     hours: number;
     activity?: ActivityType;
     note?: string;
     entryDate?: string;
   }) => void;
+  /**
+   * Job-level assignments (who's on which job). Owner sees all rows;
+   * employee RLS restricts to their own. Empty pre-migration-035.
+   */
+  jobAssignments: JobAssignment[];
+  /**
+   * Per-booking overrides. If a booking has ANY rows here, exactly those
+   * people are on it that day; otherwise the job-level assignees are.
+   */
+  scheduleAssignments: ScheduleAssignment[];
+  /**
+   * Owner-only: replace the full assignee set for a job. Diffs against
+   * current state — inserts the new, deletes the removed. Optimistic
+   * with rollback.
+   */
+  setJobAssignees: (jobId: string, userIds: string[]) => Promise<void>;
+  /**
+   * Owner-only: set a per-booking override. Pass the exact people for
+   * that day; pass [] to clear the override (booking inherits the job
+   * team again).
+   */
+  setBookingAssignees: (scheduleItemId: string, userIds: string[]) => Promise<void>;
+  /**
+   * Owner-only: set a job's main image from an existing photo. `bucket`
+   * is where the source object lives — 'shift-photos' (already readable
+   * by staff, so the path is reused as-is) or 'quote-attachments' (owner-
+   * only and full of priced PDFs, so the image is DOWNLOADED and RE-
+   * UPLOADED into shift-photos; employees never get access to the source
+   * bucket). Pass `null` to clear the cover and fall back to auto-pick.
+   */
+  setJobCoverPhoto: (
+    jobId: string,
+    source: { bucket: 'shift-photos' | 'quote-attachments'; path: string } | null,
+  ) => Promise<void>;
   /** Site photos, filtered by RLS (employees see only their own uploads). */
   shiftPhotos: ShiftPhoto[];
   uploadShiftPhotos: (input: {
@@ -189,6 +247,30 @@ interface StoreState {
     entryId?: string;
   }) => Promise<{ inserted: number; failed: number }>;
   deleteShiftPhoto: (id: string) => void;
+  /**
+   * Every contact with a customer, both directions, newest first
+   * (migration 042). Owner-only, so empty for employees.
+   */
+  jobContacts: JobContact[];
+  /**
+   * Log one contact and keep `job.lastContactedDate` in step with it.
+   *
+   * This is the ONLY way contact should be recorded — writing
+   * `lastContactedDate` directly still works but silently drops the history,
+   * which is the bug this whole table exists to fix.
+   *
+   * Fire-and-forget: the local row appears immediately and the write happens
+   * behind it, because every caller is a one-tap button that must feel
+   * instant. A failed insert rolls the optimistic row back.
+   */
+  logContact: (input: {
+    jobId: string;
+    direction?: ContactDirection;
+    channel?: ContactChannel;
+    note?: string;
+    /** ISO timestamp. Defaults to now; pass a value to backdate. */
+    contactedAt?: string;
+  }) => void;
   addScheduleItem: (item: ScheduleItem) => void;
   updateScheduleItem: (id: string, updates: Partial<ScheduleItem>) => void;
   deleteScheduleItem: (id: string) => void;
@@ -259,6 +341,31 @@ interface StoreState {
    * payment date. Idempotent: if the invoice is already paid, no-op.
    */
   markInvoicePaid: (id: string, paidDate: string, paidVia?: string) => void;
+
+  /**
+   * Record a pay run as PAID and auto-create the linked wages expense
+   * entry (category 'labour', no GST — wages are outside the GST net) so
+   * the gross lands in the books on the pay date. Mirrors the
+   * markInvoicePaid insert-entry-first / rollback-on-failure pattern.
+   */
+  addPayRun: (input: {
+    memberId?: string;
+    employeeName: string;
+    periodStart: string;
+    periodEnd: string;
+    hours?: number;
+    rate?: number;
+    gross: number;
+    paye?: number;
+    net?: number;
+    paidDate: string;
+    notes?: string;
+  }) => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Flip the IRD follow-up flags on a pay run (eiFiled / payePaid) or
+   * patch its recorded figures. Optimistic + rollback.
+   */
+  updatePayRun: (id: string, patch: Partial<Pick<PayRun, 'eiFiled' | 'payePaid' | 'paye' | 'net' | 'notes'>>) => void;
 
   /**
    * Flip a draft bill (isDraft=true) into a real, counted bill. Optional
@@ -552,6 +659,19 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   /* eslint-enable react-hooks/refs */
   const [quoteAttachments, setQuoteAttachments] = useState<QuoteAttachment[]>([]);
   const [shiftPhotos, setShiftPhotos] = useState<ShiftPhoto[]>([]);
+  const [jobContacts, setJobContacts] = useState<JobContact[]>([]);
+  const [teamMembers, setTeamMembers] = useState<BusinessMember[]>([]);
+  const [jobAssignments, setJobAssignments] = useState<JobAssignment[]>([]);
+  const [scheduleAssignments, setScheduleAssignments] = useState<ScheduleAssignment[]>([]);
+  // Refs so the assign mutators can diff against current state without
+  // stale-closure risk (same pattern as jobsRef / jobImportsRef).
+  const jobAssignmentsRef = useRef(jobAssignments);
+  const scheduleAssignmentsRef = useRef(scheduleAssignments);
+  /* eslint-disable react-hooks/refs */
+  jobAssignmentsRef.current = jobAssignments;
+  scheduleAssignmentsRef.current = scheduleAssignments;
+  /* eslint-enable react-hooks/refs */
+  const [payRuns, setPayRuns] = useState<PayRun[]>([]);
   const [businessId, setBusinessId] = useState<string | null>(null);
   const [role, setRole] = useState<MemberRole>('owner');
   const [membership, setMembership] = useState<BusinessMember | null>(null);
@@ -643,7 +763,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // the missing money columns (they map to undefined). Owners read the
       // full base table as before.
       const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
-      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, tm, pr, ja, sa, jc] = await Promise.all([
         supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -669,6 +789,24 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // Degrades to empty if migration 027 hasn't been applied yet.
         supabase.from('shift_photos').select('*').eq('business_id', bizId)
           .order('created_at', { ascending: false }),
+        // Team members — owner reads all rows (RLS); employees only their
+        // own. Drives payroll flags + Settings → Team.
+        supabase.from('business_members').select('*').eq('business_id', bizId)
+          .order('created_at', { ascending: true }),
+        // Pay runs — owner-only (RLS); employees degrade to empty, as does
+        // the whole app if migration 032 hasn't been applied yet.
+        supabase.from('pay_runs').select('*').eq('business_id', bizId)
+          .order('period_start', { ascending: false }),
+        // Assignments — owner sees all (RLS); employees only their own
+        // rows. Both degrade to empty pre-migration-035 (log-only below,
+        // like pay_runs, so a pending migration doesn't banner the app).
+        supabase.from('job_assignments').select('*').eq('business_id', bizId),
+        supabase.from('schedule_assignments').select('*').eq('business_id', bizId),
+        // Contact log — owner-only (RLS), so employees degrade to empty, as
+        // does everyone if migration 042 hasn't been applied yet. Newest first
+        // so the per-job timeline needs no re-sort.
+        supabase.from('job_contacts').select('*').eq('business_id', bizId)
+          .order('contacted_at', { ascending: false }),
       ]);
 
       // Log per-table errors with detail (Supabase errors don't stringify
@@ -682,6 +820,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       collect('invoices', inv); collect('bank_transactions', bnk);
       collect('job_imports', ji); collect('quote_attachments', qa);
       collect('paint_stock', ps); collect('shift_photos', sp);
+      collect('business_members', tm);
+      // pay_runs is deliberately NOT collected into tableErrors — before
+      // migration 032 runs, the table doesn't exist, and that shouldn't
+      // put a permanent warning banner on the app. It logs below instead.
 
       if (tableErrors.length > 0) {
         for (const { table, err: tErr } of tableErrors) {
@@ -715,6 +857,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setQuoteAttachments((qa.data ?? []).map(rowToQuoteAttachment));
       setPaintStock((ps.data ?? []).map(rowToPaintStock));
       setShiftPhotos((sp.data ?? []).map(rowToShiftPhoto));
+      setTeamMembers((tm.data ?? []).map(rowToBusinessMember));
+      if (pr.error) console.warn('[store] pay_runs load failed (migration 032 applied?):', pr.error.message);
+      setPayRuns((pr.data ?? []).map(rowToPayRun));
+      if (ja.error) console.warn('[store] job_assignments load failed (migration 035 applied?):', ja.error.message);
+      setJobAssignments((ja.data ?? []).map(rowToJobAssignment));
+      if (sa.error) console.warn('[store] schedule_assignments load failed (migration 035 applied?):', sa.error.message);
+      setScheduleAssignments((sa.data ?? []).map(rowToScheduleAssignment));
+      if (jc.error) console.warn('[store] job_contacts load failed (migration 042 applied?):', jc.error.message);
+      setJobContacts((jc.data ?? []).map(rowToJobContact));
     } catch (err: unknown) {
       // Top-level catch — only fires for the businesses fetch or completely
       // unexpected throws.
@@ -987,6 +1138,40 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   const updateJob = useCallback((id: string, updates: Partial<Job>) => {
     let prevJob: Job | undefined;
+    // Keep the derived single-value summary in step with the set, in the
+    // LOCAL state too. jobToRow does the same for the DB write, but the
+    // optimistic object here is what every screen renders until the next
+    // refetch — without this, re-tagging a job would leave the leads
+    // filter and the marketing service mapper reading the old bucket
+    // right up until a reload.
+    if (updates.workTypes !== undefined && updates.workType === undefined) {
+      updates = { ...updates, workType: deriveWorkType(updates.workTypes) };
+    }
+    // Stamp the moment a job is accepted (migration 041). Done HERE — the one
+    // choke point every in-app job write passes through — rather than in the
+    // status dropdown handler, so any future "mark accepted" path gets it for
+    // free instead of each caller having to remember. (The finance importer
+    // writes rows directly and bypasses this; migration 041's backfill is what
+    // covers those.)
+    //
+    // Read from jobsRef, not the `prevJob` captured below: that's assigned
+    // inside the setJobs updater, which React may not run until render, so it
+    // can still be undefined at this point in the tick.
+    //
+    // Write-once by design. `!existing.acceptedAt` means a job that goes
+    // accepted → lost → accepted again keeps its ORIGINAL yes-date, which is
+    // the honest answer for "how long did it take them to say yes". An
+    // explicit acceptedAt in the patch always wins, so a correction is still
+    // possible.
+    if (
+      updates.status === 'accepted' &&
+      updates.acceptedAt === undefined
+    ) {
+      const existing = jobsRef.current.find((j) => j.id === id);
+      if (existing && !existing.acceptedAt) {
+        updates = { ...updates, acceptedAt: new Date().toISOString() };
+      }
+    }
     setJobs((prev) => {
       prevJob = prev.find((j) => j.id === id);
       return prev.map((j) =>
@@ -1011,15 +1196,111 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // items with reality so the calendar stops lying. The hours entries are
     // the source of truth for what actually happened; schedule items were
     // just the plan. See `reconcileJobSchedule` above for the rules.
-    const TERMINAL: JobStatus[] = ['completed', 'invoiced', 'paid', 'lost'];
+    const TERMINAL: JobStatus[] = ['completed', 'invoiced', 'paid', 'lost', 'declined'];
     const isNowTerminal = !!(updates.status && TERMINAL.includes(updates.status));
     const wasTerminal = !!(prevJob?.status && TERMINAL.includes(prevJob.status));
     if (isNowTerminal && !wasTerminal) {
-      reconcileJobSchedule(id, updates.status === 'lost').catch((err) => {
+      // `pruneFuture` = "this job never happened, bin the future plans".
+      // True for both ways a job ends without work: lost (we didn't get it)
+      // and declined (we said no). Declining a job that was already booked
+      // is the case that most needs this — otherwise its work days sit on
+      // the calendar blocking availability for work Brad could take.
+      const neverHappened = updates.status === 'lost' || updates.status === 'declined';
+      reconcileJobSchedule(id, neverHappened).catch((err) => {
         console.error('[store] auto-reconcile after status change failed:', describeError(err));
       });
     }
   }, [reconcileJobSchedule]);
+
+  /**
+   * Log one contact with a customer (migration 042) and keep the job's
+   * `lastContactedDate` cache in step.
+   *
+   * ## Why both writes
+   *
+   * `job_contacts` is the history and the truth. `jobs.last_contacted_date`
+   * is a denormalised copy of the newest contact in EITHER direction (see
+   * below), kept because the chase-list sort, the lead temperature badge and
+   * the follow-up ladder all read it directly — and rewriting those to scan
+   * an event log would be a much bigger change than this feature is worth.
+   * Two writes, one source of truth, no behaviour change downstream.
+   *
+   * ## Inbound moves the cache too
+   *
+   * Deliberately. A customer replying absolutely means the lead has
+   * been touched and shouldn't be chased tomorrow — the follow-up ladder's
+   * whole question is "has anything happened since the quote went out?", and
+   * a reply is the strongest possible yes. The direction is preserved in the
+   * log for analysis; the cache just records that contact occurred.
+   *
+   * ## Backdating
+   *
+   * The quote catch-up flow logs contacts that happened days ago. Those must
+   * NOT drag the cache backwards past a more recent contact, so the cache is
+   * only advanced when the new contact is actually the newest one.
+   */
+  const logContact = useCallback((input: {
+    jobId: string;
+    direction?: ContactDirection;
+    channel?: ContactChannel;
+    note?: string;
+    contactedAt?: string;
+  }) => {
+    if (!businessId) return;
+    const contactedAt = input.contactedAt ?? new Date().toISOString();
+    const direction: ContactDirection = input.direction ?? 'out';
+    const channel: ContactChannel = input.channel ?? 'unknown';
+    const uid = membership?.userId ?? null;
+
+    // Optimistic row with a temporary id, swapped for the real one below.
+    // Every caller is a one-tap button, so the UI can't wait on the network.
+    const tempId = `tmp-${crypto.randomUUID()}`;
+    const optimistic: JobContact = {
+      id: tempId,
+      businessId,
+      jobId: input.jobId,
+      contactedAt,
+      direction,
+      channel,
+      note: input.note,
+      createdAt: new Date().toISOString(),
+    };
+    setJobContacts((prev) => [optimistic, ...prev]);
+
+    // Advance the cache only if this really is the newest contact — see the
+    // backdating note above.
+    const existing = jobsRef.current.find((j) => j.id === input.jobId);
+    if (!existing?.lastContactedDate || contactedAt > existing.lastContactedDate) {
+      updateJob(input.jobId, { lastContactedDate: contactedAt });
+    }
+
+    (async () => {
+      const { data, error: insErr } = await supabase
+        .from('job_contacts')
+        .insert({
+          business_id: businessId,
+          job_id: input.jobId,
+          contacted_at: contactedAt,
+          direction,
+          channel,
+          note: input.note ?? null,
+          logged_by: uid,
+        })
+        .select('*')
+        .single();
+      if (insErr || !data) {
+        console.error('[store] logContact failed:', describeError(insErr));
+        // Drop the optimistic row. The lastContactedDate bump is left alone
+        // on purpose: the old single-column behaviour is what the app had
+        // before this table existed, so a failed log degrades to exactly
+        // that rather than losing the chase entirely.
+        setJobContacts((prev) => prev.filter((c) => c.id !== tempId));
+        return;
+      }
+      const saved = rowToJobContact(data);
+      setJobContacts((prev) => prev.map((c) => (c.id === tempId ? saved : c)));
+    })();
+  }, [businessId, membership?.userId, updateJob]);
 
   /**
    * Hard-delete a job. Blocked if anything is attached. The block-rule
@@ -2049,19 +2330,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       return [...siblingLocal, ...updated];
     });
 
-    // Persist. Raw column objects so job_id / bill_group_id can be set to
-    // null directly. Old siblings are deleted by id — NOT via deleteEntry,
+    // Persist via the reallocate_bill() Postgres function (migration 033)
+    // so update-primary / delete-old / insert-new happen in ONE
+    // transaction — a partial failure can no longer eat sibling rows.
+    // Old siblings are deleted by id inside the fn — NOT via deleteEntry,
     // which would also remove the shared bill PDF from Storage.
-    const updatePrimary = supabase.from('entries').update({
-      job_id: first.jobId,
-      amount: first.gross,
-      amount_ex_gst: first.ex,
-      gst_component: first.gst,
-      bill_group_id: groupId,
-    }).eq('id', primary.id);
-    const deleteOld = removedSiblingIds.length > 0
-      ? supabase.from('entries').delete().in('id', removedSiblingIds)
-      : Promise.resolve({ error: null });
     const siblingRows = rest.map((s) => ({
       business_id: businessId,
       job_id: s.jobId,
@@ -2085,24 +2358,31 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       bill_group_id: groupId,
       created_at: nowISO,
     }));
-    const insertNew = siblingRows.length > 0
-      ? supabase.from('entries').insert(siblingRows).select('*')
-      : Promise.resolve({ data: [] as Record<string, unknown>[], error: null });
 
-    const [updRes, delRes, insRes] = await Promise.all([updatePrimary, deleteOld, insertNew]);
+    const { data: insData, error: rpcErr } = await supabase.rpc('reallocate_bill', {
+      p_primary_id: primary.id,
+      p_primary_job: first.jobId,
+      p_primary_gross: first.gross,
+      p_primary_ex: first.ex,
+      p_primary_gst: first.gst,
+      p_group_id: groupId,
+      p_delete_ids: removedSiblingIds,
+      p_new_rows: siblingRows,
+    });
 
-    if (updRes.error || delRes.error || insRes.error) {
-      const msg = describeError(updRes.error || delRes.error || insRes.error)
-        || 'Failed to re-allocate the bill';
+    if (rpcErr) {
+      const msg = describeError(rpcErr) || 'Failed to re-allocate the bill';
       console.error('[store] reallocateBill failed:', msg);
       setError(msg);
+      // The fn is transactional — on error NOTHING persisted, so the
+      // local rollback is now actually truthful.
       setEntries(prevEntries);
       return { ok: false, error: msg };
     }
 
-    // Swap temp sibling ids for persisted rows.
-    if (insRes.data && insRes.data.length > 0) {
-      const persisted = (insRes.data as Record<string, unknown>[]).map(rowToEntry);
+    // Swap temp sibling ids for the persisted rows the fn returned.
+    if (insData && (insData as Record<string, unknown>[]).length > 0) {
+      const persisted = (insData as Record<string, unknown>[]).map(rowToEntry);
       setEntries((list) => {
         const withoutTemps = list.filter((e) => !tempIds.includes(e.id));
         return [...persisted, ...withoutTemps];
@@ -2464,7 +2744,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, []);
 
   const logMyHours = useCallback((input: {
-    jobId: string;
+    jobId?: string;
     hours: number;
     activity?: ActivityType;
     note?: string;
@@ -2559,6 +2839,54 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { inserted, failed };
   }, [businessId, membership]);
 
+  /**
+   * Set (or clear) a job's cover photo. See the interface docs above for
+   * why quote-attachments images get copied rather than referenced: that
+   * bucket is owner-only and holds priced PDFs, so handing employees a
+   * path into it would break money-blindness.
+   *
+   * updateJob handles the optimistic write + rollback; the only extra
+   * work here is materialising a staff-readable copy of the image first.
+   */
+  const setJobCoverPhoto = useCallback(async (
+    jobId: string,
+    source: { bucket: 'shift-photos' | 'quote-attachments'; path: string } | null,
+  ) => {
+    if (!businessId) return;
+    if (!source) {
+      updateJob(jobId, { coverPhotoPath: undefined, coverPhotoSource: undefined });
+      return;
+    }
+    // Already in the readable bucket — just point at it. No copy, so the
+    // cover stays in sync if the photo is later deleted (it 404s and the
+    // fallback kicks in, rather than leaving an orphan duplicate).
+    if (source.bucket === 'shift-photos') {
+      updateJob(jobId, { coverPhotoPath: source.path, coverPhotoSource: source.path });
+      return;
+    }
+    try {
+      const { data: blob, error: dlErr } = await supabase.storage
+        .from('quote-attachments')
+        .download(source.path);
+      if (dlErr || !blob) throw dlErr ?? new Error('Could not read that image.');
+
+      const rawName = source.path.split('/').pop() || 'cover.jpg';
+      const safeName = rawName.replace(/[^a-zA-Z0-9._-]+/g, '_');
+      const destPath = `${businessId}/${jobId}/cover__${crypto.randomUUID()}__${safeName}`;
+      const { error: upErr } = await supabase.storage
+        .from('shift-photos')
+        .upload(destPath, blob, { contentType: blob.type || 'image/jpeg', upsert: false });
+      if (upErr) throw upErr;
+
+      // Remember where it came from so the UI can star the ORIGINAL
+      // thumbnail — the copy's path looks nothing like the source's.
+      updateJob(jobId, { coverPhotoPath: destPath, coverPhotoSource: source.path });
+    } catch (err) {
+      console.error('[store] setJobCoverPhoto failed:', describeError(err));
+      setError('Could not set that as the cover photo.');
+    }
+  }, [businessId, updateJob]);
+
   const deleteShiftPhoto = useCallback((id: string) => {
     let prev: ShiftPhoto | undefined;
     setShiftPhotos((list) => {
@@ -2578,6 +2906,115 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       }
     })();
   }, []);
+
+  /**
+   * Replace the assignee set for a job (owner-only — employee RLS will
+   * reject the writes). Diff-based: deletes the removed, inserts the new.
+   * Optimistic with full rollback on any failure.
+   */
+  const setJobAssignees = useCallback(async (jobId: string, userIds: string[]) => {
+    if (!businessId) return;
+    const prev = jobAssignmentsRef.current;
+    const current = prev.filter((a) => a.jobId === jobId);
+    const currentIds = new Set(current.map((a) => a.userId));
+    const nextIds = new Set(userIds);
+    const toRemove = current.filter((a) => !nextIds.has(a.userId));
+    const toAdd = userIds.filter((uid) => !currentIds.has(uid));
+    if (toRemove.length === 0 && toAdd.length === 0) return;
+
+    const tempRows: JobAssignment[] = toAdd.map((uid) => ({
+      id: `temp-ja-${crypto.randomUUID()}`,
+      businessId, jobId, userId: uid,
+      createdAt: new Date().toISOString(),
+    }));
+    const removeIds = new Set(toRemove.map((a) => a.id));
+    setJobAssignments((p) => [...p.filter((a) => !removeIds.has(a.id)), ...tempRows]);
+
+    try {
+      if (toRemove.length > 0) {
+        const { error: delErr } = await supabase
+          .from('job_assignments').delete()
+          .in('id', toRemove.map((a) => a.id));
+        if (delErr) throw delErr;
+      }
+      if (toAdd.length > 0) {
+        const { data, error: insErr } = await supabase
+          .from('job_assignments')
+          .insert(toAdd.map((uid) => ({ business_id: businessId, job_id: jobId, user_id: uid })))
+          .select('*');
+        if (insErr) throw insErr;
+        const real = (data ?? []).map(rowToJobAssignment);
+        const tempIds = new Set(tempRows.map((t) => t.id));
+        setJobAssignments((p) => [...p.filter((a) => !tempIds.has(a.id)), ...real]);
+      }
+    } catch (err) {
+      console.error('[store] setJobAssignees failed:', describeError(err));
+      setError('Saving the job team failed — change reverted.');
+      setJobAssignments(prev);
+    }
+  }, [businessId]);
+
+  /**
+   * Set a per-booking override (owner-only). Pass the exact people for
+   * that day; [] clears the override so the booking inherits the job
+   * team. Same diff + optimistic + rollback shape as setJobAssignees.
+   */
+  const setBookingAssignees = useCallback(async (scheduleItemId: string, userIds: string[]) => {
+    if (!businessId) return;
+    const prev = scheduleAssignmentsRef.current;
+    const current = prev.filter((a) => a.scheduleItemId === scheduleItemId);
+    const currentIds = new Set(current.map((a) => a.userId));
+    const nextIds = new Set(userIds);
+    const toRemove = current.filter((a) => !nextIds.has(a.userId));
+    const toAdd = userIds.filter((uid) => !currentIds.has(uid));
+    if (toRemove.length === 0 && toAdd.length === 0) return;
+
+    const tempRows: ScheduleAssignment[] = toAdd.map((uid) => ({
+      id: `temp-sa-${crypto.randomUUID()}`,
+      businessId, scheduleItemId, userId: uid,
+      createdAt: new Date().toISOString(),
+    }));
+    const removeIds = new Set(toRemove.map((a) => a.id));
+    setScheduleAssignments((p) => [...p.filter((a) => !removeIds.has(a.id)), ...tempRows]);
+
+    try {
+      if (toRemove.length > 0) {
+        const { error: delErr } = await supabase
+          .from('schedule_assignments').delete()
+          .in('id', toRemove.map((a) => a.id));
+        if (delErr) throw delErr;
+      }
+      if (toAdd.length > 0) {
+        // The booking itself may still be in-flight (addScheduleItem is an
+        // optimistic fire-and-forget insert, and the edit-sheet's range
+        // flow re-creates bookings then immediately re-applies the
+        // override). A 23503 FK violation here just means "booking row
+        // hasn't landed yet" — retry briefly before giving up.
+        const rows = toAdd.map((uid) => ({
+          business_id: businessId, schedule_item_id: scheduleItemId, user_id: uid,
+        }));
+        let data: Record<string, unknown>[] | null = null;
+        let insErr: unknown = null;
+        for (let attempt = 0; attempt < 4; attempt++) {
+          if (attempt > 0) await new Promise((r) => setTimeout(r, 600 * attempt));
+          const res = await supabase.from('schedule_assignments').insert(rows).select('*');
+          data = res.data;
+          insErr = res.error;
+          const code = res.error && typeof res.error === 'object' && 'code' in res.error
+            ? (res.error as { code?: string }).code : undefined;
+          if (!res.error || code !== '23503') break;
+        }
+        if (insErr) throw insErr;
+        const real = (data ?? []).map(rowToScheduleAssignment);
+        const tempIds = new Set(tempRows.map((t) => t.id));
+        setScheduleAssignments((p) => [...p.filter((a) => !tempIds.has(a.id)), ...real]);
+      }
+    } catch (err) {
+      console.error('[store] setBookingAssignees failed:', describeError(err));
+      setError('Saving who’s on the booking failed — change reverted.');
+      setScheduleAssignments(prev);
+    }
+  }, [businessId]);
 
   const addScheduleItem = useCallback((item: ScheduleItem) => {
     if (!businessId) {
@@ -2638,6 +3075,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       prevItem = prev.find((s) => s.id === id);
       return prev.filter((s) => s.id !== id);
     });
+    // Mirror the DB cascade: per-booking assignment overrides die with the
+    // booking. (Best-effort local cleanup only — Postgres does the real
+    // cascade; not restored on rollback since re-editing re-derives it.)
+    setScheduleAssignments((prev) => prev.filter((a) => a.scheduleItemId !== id));
 
     (async () => {
       const { error: delErr } = await supabase.from('schedule_items').delete().eq('id', id);
@@ -2867,6 +3308,144 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
    * upsert with ignoreDuplicates so already-imported rows just no-op rather
    * than erroring.
    */
+  // ── Pay runs (employee payroll) ──────────────────────────────────────────
+
+  /**
+   * Record a pay run as paid. Two linked writes, mirroring markInvoicePaid:
+   *   1. Insert the wages expense entry (the deductible cost, s DA 1).
+   *      Wages carry NO GST — gstApplies false, ex-GST = gross.
+   *   2. Insert the pay_run row linking back to that entry.
+   * If step 2 fails the entry is deleted again (best-effort) so the books
+   * never show a wage cost without its pay-run record.
+   */
+  const addPayRun = useCallback(async (input: {
+    memberId?: string;
+    employeeName: string;
+    periodStart: string;
+    periodEnd: string;
+    hours?: number;
+    rate?: number;
+    gross: number;
+    paye?: number;
+    net?: number;
+    paidDate: string;
+    notes?: string;
+  }): Promise<{ ok: boolean; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business loaded' };
+
+    const periodLabel = `${input.periodStart} → ${input.periodEnd}`;
+    const tempEntryId = `ent_${Date.now()}`;
+    const tempRunId = `pay_${Date.now()}`;
+    const nowISO = new Date().toISOString();
+
+    // Optimistic local rows — cash/profit numbers update immediately.
+    const localEntry: Entry = {
+      id: tempEntryId,
+      businessId,
+      type: 'expense',
+      category: 'labour',
+      amount: input.gross,
+      gstApplies: false,
+      amountExGst: input.gross,
+      gstComponent: 0,
+      description: `Wages — ${input.employeeName} (${periodLabel})`,
+      entryDate: input.paidDate,
+      createdAt: nowISO,
+    };
+    const localRun: PayRun = {
+      id: tempRunId,
+      businessId,
+      memberId: input.memberId,
+      employeeName: input.employeeName,
+      periodStart: input.periodStart,
+      periodEnd: input.periodEnd,
+      hours: input.hours,
+      rate: input.rate,
+      gross: input.gross,
+      paye: input.paye,
+      net: input.net,
+      paid: true,
+      paidDate: input.paidDate,
+      eiFiled: false,
+      payePaid: false,
+      expenseEntryId: tempEntryId,
+      notes: input.notes,
+      createdAt: nowISO,
+    };
+    setEntries((prev) => [localEntry, ...prev]);
+    setPayRuns((prev) => [localRun, ...prev]);
+
+    const rollbackLocal = () => {
+      setEntries((prev) => prev.filter((e) => e.id !== tempEntryId));
+      setPayRuns((prev) => prev.filter((p) => p.id !== tempRunId));
+    };
+
+    // 1. Wages expense entry first — its real id goes on the pay run.
+    const { data: entryData, error: entryErr } = await supabase
+      .from('entries').insert(entryToRow({ ...localEntry, businessId })).select('*').single();
+    if (entryErr || !entryData) {
+      const msg = describeError(entryErr) || 'Failed to log the wages expense';
+      console.error('[store] addPayRun: entry insert failed —', msg, entryErr);
+      setError(msg);
+      rollbackLocal();
+      return { ok: false, error: msg };
+    }
+    const persistedEntry = rowToEntry(entryData);
+    setEntries((prev) => prev.map((e) => (e.id === tempEntryId ? persistedEntry : e)));
+
+    // 2. The pay run itself.
+    const runRow = {
+      ...payRunToRow({ ...localRun, expenseEntryId: persistedEntry.id }),
+      business_id: businessId,
+    };
+    delete (runRow as Record<string, unknown>).id; // let Postgres mint the uuid
+    const { data: runData, error: runErr } = await supabase
+      .from('pay_runs').insert(runRow).select('*').single();
+    if (runErr || !runData) {
+      const msg = describeError(runErr) || 'Failed to save the pay run';
+      console.error('[store] addPayRun: pay_run insert failed —', msg, runErr);
+      setError(msg);
+      // Best-effort: remove the wages entry so the books stay consistent.
+      const { error: rbErr } = await supabase.from('entries').delete().eq('id', persistedEntry.id);
+      if (rbErr) console.warn('[store] addPayRun: entry rollback also failed —', describeError(rbErr));
+      setEntries((prev) => prev.filter((e) => e.id !== persistedEntry.id));
+      setPayRuns((prev) => prev.filter((p) => p.id !== tempRunId));
+      return { ok: false, error: msg };
+    }
+    const persistedRun = rowToPayRun(runData);
+    setPayRuns((prev) => prev.map((p) => (p.id === tempRunId ? persistedRun : p)));
+    return { ok: true };
+  }, [businessId]);
+
+  const updatePayRun = useCallback((
+    id: string,
+    patch: Partial<Pick<PayRun, 'eiFiled' | 'payePaid' | 'paye' | 'net' | 'notes'>>,
+  ) => {
+    let before: PayRun | undefined;
+    setPayRuns((prev) => prev.map((p) => {
+      if (p.id !== id) return p;
+      before = p;
+      return { ...p, ...patch };
+    }));
+    if (!before) return;
+    const snapshot = before;
+
+    (async () => {
+      const { data, error: updErr } = await supabase
+        .from('pay_runs')
+        .update(payRunToRow(patch))
+        .eq('id', id)
+        .select('id');
+      const noRows = !updErr && (!data || data.length === 0);
+      if (updErr || noRows) {
+        const msg = updErr ? describeError(updErr) : `No pay run matched id=${id}`;
+        console.error('[store] updatePayRun failed:', msg, updErr ?? '');
+        setError(msg);
+        setPayRuns((prev) => prev.map((p) => (p.id === id ? snapshot : p)));
+      }
+    })();
+  }, []);
+
   const importBankTransactions = useCallback(async (
     rows: Omit<BankTransaction, 'id' | 'businessId' | 'importedAt'>[],
   ): Promise<{ inserted: number; skipped: number }> => {
@@ -3366,12 +3945,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       value={{
         jobs, entries, scheduleItems, materials, paintStock, quotes, settings, invoices, bankTransactions,
         jobImports, quoteAttachments,
-        businessId, role, membership, loading, error,
+        businessId, role, membership, teamMembers, payRuns, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
         addEntry, updateEntry, deleteEntry, logMyHours,
-        shiftPhotos, uploadShiftPhotos, deleteShiftPhoto,
+        shiftPhotos, uploadShiftPhotos, deleteShiftPhoto, setJobCoverPhoto,
+        jobContacts, logContact,
+        jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid,
+        addPayRun, updatePayRun,
         confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,
         addMaterials, addMaterialFromOverhead,
         addPaintStock, updatePaintStock, deletePaintStock,

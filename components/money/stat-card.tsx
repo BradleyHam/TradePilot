@@ -23,14 +23,14 @@ const ACCENT_STYLES = {
 export function StatCard({ label, value, subvalue, icon: Icon, trend, trendLabel, accent = 'default' }: StatCardProps) {
   const styles = ACCENT_STYLES[accent];
   return (
-    <div className="bg-card border border-border rounded-2xl p-4">
+    <div className="bg-card border border-border/70 rounded-2xl p-4 shadow-card">
       <div className="flex items-start justify-between gap-2 mb-3">
         <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide leading-tight">{label}</p>
-        <div className={cn('w-8 h-8 rounded-xl flex items-center justify-center shrink-0', styles.icon)}>
+        <div className={cn('w-8 h-8 rounded-xl flex items-center justify-center shrink-0 ring-1 ring-inset ring-current/10', styles.icon)}>
           <Icon size={16} strokeWidth={1.8} />
         </div>
       </div>
-      <p className={cn('text-2xl font-bold tracking-tight', styles.value)}>{value}</p>
+      <p className={cn('text-2xl font-bold tracking-tight tabular-nums', styles.value)}>{value}</p>
       {subvalue && <p className="text-xs text-muted-foreground mt-1">{subvalue}</p>}
       {trendLabel && (
         <p className={cn(

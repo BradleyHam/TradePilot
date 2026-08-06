@@ -2,6 +2,7 @@
 
 import { useState } from 'react';
 import { useStore } from '@/lib/store';
+import { jobCoverPath, useSignedCovers } from '@/lib/job-cover';
 import { Job, JobStatus, ScheduleItem, ScheduleItemType } from '@/lib/types';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
@@ -45,8 +46,12 @@ const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
   { label: 'Booked',      value: 'booked' },
   { label: 'Invoiced',    value: 'invoiced' },
   { label: 'Paid',        value: 'paid' },
-  // Sits at the end — only relevant when reviewing what didn't convert.
+  // These two sit at the end — only relevant when reviewing what didn't
+  // convert. Kept as separate chips because they answer different questions:
+  // Lost is "where am I getting beaten?", Declined is "what am I choosing
+  // not to take?". Rolling them together hid both.
   { label: 'Lost',        value: 'lost' },
+  { label: 'Declined',    value: 'declined' },
 ];
 
 /**
@@ -111,6 +116,7 @@ function comingUpQualifies(
     || job.status === 'invoiced'
     || job.status === 'paid'
     || job.status === 'lost'
+    || job.status === 'declined'
   ) {
     return false;
   }
@@ -211,8 +217,8 @@ function jobComparatorForFilter(
     return (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
   }
 
-  // Lost — most recently lost first.
-  if (filter === 'lost') {
+  // Lost / Declined — most recently closed out first.
+  if (filter === 'lost' || filter === 'declined') {
     return (a, b) => new Date(b.updatedAt).getTime() - new Date(a.updatedAt).getTime();
   }
 
@@ -224,7 +230,7 @@ function jobComparatorForFilter(
 }
 
 export default function JobsPage() {
-  const { jobs, entries, materials, scheduleItems, addJob, businessId } = useStore();
+  const { jobs, entries, materials, scheduleItems, addJob, businessId, shiftPhotos } = useStore();
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [showAddJob, setShowAddJob] = useState(false);
   const [search, setSearch] = useState('');
@@ -255,6 +261,14 @@ export default function JobsPage() {
   // Stats are derived from entries via the shared util in lib/job-stats.ts so
   // this list view and the detail sheet always agree.
 
+  // Card thumbnails. Signed for the FILTERED list only (one batched call),
+  // so flipping chips doesn't sign every job in the business.
+  // useSignedCovers already de-dupes + sorts into a stable key internally,
+  // so passing a freshly-built array each render is fine — and it means a
+  // newly-set cover picks up immediately.
+  const coverPaths = filteredJobs.map((j) => jobCoverPath(j, shiftPhotos));
+  const coverUrls = useSignedCovers(coverPaths);
+
   function handleAddJob(data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) {
     addJob({
       // Real UUID — jobs.id is a uuid column, so a "job_123" temp id fails
@@ -268,8 +282,12 @@ export default function JobsPage() {
     setShowAddJob(false);
   }
 
+  // Work that could still turn into money. 'declined' belongs in this
+  // exclusion list for the same reason 'lost' does — it's never happening,
+  // so counting a turned-down $29k tender as pipeline overstates the number.
+  // Must stay in step with the identical filter on the Money tab.
   const pipelineValue = jobs
-    .filter((j) => !['paid', 'lost'].includes(j.status))
+    .filter((j) => !['paid', 'lost', 'declined'].includes(j.status))
     .reduce((s, j) => s + (j.quoteAmount ?? j.estimatedValue ?? 0), 0);
 
   return (
@@ -331,6 +349,7 @@ export default function JobsPage() {
           <div className="space-y-2.5 pb-6">
             {filteredJobs.map((job) => {
               const stats = jobStats(job, entries, materials);
+              const coverPath = jobCoverPath(job, shiftPhotos);
               return (
                 <JobCard
                   key={job.id}
@@ -340,6 +359,7 @@ export default function JobsPage() {
                   totalIncome={stats.totalIncome}
                   expectedProfit={stats.expectedProfit}
                   expectedIsConfident={stats.expectedIsConfident}
+                  coverUrl={coverPath ? coverUrls[coverPath] : undefined}
                   onClick={() => setSelectedJob(job)}
                 />
               );

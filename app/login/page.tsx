@@ -2,6 +2,7 @@
 
 import { useEffect, useState } from 'react';
 import { useRouter } from 'next/navigation';
+import Link from 'next/link';
 import { supabase } from '@/lib/supabase/client';
 import { Button } from '@/components/ui/button';
 import { Hammer } from 'lucide-react';
@@ -77,6 +78,14 @@ export default function LoginPage() {
               onChange={(e) => setPassword(e.target.value)}
               className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
+            <div className="mt-1.5 text-right">
+              <Link
+                href="/forgot-password"
+                className="text-xs text-muted-foreground hover:text-foreground underline underline-offset-2"
+              >
+                Forgot password?
+              </Link>
+            </div>
           </div>
 
           {error && (

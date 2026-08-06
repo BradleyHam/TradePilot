@@ -12,6 +12,9 @@ const STATUS_CONFIG: Record<JobStatus, { label: string; className: string }> = {
   invoiced:     { label: 'Invoiced',    className: 'bg-teal-50 text-teal-700 border-teal-200' },
   paid:         { label: 'Paid',        className: 'bg-emerald-50 text-emerald-700 border-emerald-200' },
   lost:         { label: 'Lost',        className: 'bg-red-50 text-red-500 border-red-200' },
+  // Deliberately NOT red. Losing a job is a bad outcome; turning one down is
+  // a decision Brad made on purpose, and the badge shouldn't nag him for it.
+  declined:     { label: 'Declined',    className: 'bg-slate-100 text-slate-600 border-slate-200' },
 };
 
 export function StatusBadge({ status }: { status: JobStatus }) {

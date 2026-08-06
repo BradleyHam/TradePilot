@@ -21,7 +21,7 @@
  *     amount around $80" → fuel, even with new petrol stations).
  */
 
-import type { Entry, ExpenseCategory, EntryType } from './types';
+import type { Entry, ExpenseCategory, EntryType, TaxPaymentKind } from './types';
 import type { ParsedBankRow } from './bank-csv';
 
 export type Suggestion =
@@ -29,7 +29,26 @@ export type Suggestion =
   | { kind: 'income';  confidence: Confidence }
   | { kind: 'personal'; reason: string; confidence: Confidence }
   | { kind: 'transfer'; reason: string; confidence: Confidence }
+  // Payment TO Inland Revenue (income tax / GST / PAYE / penalty). NOT a
+  // deductible expense — classifying it here means no expense entry is
+  // created, so it stays out of P&L + GST math. `taxKind` is a best guess
+  // from the description; the UI lets Brad confirm/change it.
+  | { kind: 'tax'; taxKind?: TaxPaymentKind; reason: string; confidence: Confidence }
   | { kind: 'unknown'; confidence: 'low' };
+
+/**
+ * Best-guess the IRD payment sub-type from the transaction text. Returns
+ * undefined when nothing in the description pins it down — the UI then asks
+ * Brad to pick. Deliberately conservative: a wrong auto-guess is worse than
+ * no guess because it's one tap to set and easy to leave wrong.
+ */
+function guessTaxKind(haystack: string): TaxPaymentKind | undefined {
+  if (/\bgst\b/.test(haystack)) return 'gst';
+  if (/\b(paye|payroll|emp\d|employer)\b/.test(haystack)) return 'paye';
+  if (/\b(provisional|prov tax|income tax|terminal|ir4|ir3)\b/.test(haystack)) return 'income_tax';
+  if (/\b(penalt|uomi|use of money|interest)\b/.test(haystack)) return 'penalty';
+  return undefined;
+}
 
 export type Confidence = 'high' | 'medium' | 'low';
 
@@ -118,6 +137,23 @@ export function classifyBankRow(
   const haystack = [row.payee, row.particulars, row.reference, row.description]
     .filter(Boolean).join(' ').toLowerCase();
   const payeeOnly = (row.payee ?? '').trim().toLowerCase();
+
+  // ── Payments to Inland Revenue ──────────────────────────────────────────
+  // Checked FIRST — before the internal-transfer rules — because paying IRD
+  // is NOT a business expense (income tax + GST + PAYE + penalties are all
+  // non-deductible) and must never become an expense entry. Matches the
+  // external payee "Inland Revenue" / "IRD" specifically, so it can't be
+  // confused with the BNZ internal "Taxes" tax-savings account (that's a
+  // transfer between Brad's own accounts, handled below). Debits only —
+  // a credit from IRD is a refund and should flow through as income.
+  if (row.amount < 0 && (/\b(inland revenue|ird)\b/.test(haystack) || payeeOnly.includes('inland revenue'))) {
+    return {
+      kind: 'tax',
+      taxKind: guessTaxKind(haystack),
+      reason: 'Payment to Inland Revenue',
+      confidence: 'high',
+    };
+  }
 
   // ── Internal transfers ──────────────────────────────────────────────────
   // BNZ marks money moved between your own accounts as tran_type 'FT' (Funds

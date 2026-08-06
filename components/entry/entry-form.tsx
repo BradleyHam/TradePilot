@@ -5,7 +5,7 @@ import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource, WorkerKind
 import { EXPENSE_CATEGORIES, ACTIVITY_TYPES } from '@/lib/mock-data';
 import { WORKER_KIND_LABELS } from '@/lib/worker-rates';
 import { useStore } from '@/lib/store';
-import { rankJobs } from '@/lib/job-match';
+import { JobPicker } from '@/components/shared/job-picker';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -69,7 +69,7 @@ export function EntryForm({
   onSave,
   onCancel,
 }: EntryFormProps) {
-  const { jobs } = useStore();
+  const { jobs, entries } = useStore();
   const today = new Date().toISOString().split('T')[0];
 
   // When prefilling from an existing entry, strip the `[OH]` prefix so the
@@ -88,11 +88,12 @@ export function EntryForm({
   const [category, setCategory] = useState<ExpenseCategory | ''>(defaultValues?.category ?? '');
   const [activity, setActivity] = useState<ActivityType | ''>(defaultValues?.activity ?? '');
   // Hours-entry worker tier — defaults to 'owner' (Brad solo) for new
-  // entries, preserves whatever was saved when editing. The optional
-  // helperHours field captures "Sophie was there for X of these hours"
-  // without forcing a second entry — most common multi-worker case.
+  // entries, preserves whatever was saved when editing. Helper hours are
+  // no longer captured here — employees log their own time from their
+  // own login (/my/hours), which is what payroll pays from. (The legacy
+  // helperHours field still exists on old entries and job-stats still
+  // honours it — we just stopped creating new ones.)
   const [workerKind, setWorkerKind] = useState<WorkerKind>(defaultValues?.workerKind ?? 'owner');
-  const [helperHours, setHelperHours] = useState(defaultValues?.helperHours?.toString() ?? '');
   const [jobId, setJobId] = useState(defaultValues?.jobId ?? '');
   // Overhead = no job, deliberately. Distinct from "I forgot to pick one".
   // Stored as `[OH]` description prefix; jobId stays null.
@@ -141,11 +142,10 @@ export function EntryForm({
       // Only attach lead source for enquiries — the picker is hidden for
       // other types so the state could be stale from a prior chip flip.
       leadSource: type === 'enquiry' ? (leadSource || undefined) : undefined,
-      // Worker tier + helper hours — only meaningful for hours-type
-      // entries. The picker is hidden for other types so stale state
-      // from a chip flip doesn't leak through.
+      // Worker tier — only meaningful for hours-type entries. The picker
+      // is hidden for other types so stale state from a chip flip
+      // doesn't leak through.
       workerKind: type === 'hours' ? workerKind : undefined,
-      helperHours: type === 'hours' && helperHours ? parseFloat(helperHours) : undefined,
     });
   }
 
@@ -327,9 +327,10 @@ export function EntryForm({
         )}
       </div>
 
-      {/* Who did the work — only for hours entries. Defaults to "Me",
-          plus an optional "+ helper hours" capture so Brad doesn't need
-          to make two entries when he + Sophie did the same shift. */}
+      {/* Who did the work — only for hours entries. Defaults to "Me".
+          Employees (Suzie) log their own hours from /my/hours — that's
+          what payroll pays from, so there's no helper-hours capture
+          here any more. */}
       {type === 'hours' && (
         <div className="grid grid-cols-2 gap-3">
           <div>
@@ -347,22 +348,6 @@ export function EntryForm({
               </SelectContent>
             </Select>
           </div>
-          {workerKind === 'owner' && (
-            <div>
-              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-                + Helper hrs
-              </label>
-              <input
-                type="number"
-                inputMode="decimal"
-                step="0.5"
-                placeholder="0"
-                value={helperHours}
-                onChange={(e) => setHelperHours(e.target.value)}
-                className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-              />
-            </div>
-          )}
         </div>
       )}
 
@@ -375,69 +360,19 @@ export function EntryForm({
           Job (optional)
         </label>
         <div className="flex items-center gap-2">
-          <div className="flex-1">
-            <Select
+          <div className="flex-1 min-w-0">
+            <JobPicker
+              jobs={jobs}
+              entries={entries}
               value={jobId}
-              onValueChange={(v) => {
-                setJobId(v ?? '');
-                if (v) setIsOverhead(false);
+              onChange={(id) => {
+                setJobId(id);
+                if (id) setIsOverhead(false);
               }}
-            >
-              <SelectTrigger className={cn('h-9 text-sm', isOverhead && 'opacity-50')}>
-                {/*
-                  base-ui's SelectValue renders the raw value (a UUID) by
-                  default. Pass a render function so we display the job's
-                  human-readable name instead. Empty/null = "no job".
-                */}
-                <SelectValue placeholder="No job selected">
-                  {(value) => {
-                    if (!value) return 'No job selected';
-                    const match = jobs.find((j) => j.id === value);
-                    return match?.name ?? 'No job selected';
-                  }}
-                </SelectValue>
-              </SelectTrigger>
-              {/* Override the default w-(--anchor-width) so long job names
-                  ("Cedar Restain and gate — Nicoles house") don't get
-                  truncated. Cap at the viewport so we still behave sensibly
-                  on narrow phones. */}
-              <SelectContent className="w-auto min-w-[var(--anchor-width)] max-w-[calc(100vw-2rem)]">
-                <SelectItem value="">No job</SelectItem>
-                {(() => {
-                  // Tier-grouped: active first, then recently completed, then
-                  // older. The "Older" bucket is hidden when there are active
-                  // jobs and the user hasn't already selected one — matches
-                  // the schedule page picker so completed-from-months-ago
-                  // doesn't clutter the list.
-                  const ranked = rankJobs(jobs);
-                  const tiers: Array<['active' | 'recent' | 'older', string]> = [
-                    ['active',  'Active'],
-                    ['recent',  'Recently completed'],
-                    ['older',   'Older'],
-                  ];
-                  const hasActive = ranked.some((r) => r.tier === 'active' || r.tier === 'active-match');
-                  const selectedIsOlder = !!jobId && ranked.find((r) => r.job.id === jobId)?.tier === 'older';
-                  return tiers.flatMap(([tier, label]) => {
-                    const items = ranked.filter((r) => r.tier === tier);
-                    if (items.length === 0) return [];
-                    if (tier === 'older' && hasActive && !selectedIsOlder) return [];
-                    return [
-                      <div
-                        key={`${tier}-label`}
-                        className="px-2 pt-2 pb-1 text-[10px] font-semibold text-muted-foreground uppercase tracking-wide"
-                      >
-                        {label}
-                      </div>,
-                      ...items.map((r) => (
-                        <SelectItem key={r.job.id} value={r.job.id}>
-                          {r.job.name}
-                        </SelectItem>
-                      )),
-                    ];
-                  });
-                })()}
-              </SelectContent>
-            </Select>
+              placeholder="No job selected"
+              disabled={isOverhead}
+              hideOlderWhenActive
+            />
           </div>
           {/* Overhead is a money-side concept (a business cost not tied to a
               specific job), so it only makes sense for Expense and Bill Due.

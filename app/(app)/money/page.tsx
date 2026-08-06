@@ -8,13 +8,15 @@ import { RevenueChart } from '@/components/money/revenue-chart';
 import { ExpenseChart } from '@/components/money/expense-chart';
 import { TransactionList } from '@/components/money/transaction-list';
 import { TaxExposureCard } from '@/components/money/tax-exposure-card';
+import { TaxPaidCard } from '@/components/money/tax-paid-card';
 import {
   TimeframeSelector,
   type Timeframe, type TimeframeKind,
   smartDefault, frameFor,
 } from '@/components/money/timeframe-selector';
 import {
-  earnedIncomeInWindow, cashIncomeInWindow, earnedIncomeByMonth,
+  earnedIncomeInWindow, cashIncomeExGstInWindow, earnedIncomeByMonth,
+  expensesInWindow,
 } from '@/lib/income-allocator';
 import { MonthlyData, CategoryData } from '@/lib/types';
 import { cn } from '@/lib/utils';
@@ -22,7 +24,7 @@ import {
   TrendingUp, TrendingDown, Receipt, Clock, AlertCircle, FileText,
   Briefcase, DollarSign,
 } from 'lucide-react';
-import { format, parseISO, isSameMonth, addMonths, startOfMonth, differenceInCalendarMonths } from 'date-fns';
+import { format, parseISO, addMonths, startOfMonth, endOfMonth, differenceInCalendarMonths } from 'date-fns';
 
 export default function MoneyPage() {
   const { entries, jobs } = useStore();
@@ -54,9 +56,10 @@ export default function MoneyPage() {
   );
 
   // ── KPIs (timeframe-bound) ─────────────────────────────────────────────────
-  // Cash income — money that actually landed in the window.
+  // Cash income — money that actually landed in the window, EX-GST (the
+  // GST slice is the IRD's, not revenue — golden rule: all math ex-GST).
   const cashRevenue = useMemo(
-    () => cashIncomeInWindow(entries, frame.start, frame.end),
+    () => cashIncomeExGstInWindow(entries, frame.start, frame.end),
     [entries, frame.start, frame.end],
   );
   // Earned income — for each completed/invoiced/paid job, allocate its quote
@@ -67,9 +70,13 @@ export default function MoneyPage() {
   );
   const revenue = basis === 'earned' ? earnedRevenue : cashRevenue;
 
+  // Expenses — ex-GST, INCLUDING paid bills (by paidDate, matching the
+  // payments-basis GST registration). This was previously expense-type
+  // entries only, at gross — which omitted every supplier bill (the
+  // biggest cost) and disagreed with Home's numbers.
   const expenses = useMemo(
-    () => windowEntries.filter((e) => e.type === 'expense').reduce((s, e) => s + (e.amount ?? 0), 0),
-    [windowEntries],
+    () => expensesInWindow(entries, frame.start, frame.end),
+    [entries, frame.start, frame.end],
   );
   const profit = revenue - expenses;
   const totalHoursInWindow = useMemo(
@@ -89,7 +96,7 @@ export default function MoneyPage() {
     .filter((e) => e.type === 'bill' && !e.isDraft && e.dueDate && new Date(e.dueDate) >= now)
     .reduce((s, e) => s + (e.amount ?? 0), 0);
   const pipelineValue = jobs
-    .filter((j) => !['paid', 'lost'].includes(j.status))
+    .filter((j) => !['paid', 'lost', 'declined'].includes(j.status))
     .reduce((s, j) => s + (j.quoteAmount ?? j.estimatedValue ?? 0), 0);
 
   // ── Charts ─────────────────────────────────────────────────────────────────
@@ -132,32 +139,47 @@ export default function MoneyPage() {
       : null;
 
     return months.map((m, i) => {
-      const monthEntries = entries.filter((e) => isSameMonth(parseISO(e.entryDate), m));
-      const cashRev = monthEntries
-        .filter((e) => e.type === 'income')
-        .reduce((s, e) => s + (e.amount ?? 0), 0);
+      // Ex-GST + paid bills, same semantics as the KPI cards — the chart
+      // and the cards must never tell two different profit stories.
+      const mStart = format(m, 'yyyy-MM-dd');
+      const mEnd = format(endOfMonth(m), 'yyyy-MM-dd');
+      const cashRev = cashIncomeExGstInWindow(entries, mStart, mEnd);
       const earnedRev = earnedByMonth?.get(monthKeys[i]) ?? 0;
       return {
         month: format(m, 'MMM'),
         revenue: basis === 'earned' ? earnedRev : cashRev,
-        expenses: monthEntries.filter((e) => e.type === 'expense').reduce((s, e) => s + (e.amount ?? 0), 0),
+        expenses: expensesInWindow(entries, mStart, mEnd),
       };
     });
   }, [entries, jobs, chartRange, basis, now]);
 
-  // Expense breakdown for the selected window.
+  // Expense breakdown for the selected window — same population as the
+  // Expenses KPI (ex-GST; expense entries by entryDate + PAID bills by
+  // paidDate) so the bars sum to the card. Uncategorised rows (most
+  // supplier bills) land in 'other' rather than vanishing.
   const expenseByCategory: CategoryData[] = useMemo(() => {
+    const exGst = (e: (typeof entries)[number]) => {
+      if (e.amountExGst != null) return e.amountExGst;
+      if (e.amount == null) return 0;
+      return e.gstApplies ? e.amount / 1.15 : e.amount;
+    };
     const map: Record<string, number> = {};
-    windowEntries
-      .filter((e) => e.type === 'expense' && e.category)
-      .forEach((e) => {
-        const cat = e.category!;
-        map[cat] = (map[cat] ?? 0) + (e.amount ?? 0);
-      });
+    for (const e of entries) {
+      if (e.isDraft) continue;
+      let inWindow = false;
+      if (e.type === 'expense') {
+        inWindow = e.entryDate >= frame.start && e.entryDate <= frame.end;
+      } else if (e.type === 'bill') {
+        inWindow = !!e.paid && !!e.paidDate && e.paidDate >= frame.start && e.paidDate <= frame.end;
+      }
+      if (!inWindow) continue;
+      const cat = e.category ?? 'other';
+      map[cat] = (map[cat] ?? 0) + exGst(e);
+    }
     return Object.entries(map)
       .map(([category, amount]) => ({ category, amount }))
       .sort((a, b) => b.amount - a.amount);
-  }, [windowEntries]);
+  }, [entries, frame.start, frame.end]);
 
   const fmt = (n: number) => `$${n.toLocaleString('en-NZ')}`;
 
@@ -279,12 +301,16 @@ export default function MoneyPage() {
             value={fmt(pipelineValue)}
             icon={Briefcase}
             accent="blue"
-            subvalue={`${jobs.filter((j) => !['paid', 'lost'].includes(j.status)).length} active jobs`}
+            subvalue={`${jobs.filter((j) => !['paid', 'lost', 'declined'].includes(j.status)).length} active jobs`}
           />
         </div>
 
         {/* Tax exposure — independent annual scope */}
         <TaxExposureCard />
+
+        {/* Paid to IRD — tax-year tally of tagged tax payments. Self-hides
+            when nothing's been tagged. Excluded from all profit/GST math. */}
+        <TaxPaidCard />
 
         {/* Reconcile entry point */}
         <ReconcileEntryCard />

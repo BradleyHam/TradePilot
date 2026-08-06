@@ -23,12 +23,17 @@ import { PageHeader } from '@/components/shared/page-header';
 import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
 import { rankJobs } from '@/lib/job-match';
-import type { ScheduleItem, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
+import { JobPicker } from '@/components/shared/job-picker';
+import type { ScheduleItem, ScheduleItemType, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
+import { QuoteCatchUpSheet } from '@/components/jobs/quote-catch-up-sheet';
+import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { BillItemsAttacher } from '@/components/bills/bill-items-attacher';
 import { BillDetailSheet } from '@/components/bills/bill-detail-sheet';
+import { PayrollFlags } from '@/components/payroll/payroll-flags';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { InvoiceAction } from '@/components/jobs/invoice-action';
+import { EditScheduleItemSheet, type ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 
@@ -53,7 +58,7 @@ import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
   Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split, Send,
-  Paintbrush,
+  Paintbrush, History,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
@@ -80,6 +85,45 @@ function startOfWeekMonISO(d: Date): string {
   const day = d.getDay(); // 0=Sun, 1=Mon, ... 6=Sat
   const offsetToMon = day === 0 ? -6 : 1 - day;
   return formatISODate(addDays(d, offsetToMon));
+}
+
+// ── Reschedule: find the run a tapped Today row belongs to ─────────────────
+// Mirrors the grouping rule in app/(app)/schedule/page.tsx's groupRuns() —
+// same-type, same-jobId, same base title, consecutive calendar days — but
+// scoped to just the tapped item's bucket instead of grouping the whole
+// list. This is what lets tapping ANY day of a multi-day run (e.g. "Clear
+// coat two ceilings (Day 2/3)") open the reschedule sheet pre-loaded with
+// all three days, matching the Schedule tab's behaviour.
+const RESCHEDULE_RUN_TYPES: ScheduleItemType[] = ['job_booking', 'quote_visit', 'reminder'];
+
+function stripDayLabel(title: string): string {
+  return title.replace(/\s*\(Day\s+\d+\s*\/\s*\d+\s*\)\s*$/i, '').trim();
+}
+
+function isNextCalendarDay(prevISO: string, nextISO: string): boolean {
+  const d = parseISODate(prevISO);
+  d.setDate(d.getDate() + 1);
+  return formatISODate(d) === nextISO;
+}
+
+function findScheduleRun(item: ScheduleItem, all: ScheduleItem[]): ScheduleItem[] {
+  if (!RESCHEDULE_RUN_TYPES.includes(item.type)) return [item];
+
+  const runKey = (s: ScheduleItem) => `${s.type}::${s.jobId ?? '_'}::${stripDayLabel(s.title)}`;
+  const key = runKey(item);
+  const bucket = all
+    .filter((s) => runKey(s) === key)
+    .sort((a, b) => a.date.localeCompare(b.date));
+
+  const idx = bucket.findIndex((s) => s.id === item.id);
+  if (idx === -1) return [item];
+
+  let start = idx;
+  let end = idx;
+  while (start > 0 && isNextCalendarDay(bucket[start - 1].date, bucket[start].date)) start--;
+  while (end < bucket.length - 1 && isNextCalendarDay(bucket[end].date, bucket[end + 1].date)) end++;
+
+  return bucket.slice(start, end + 1);
 }
 
 // ── Money formatting ────────────────────────────────────────────────────────
@@ -130,7 +174,8 @@ const LEADS_TO_CONTACT_MAX_ROWS = 6;
 export default function HomePage() {
   const {
     entries, scheduleItems, invoices, jobs, jobImports, quotes, businessId,
-    updateScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry, updateJob,
+    updateScheduleItem, addScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry, updateJob,
+    logContact,
     confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
     commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
   } = useStore();
@@ -148,11 +193,47 @@ export default function HomePage() {
   // lastContactedDate and clears the row (the old behaviour).
   //   visitPromptJob — lead awaiting the Yes/No answer.
   //   bookVisitJob   — lead whose booking form is open (after "Yes").
+  //
+  // Third branch — "Already visited". Brad does the visit, gets busy, and
+  // only opens the app days later; the lead is still sitting in the
+  // to-contact list with no visit ever booked. Rather than making him
+  // fake a future booking or hand-build a schedule item, this branch
+  // catches the app up on what already happened:
+  //   catchUpJob    — lead whose backdated wrap-up is open. On save we
+  //                   write a COMPLETED quote_visit on the date he gives
+  //                   us, so the schedule history reads correctly.
+  //   quoteCatchUpJob — same lead, now being asked whether the quote has
+  //                   already gone out too. Slack begets slack: if the
+  //                   visit never got logged, odds are the quote didn't
+  //                   either.
   const [visitPromptJob, setVisitPromptJob] = useState<Job | null>(null);
   const [bookVisitJob, setBookVisitJob] = useState<Job | null>(null);
+  const [catchUpJobId, setCatchUpJobId] = useState<string | null>(null);
+  const [quoteCatchUpJobId, setQuoteCatchUpJobId] = useState<string | null>(null);
+  // "Sent the quote" quick action on a leads-to-contact row. Commercial
+  // leads (builders, PMs) often get quoted straight off plans with no
+  // site visit — the app previously had no way to say so from Home, so
+  // an already-quoted lead kept nagging as "to contact" (the Switchroom
+  // pair). Opens the same MarkAsQuotedSheet the Leads page uses. Held
+  // as an id so the sheet reads the live job (stale-prop rule).
+  const [markQuotedJobId, setMarkQuotedJobId] = useState<string | null>(null);
   // When set, the InvoiceAction sheet opens in create mode for this job —
   // pre-filled as a deposit. Driven by the "Deposits to send" Home flag.
   const [depositForJob, setDepositForJob] = useState<Job | null>(null);
+
+  // Reschedule sheet — opened by tapping any Today row. Stores item ids
+  // (not the items themselves) so we re-resolve from the live store on
+  // every render, same pattern as the Schedule tab's editingItemIds
+  // (dodges the stale-prop trap in AGENTS.md). Holds every id in the
+  // tapped item's run so multi-day job bookings reschedule as one block.
+  const [reschedulingItemIds, setReschedulingItemIds] = useState<string[] | null>(null);
+  const reschedulingTarget: ScheduleEditTarget | null = useMemo(() => {
+    if (!reschedulingItemIds || reschedulingItemIds.length === 0) return null;
+    const items = reschedulingItemIds
+      .map((id) => scheduleItems.find((s) => s.id === id))
+      .filter((s): s is ScheduleItem => !!s);
+    return items.length > 0 ? { items } : null;
+  }, [reschedulingItemIds, scheduleItems]);
   const wrapUpItem = wrapUpScheduleItemId
     ? scheduleItems.find((s) => s.id === wrapUpScheduleItemId) ?? null
     : null;
@@ -175,6 +256,23 @@ export default function HomePage() {
       visitNotes: wrapUpItem.notes,
     };
   }, [wrapUpItem, jobs]);
+
+  // Catch-up flow targets. Held as ids, not Job objects, so they
+  // re-resolve from the live store every render — the same stale-prop
+  // rule the reschedule sheet follows. Memoised for the wrap-up sheet's
+  // sake: it resets staged photos whenever its target's identity
+  // changes, and this page re-renders on every store tick.
+  const catchUpJob = catchUpJobId ? jobs.find((j) => j.id === catchUpJobId) ?? null : null;
+  const catchUpTarget = useMemo<WrapUpTarget | null>(
+    () => (catchUpJob ? { mode: 'existing-job', job: catchUpJob } : null),
+    [catchUpJob],
+  );
+  const quoteCatchUpJob = quoteCatchUpJobId
+    ? jobs.find((j) => j.id === quoteCatchUpJobId) ?? null
+    : null;
+  const markQuotedJob = markQuotedJobId
+    ? jobs.find((j) => j.id === markQuotedJobId) ?? null
+    : null;
 
   // Compute "today" once per render and pin the ISO strings in stable values
   // so the memo dependency arrays compare by value, not by Date identity.
@@ -342,12 +440,32 @@ export default function HomePage() {
       });
   }, [jobs]);
 
+  // Job ids with an upcoming quote_visit on the calendar (not completed,
+  // not skipped, today or later). A lead with a visit booked has plainly
+  // been contacted already — the next action is turning up on the day,
+  // not another reply — so these are excluded from "Leads to contact".
+  // Mirrors the Leads page's nextVisitByJob carve-out ("Visit booked"
+  // section) so Home and Leads never disagree about who still needs a
+  // reply. This was the 20 Waimana bug: visit booked for Monday, Home
+  // still nagging "Mark contacted".
+  const visitBookedJobIds = useMemo(() => {
+    const set = new Set<string>();
+    for (const s of scheduleItems) {
+      if (s.type !== 'quote_visit' || !s.jobId) continue;
+      if (s.completed || s.skipReasonKind) continue;
+      if (s.date < todayISO) continue;
+      set.add(s.jobId);
+    }
+    return set;
+  }, [scheduleItems, todayISO]);
+
   // Raw enquiries that still need a first contact: status=lead, no
-  // site-visit data yet (those go to "Quotes to prep"), and never
-  // marked contacted. Once Brad taps "Mark contacted" on a row,
-  // lastContactedDate is stamped and the row drops out of this list —
-  // so the section doubles as a "leads I still owe a reply" inbox that
-  // empties as he works through it.
+  // site-visit data yet (those go to "Quotes to prep"), no upcoming
+  // visit on the calendar (those are handled — see visitBookedJobIds),
+  // not snoozed on the Leads page, and never marked contacted. Once Brad
+  // taps "Mark contacted" on a row, lastContactedDate is stamped and the
+  // row drops out of this list — so the section doubles as a "leads I
+  // still owe a reply" inbox that empties as he works through it.
   //
   // Sorted oldest-waiting first: the enquiry sitting longest without a
   // reply is the most at risk of going cold, so it belongs at the top.
@@ -356,10 +474,14 @@ export default function HomePage() {
       .filter((j) =>
         j.status === 'lead'
         && !hasWrapUpData(j)
-        && !j.lastContactedDate,
+        && !j.lastContactedDate
+        && !visitBookedJobIds.has(j.id)
+        // Snoozed on the Leads page = deliberately parked; Home must
+        // respect that or the snooze button looks broken.
+        && !(j.snoozeUntil && j.snoozeUntil > todayISO),
       )
       .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
-  }, [jobs]);
+  }, [jobs, visitBookedJobIds, todayISO]);
 
   // ── Render ──────────────────────────────────────────────────────────────
   const subtitle = parseISODate(todayISO).toLocaleDateString('en-NZ', {
@@ -381,6 +503,13 @@ export default function HomePage() {
           items={todayItems}
           todayISO={todayISO}
           onMarkDone={(id) => updateScheduleItem(id, { completed: true })}
+          onReschedule={(item) => {
+            // Tap any day of a run and the whole run comes along — matches
+            // the Schedule tab so rescheduling one overdue day of a 3-day
+            // job doesn't leave the other two days orphaned with a stale
+            // "(Day 2/3)" label.
+            setReschedulingItemIds(findScheduleRun(item, scheduleItems).map((s) => s.id));
+          }}
           onOpenWrapUp={(item) => {
             // Ticking a quote_visit opens the wrap-up regardless of
             // whether it has a linked job — the sheet will create one
@@ -419,10 +548,13 @@ export default function HomePage() {
           <LeadsToContactSection
             items={leadsToContact}
             todayISO={todayISO}
+            // Fired by the Email shortcut in this section, so the channel is
+            // known rather than guessed.
             onMarkContacted={(jobId) =>
-              updateJob(jobId, { lastContactedDate: new Date().toISOString() })
+              logContact({ jobId, direction: 'out', channel: 'email' })
             }
             onArrangeVisit={(job) => setVisitPromptJob(job)}
+            onSentQuote={(job) => setMarkQuotedJobId(job.id)}
           />
         )}
 
@@ -441,6 +573,11 @@ export default function HomePage() {
           fresh={freshWeek}
         />
 
+        {/* Payroll — pay Suzie + the IRD follow-ups. Self-contained:
+            reads the store itself and renders nothing when no employees
+            exist or nothing is due. */}
+        <PayrollFlags />
+
         {showMoneyFlags && (
           <MoneyFlagsCard
             overdueInvoices={overdueInvoices}
@@ -452,8 +589,10 @@ export default function HomePage() {
             jobs={jobs}
             todayISO={todayISO}
             onIssueDeposit={(job) => setDepositForJob(job)}
+            // "Followed up" on a quote flag — Brad chased, but this button
+            // doesn't know how, so 'other' rather than a guess.
             onFollowedUp={(jobId) =>
-              updateJob(jobId, { lastContactedDate: new Date().toISOString() })
+              logContact({ jobId, direction: 'out', channel: 'other' })
             }
             onMarkLost={(jobId) =>
               updateJob(jobId, { status: 'lost', lostReason: 'no-reply' })
@@ -512,10 +651,108 @@ export default function HomePage() {
           setBookVisitJob(job);
         }}
         onNo={(job) => {
-          updateJob(job.id, { lastContactedDate: new Date().toISOString() });
+          // Contact happened, no visit came of it. Channel unknown at this
+          // point in the flow — the prompt is reached from several routes.
+          logContact({ jobId: job.id, direction: 'out', channel: 'other' });
           setVisitPromptJob(null);
         }}
+        onAlreadyVisited={(job) => {
+          setVisitPromptJob(null);
+          setCatchUpJobId(job.id);
+        }}
         onCancel={() => setVisitPromptJob(null)}
+      />
+
+      {/* "Already visited" branch — the backdated wrap-up. Same sheet as
+          the normal post-visit wrap-up, with the visit date asked for
+          (there's no schedule_item to read it off). On save we write the
+          completed quote_visit ourselves, then hand off to the quote
+          catch-up question. */}
+      <SiteVisitWrapUpSheet
+        open={catchUpTarget !== null}
+        target={catchUpTarget}
+        askVisitDate
+        title="Catch up — site visit"
+        onSaved={(resolvedJobId, { visitDate }) => {
+          const job = jobs.find((j) => j.id === resolvedJobId);
+          if (visitDate) {
+            // Backfill the visit as already-completed history. No .ics —
+            // a calendar reminder for something that already happened is
+            // just noise. Real uuid because schedule_items.id is a uuid
+            // column (see BookVisitSheet for the 22P02 story).
+            addScheduleItem({
+              id: crypto.randomUUID(),
+              businessId: businessId ?? '',
+              jobId: resolvedJobId,
+              type: 'quote_visit',
+              title: `Site visit — ${job?.name ?? 'lead'}`,
+              date: visitDate,
+              startTime: '09:00',
+              notes: 'Logged after the fact.',
+              completed: true,
+              icsDownloaded: false,
+              createdAt: new Date().toISOString(),
+            });
+          }
+          setCatchUpJobId(null);
+          // Straight into "…and did you quote it?" — the wrap-up only
+          // captured scope, and a lead that's been visited but not
+          // quoted needs a different nudge than one that's been quoted
+          // and ignored.
+          setQuoteCatchUpJobId(resolvedJobId);
+        }}
+        onCancel={() => setCatchUpJobId(null)}
+      />
+
+      {/* Step 2 of the catch-up: has the quote already gone out? Yes
+          moves the job to 'quoted' with the amount + send date, which
+          hands it to the quote follow-up surface. No leaves it as a
+          lead with the quoteReadyBy promise the wrap-up just set. */}
+      <QuoteCatchUpSheet
+        job={quoteCatchUpJob}
+        onQuoted={(job, { amount, sentDate }) => {
+          updateJob(job.id, {
+            status: 'quoted',
+            // Only overwrite the stored amount when we actually got one —
+            // a blank field shouldn't wipe a figure already on the job.
+            ...(amount != null ? { quoteAmount: amount } : {}),
+            // Promise kept — stop counting it as a quote owed.
+            quoteReadyBy: undefined,
+          });
+          // Contact is dated from when the customer heard from Brad, not from
+          // now — otherwise a quote sent last week looks fresh and the
+          // follow-up nudge is a week late. This is the one backdating caller;
+          // logContact won't drag the cache backwards if a more recent contact
+          // already exists.
+          logContact({
+            jobId: job.id,
+            direction: 'out',
+            channel: 'quote-sent',
+            contactedAt: new Date(`${sentDate}T12:00:00`).toISOString(),
+            note: 'Logged retrospectively via quote catch-up.',
+          });
+          setQuoteCatchUpJobId(null);
+        }}
+        onNotQuoted={(job) => {
+          // Still a lead, but Brad has now actively touched it — log contact
+          // so it drops out of the to-contact list. quoteReadyBy (set in the
+          // wrap-up) keeps it visible as a quote owed.
+          logContact({ jobId: job.id, direction: 'out', channel: 'other' });
+          setQuoteCatchUpJobId(null);
+        }}
+        onCancel={() => setQuoteCatchUpJobId(null)}
+      />
+
+      {/* "Sent the quote" quick action from a leads-to-contact row —
+          same sheet the Leads page's To-quote section uses. Saving flips
+          the job to 'quoted' + logs the quote-sent contact, so the row
+          clears from Leads to contact and the follow-up ladder takes
+          over the chasing. */}
+      <MarkAsQuotedSheet
+        open={markQuotedJob !== null}
+        job={markQuotedJob}
+        onSaved={() => setMarkQuotedJobId(null)}
+        onCancel={() => setMarkQuotedJobId(null)}
       />
 
       {/* Shared booking sheet — adds a quote_visit schedule item, bumps
@@ -539,6 +776,18 @@ export default function HomePage() {
           onClose={() => setDepositForJob(null)}
         />
       )}
+
+      {/* Reschedule sheet — opened by tapping any Today row (including
+          overdue ones). Same component the Schedule tab uses, so a
+          multi-day job booking, a quote visit, or a bare reminder all get
+          the right edit UI (date range + working-days pattern where it
+          makes sense, single date otherwise). */}
+      <EditScheduleItemSheet
+        open={reschedulingTarget !== null}
+        onOpenChange={(open) => { if (!open) setReschedulingItemIds(null); }}
+        target={reschedulingTarget}
+        jobs={jobs}
+      />
     </div>
   );
 }
@@ -550,11 +799,13 @@ export default function HomePage() {
 // book it (schedule + calendar). No → just mark contacted. A compact
 // bottom sheet with two big tap targets — the 5:30pm-on-a-phone rule.
 function SiteVisitPromptSheet({
-  job, onYes, onNo, onCancel,
+  job, onYes, onNo, onAlreadyVisited, onCancel,
 }: {
   job: Job | null;
   onYes: (job: Job) => void;
   onNo: (job: Job) => void;
+  /** Third branch: the visit already happened, the app just doesn't know. */
+  onAlreadyVisited: (job: Job) => void;
   onCancel: () => void;
 }) {
   return (
@@ -593,6 +844,18 @@ function SiteVisitPromptSheet({
                 <CalendarCheck size={18} className="mr-2" strokeWidth={2} />
                 No — just mark contacted
               </Button>
+              {/* Tertiary on purpose: the common case is a visit being
+                  arranged now, and this branch opens a much longer form.
+                  Ghost styling keeps it available without competing with
+                  the two one-tap answers above. */}
+              <Button
+                variant="ghost"
+                className="w-full h-11 text-sm text-muted-foreground"
+                onClick={() => onAlreadyVisited(job)}
+              >
+                <History size={16} className="mr-2" strokeWidth={2} />
+                Already visited — catch the app up
+              </Button>
             </div>
           </div>
         )}
@@ -612,7 +875,7 @@ export interface LoggedHoursFields {
 }
 
 function TodaySection({
-  items, todayISO, onMarkDone, onLogHours, onOpenWrapUp,
+  items, todayISO, onMarkDone, onLogHours, onOpenWrapUp, onReschedule,
 }: {
   items: ScheduleItem[];
   todayISO: string;
@@ -620,6 +883,8 @@ function TodaySection({
   onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => void;
   /** Tick handler for quote_visit rows with a linked job — opens the wrap-up. */
   onOpenWrapUp: (item: ScheduleItem) => void;
+  /** Tapping the row body — opens the reschedule sheet for the item's run. */
+  onReschedule: (item: ScheduleItem) => void;
 }) {
   return (
     <section>
@@ -644,6 +909,7 @@ function TodaySection({
               onMarkDone={onMarkDone}
               onLogHours={onLogHours}
               onOpenWrapUp={onOpenWrapUp}
+              onReschedule={onReschedule}
             />
           ))}
         </ul>
@@ -658,7 +924,7 @@ const SCHEDULE_TYPE_META: Record<string, { color: string; bg: string; icon: Reac
   // is this?" should be readable at a glance without squinting. Keep
   // each label ≤14 chars so a chip never wraps on narrow viewports.
   job_booking: { color: 'text-orange-600', bg: 'bg-orange-50', icon: Briefcase,   label: 'Job day' },
-  quote_visit: { color: 'text-blue-600',   bg: 'bg-blue-50',   icon: FileText,    label: 'Quote visit' },
+  quote_visit: { color: 'text-blue-600',   bg: 'bg-blue-50',   icon: FileText,    label: 'Site visit' },
   follow_up:   { color: 'text-violet-600', bg: 'bg-violet-50', icon: Bell,        label: 'Follow-up' },
   bill_due:    { color: 'text-red-600',    bg: 'bg-red-50',    icon: AlertCircle, label: 'Bill due' },
   invoice_due: { color: 'text-amber-600',  bg: 'bg-amber-50',  icon: Receipt,     label: 'Invoice due' },
@@ -666,7 +932,7 @@ const SCHEDULE_TYPE_META: Record<string, { color: string; bg: string; icon: Reac
 };
 
 function TodayRow({
-  item, todayISO, onMarkDone, onLogHours, onOpenWrapUp,
+  item, todayISO, onMarkDone, onLogHours, onOpenWrapUp, onReschedule,
 }: {
   item: ScheduleItem;
   todayISO: string;
@@ -674,6 +940,8 @@ function TodayRow({
   onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => void;
   /** Tick handler for quote_visit rows. Falls back to onMarkDone if not provided. */
   onOpenWrapUp?: (item: ScheduleItem) => void;
+  /** Tapping the row body — opens the reschedule sheet. */
+  onReschedule: (item: ScheduleItem) => void;
 }) {
   const meta = SCHEDULE_TYPE_META[item.type] ?? SCHEDULE_TYPE_META.reminder;
   const Icon = meta.icon;
@@ -751,7 +1019,16 @@ function TodayRow({
   return (
     <li className="bg-card border border-border rounded-2xl flex flex-col overflow-hidden">
       <div className="flex items-stretch min-h-[56px]">
-        <div className="flex items-center gap-3 flex-1 px-4 py-3 min-w-0">
+        <button
+          type="button"
+          onClick={() => onReschedule(item)}
+          disabled={formOpen}
+          aria-label={`Reschedule "${item.title}"`}
+          className={cn(
+            'flex items-center gap-3 flex-1 px-4 py-3 min-w-0 text-left transition-colors',
+            formOpen ? 'cursor-default' : 'hover:bg-accent/60 active:bg-accent',
+          )}
+        >
           <div className={cn('w-8 h-8 rounded-xl flex items-center justify-center shrink-0', meta.bg)}>
             <Icon size={16} className={meta.color} strokeWidth={1.8} />
           </div>
@@ -776,7 +1053,10 @@ function TodayRow({
               {item.startTime && <span className="truncate">{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
             </p>
           </div>
-        </div>
+          {!formOpen && (
+            <ChevronRight size={16} className="text-muted-foreground shrink-0" strokeWidth={1.8} />
+          )}
+        </button>
         {showWrapUpButton ? (
           // Site visit whose time has passed → explicit "Wrap up" CTA so
           // adding the details is reachable straight from Home (no need to
@@ -1799,6 +2079,14 @@ function BillsToConfirmFlag({
 // splitSlices already buckets '__OH__' to overhead; resolveJobId maps it to undefined.
 type LineAlloc = '' | 'skip' | string;
 
+// The non-job outcomes a line item can take, fed to JobPicker as fixed
+// rows above the job list. '' (use the bill's job) isn't here — that's
+// the picker's built-in "no job" row, relabelled via noJobLabel.
+const LINE_ALLOC_OPTIONS = [
+  { value: '__OH__', label: 'Overhead (no job)', description: 'Force this line to overhead even if the bill has a job' },
+  { value: 'skip', label: "Skip — don't track", description: 'No material row (levies, freight, rounding)' },
+];
+
 // Shape of a parsed line item we accept from parserRaw. The LLM may emit
 // loose JSON; we narrow defensively before reading fields.
 interface ParsedLineItem {
@@ -1856,7 +2144,9 @@ function DraftBillRow({
   const hint = parserRaw?.jobHint;
   const dueDateSource = parserRaw?.dueDateSource;
   const duluxSecureLink = parserRaw?.duluxSecureLink;
-  const ranked = useMemo(() => rankJobs(jobs, hint), [jobs, hint]);
+  // (No local rankJobs call any more — JobPicker does its own ranking off
+  // the `context` we hand it, so pre-ranking here would just be duplicate
+  // work that can drift out of step with the picker's ordering.)
 
   // ── Line items ──────────────────────────────────────────────────────────
   // Defensive narrowing — parserRaw is `unknown` jsonb, can be anything.
@@ -2138,25 +2428,29 @@ function DraftBillRow({
         </button>
       </div>
 
-      {/* Job picker — best matches float to the top via rankJobs */}
+      {/* Job picker. Was a native <select> listing every job in rankJobs
+          order — fine at a dozen jobs, unusable past that: no typing, no
+          filtering, just a long scroll where the only way to find "32 Ash
+          Ave" is to read past everything else. JobPicker searches name,
+          client, address and legacy id, keeps the same relevance ordering
+          when the box is empty, and surfaces recently-used jobs. Same
+          component the entry form and reconcile screen use. */}
       <div>
         <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
           Allocate to job
         </label>
-        <select
+        <JobPicker
+          jobs={jobs}
           value={pickedJobId}
-          onChange={(e) => setPickedJobId(e.target.value)}
-          className="w-full h-10 px-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-        >
-          <option value="">Overhead (no job)</option>
-          {ranked.map(({ job, tier }) => (
-            <option key={job.id} value={job.id}>
-              {tier === 'active-match' ? '★ ' : ''}
-              {job.name}
-              {job.clientName ? ` — ${job.clientName}` : ''}
-            </option>
-          ))}
-        </select>
+          onChange={setPickedJobId}
+          // Same jobHint the old dropdown ranked by — the PO reference the
+          // parser pulled off the bill — so the likely job still floats to
+          // the top before Brad types anything.
+          context={hint}
+          placeholder="Overhead (no job)"
+          noJobLabel="Overhead (no job)"
+          hideOlderWhenActive
+        />
       </div>
 
       {/* Dulux secure-link bills: the figures came from the email, but the
@@ -2205,25 +2499,20 @@ function DraftBillRow({
                       {cost !== undefined ? fmtMoney(cost) : '—'}
                     </span>
                   </div>
-                  <select
+                  {/* Same searchable picker as the bill-level one. The
+                      three non-job outcomes ride along as extraOptions so
+                      this stays one control rather than a select plus a
+                      picker. '' is the default — inherit the bill's job. */}
+                  <JobPicker
+                    jobs={jobs}
                     value={alloc}
-                    onChange={(e) => setLineAlloc(i, e.target.value as LineAlloc)}
-                    className="w-full h-9 px-2 rounded-md border border-input bg-card text-xs focus:outline-none focus:ring-2 focus:ring-ring"
-                    aria-label={`Allocate line item ${i + 1}`}
-                  >
-                    <option value="">Use bill&apos;s job</option>
-                    <option value="__OH__">Overhead (no job)</option>
-                    <option value="skip">Skip — don&apos;t track</option>
-                    <optgroup label="Or pick a different job">
-                      {ranked.map(({ job, tier }) => (
-                        <option key={job.id} value={job.id}>
-                          {tier === 'active-match' ? '★ ' : ''}
-                          {job.name}
-                          {job.clientName ? ` — ${job.clientName}` : ''}
-                        </option>
-                      ))}
-                    </optgroup>
-                  </select>
+                    onChange={(v) => setLineAlloc(i, v as LineAlloc)}
+                    context={String(li.description ?? '')}
+                    placeholder="Use bill's job"
+                    noJobLabel="Use bill's job"
+                    extraOptions={LINE_ALLOC_OPTIONS}
+                    hideOlderWhenActive
+                  />
                 </li>
               );
             })}
@@ -2712,13 +3001,16 @@ const QUOTES_TO_PREP_MAX_ROWS = 4;
 // "I tapped Mark contacted and nothing happened").
 
 function LeadsToContactSection({
-  items, todayISO, onMarkContacted, onArrangeVisit,
+  items, todayISO, onMarkContacted, onArrangeVisit, onSentQuote,
 }: {
   items: Job[];
   todayISO: string;
   onMarkContacted: (jobId: string) => void;
   /** Primary action: opens the "site visit arranged?" prompt for this lead. */
   onArrangeVisit: (job: Job) => void;
+  /** "Sent the quote" — opens MarkAsQuotedSheet for leads quoted directly
+   *  (no site visit), e.g. commercial work priced off plans. */
+  onSentQuote: (job: Job) => void;
 }) {
   const shown = items.slice(0, LEADS_TO_CONTACT_MAX_ROWS);
   const overflow = items.length - shown.length;
@@ -2739,6 +3031,7 @@ function LeadsToContactSection({
             todayISO={todayISO}
             onMarkContacted={() => onMarkContacted(job.id)}
             onArrangeVisit={() => onArrangeVisit(job)}
+            onSentQuote={() => onSentQuote(job)}
           />
         ))}
       </ul>
@@ -2756,13 +3049,15 @@ function LeadsToContactSection({
 }
 
 function LeadToContactRow({
-  job, todayISO, onMarkContacted, onArrangeVisit,
+  job, todayISO, onMarkContacted, onArrangeVisit, onSentQuote,
 }: {
   job: Job;
   todayISO: string;
   onMarkContacted: () => void;
   /** Opens the "site visit arranged?" prompt — the primary action. */
   onArrangeVisit: () => void;
+  /** Quote already went out (no visit needed) — opens MarkAsQuotedSheet. */
+  onSentQuote: () => void;
 }) {
   const waiting = daysWaiting(job.createdAt, todayISO);
   // Only show the waiting chip once a lead has aged at least a day — a
@@ -2840,6 +3135,22 @@ function LeadToContactRow({
             <Mail size={13} strokeWidth={1.8} /> Email
           </a>
         )}
+      </div>
+
+      {/* "Sent the quote" — its own subtle row rather than a fourth
+          button above (four labels don't fit a 380px viewport). For
+          leads quoted directly with no site visit (commercial work
+          priced off plans): one tap opens MarkAsQuotedSheet, saving
+          flips the job to 'quoted' and this row clears for good. */}
+      <div className="border-t border-border/60 px-2 py-1">
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onSentQuote(); }}
+          className="w-full min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+          title="Already sent this one a quote? Record it — moves the lead to 'Quoted, awaiting reply'"
+        >
+          <Send size={12} strokeWidth={1.8} /> Sent the quote already
+        </button>
       </div>
     </li>
   );

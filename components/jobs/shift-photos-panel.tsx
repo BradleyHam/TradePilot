@@ -3,7 +3,9 @@
 import { useEffect, useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
-import { Camera, Trash2 } from 'lucide-react';
+import { jobCoverPath } from '@/lib/job-cover';
+import { cn } from '@/lib/utils';
+import { Camera, Trash2, Star } from 'lucide-react';
 
 /**
  * Site photos logged against this job by whoever worked it (usually an
@@ -11,7 +13,13 @@ import { Camera, Trash2 } from 'lucide-react';
  * hour and shows a tap-to-open grid, grouped by day. Hidden when empty.
  */
 export function ShiftPhotosPanel({ jobId }: { jobId: string }) {
-  const { shiftPhotos, deleteShiftPhoto } = useStore();
+  const { shiftPhotos, deleteShiftPhoto, jobs, role, setJobCoverPhoto } = useStore();
+
+  // Which photo is currently the job's main image (explicit pick, or the
+  // newest photo by the auto-fallback rule). Starred in the grid.
+  const job = jobs.find((j) => j.id === jobId);
+  const coverPath = job ? jobCoverPath(job, shiftPhotos) : undefined;
+  const coverIsExplicit = !!job?.coverPhotoPath;
 
   const photos = useMemo(
     () => shiftPhotos
@@ -51,17 +59,33 @@ export function ShiftPhotosPanel({ jobId }: { jobId: string }) {
 
   return (
     <div className="space-y-3">
-      <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
-        <Camera size={13} /> Site photos ({photos.length})
-      </p>
+      <div>
+        <p className="text-xs font-semibold text-muted-foreground uppercase tracking-wide flex items-center gap-1.5">
+          <Camera size={13} /> Site photos ({photos.length})
+        </p>
+        {role === 'owner' && (
+          <p className="text-[11px] text-muted-foreground mt-0.5">
+            {coverIsExplicit
+              ? 'The starred photo is this job’s main image — tap the star on another to change it.'
+              : 'Newest photo is the job’s main image. Tap a star to pin a different one.'}
+          </p>
+        )}
+      </div>
       {groups.map(([day, items]) => (
         <div key={day} className="space-y-1.5">
           <p className="text-[11px] text-muted-foreground">{prettyDay(day)}</p>
           <div className="grid grid-cols-3 gap-2">
             {items.map((p) => {
               const u = urls[p.storagePath];
+              const isCover = coverPath === p.storagePath;
               return (
-                <div key={p.id} className="relative group aspect-square rounded-lg overflow-hidden border border-border bg-muted">
+                <div
+                  key={p.id}
+                  className={cn(
+                    'relative group aspect-square rounded-lg overflow-hidden border bg-muted',
+                    isCover ? 'border-primary ring-2 ring-primary/40' : 'border-border',
+                  )}
+                >
                   {u ? (
                     <a href={u} target="_blank" rel="noopener noreferrer" className="block w-full h-full">
                       {/* eslint-disable-next-line @next/next/no-img-element */}
@@ -69,6 +93,29 @@ export function ShiftPhotosPanel({ jobId }: { jobId: string }) {
                     </a>
                   ) : (
                     <div className="w-full h-full animate-pulse" />
+                  )}
+                  {/* Cover pin — owner only. The current cover's star stays
+                      visible; the rest reveal on hover/focus. Tapping the
+                      current cover clears it back to auto-pick. */}
+                  {role === 'owner' && (
+                    <button
+                      onClick={() => setJobCoverPhoto(
+                        jobId,
+                        isCover && coverIsExplicit
+                          ? null
+                          : { bucket: 'shift-photos', path: p.storagePath },
+                      )}
+                      className={cn(
+                        'absolute top-1 left-1 rounded-full p-1 transition-opacity',
+                        isCover
+                          ? 'bg-primary text-primary-foreground opacity-100'
+                          : 'bg-black/60 text-white opacity-0 group-hover:opacity-100 focus:opacity-100',
+                      )}
+                      aria-label={isCover ? 'Main image (tap to unpin)' : 'Make main image'}
+                      title={isCover ? 'Main image' : 'Make main image'}
+                    >
+                      <Star size={12} fill={isCover ? 'currentColor' : 'none'} />
+                    </button>
                   )}
                   <button
                     onClick={() => deleteShiftPhoto(p.id)}

@@ -205,7 +205,7 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
   return (
     <Sheet open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
       <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
-        <div className="h-auto max-h-[94vh] flex flex-col overflow-hidden">
+        <div className="h-auto max-h-[94vh] md:h-full md:max-h-none flex flex-col overflow-hidden">
           <SheetHeader className="px-4 pt-4 pb-2 shrink-0">
             <SheetTitle className="flex items-center gap-2">
               <FileText size={16} className="text-primary" strokeWidth={2} />

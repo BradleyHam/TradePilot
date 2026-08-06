@@ -14,12 +14,18 @@ interface JobCardProps {
   expectedProfit?: number;
   /** True when expected profit is based on a real quote/invoice rather than an estimate. */
   expectedIsConfident?: boolean;
+  /**
+   * Signed URL for the job's main image, resolved by the parent (which
+   * batch-signs the whole list in one call — see lib/job-cover.ts).
+   * Omitted when the job has no photo yet; the card just renders without.
+   */
+  coverUrl?: string;
   onClick?: () => void;
 }
 
 export function JobCard({
   job, totalHours, totalExpenses, totalIncome,
-  expectedProfit, expectedIsConfident, onClick,
+  expectedProfit, expectedIsConfident, coverUrl, onClick,
 }: JobCardProps) {
   const value = job.quoteAmount ?? job.estimatedValue;
   // Prefer the parent-provided expected profit; fall back to the simple
@@ -34,9 +40,17 @@ export function JobCard({
   return (
     <button
       onClick={onClick}
-      className="w-full text-left bg-card border border-border rounded-2xl p-4 hover:border-primary/30 hover:shadow-sm active:scale-[0.99] transition-all"
+      className="w-full text-left bg-card border border-border/70 rounded-2xl p-4 shadow-card hover:border-primary/30 hover:shadow-elevated active:scale-[0.99] transition-all"
     >
       <div className="flex items-start justify-between gap-3 mb-3">
+        {coverUrl && (
+          // eslint-disable-next-line @next/next/no-img-element
+          <img
+            src={coverUrl}
+            alt=""
+            className="w-14 h-14 rounded-xl object-cover border border-border shrink-0"
+          />
+        )}
         <div className="flex-1 min-w-0">
           <p className="font-semibold text-foreground truncate">{job.name}</p>
           <div className="flex items-center gap-1.5 mt-1 text-muted-foreground">
@@ -78,9 +92,9 @@ export function JobCard({
 
 function Stat({ label, value, valueClass }: { label: string; value: string; valueClass?: string }) {
   return (
-    <div className="flex flex-col bg-muted/50 rounded-lg px-2.5 py-1.5 min-w-0">
-      <span className="text-[10px] text-muted-foreground font-medium">{label}</span>
-      <span className={cn('text-sm font-semibold', valueClass ?? 'text-foreground')}>{value}</span>
+    <div className="flex flex-col bg-muted/60 rounded-lg px-2.5 py-1.5 min-w-0">
+      <span className="text-[10px] text-muted-foreground font-medium uppercase tracking-wide">{label}</span>
+      <span className={cn('text-sm font-semibold tabular-nums', valueClass ?? 'text-foreground')}>{value}</span>
     </div>
   );
 }

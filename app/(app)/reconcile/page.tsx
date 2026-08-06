@@ -57,6 +57,7 @@ export default function ReconcilePage() {
                 onMatchBills={(billIds, paidDate) => markBillsPaid(txn.id, billIds, paidDate)}
                 onIgnore={() => updateBankTransaction(txn.id, { status: 'ignored' })}
                 onMarkPersonal={() => updateBankTransaction(txn.id, { status: 'personal' })}
+                onMarkTax={(taxKind) => updateBankTransaction(txn.id, { status: 'tax', taxKind })}
               />
             ))}
           </div>

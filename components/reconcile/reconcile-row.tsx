@@ -3,10 +3,21 @@
 import { useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import { classifyBankRow, findMatchingEntry, type Suggestion } from '@/lib/bank-classifier';
-import { rankJobs } from '@/lib/job-match';
-import type { BankTransaction, Entry, ExpenseCategory } from '@/lib/types';
-import { CheckCircle2, ArrowRight, Receipt, DollarSign, Split, Plus, X, FileText } from 'lucide-react';
+import { JobPicker } from '@/components/shared/job-picker';
+import type { BankTransaction, Entry, ExpenseCategory, TaxPaymentKind } from '@/lib/types';
+import { CheckCircle2, ArrowRight, Receipt, DollarSign, Split, Plus, X, FileText, Landmark } from 'lucide-react';
 import { cn } from '@/lib/utils';
+
+// User-facing labels for the IRD payment sub-types. Source of truth shared
+// by the picker card here and the "Paid to IRD" summary on the Money tab.
+const TAX_KIND_LABELS: Record<TaxPaymentKind, string> = {
+  income_tax: 'Income tax',
+  gst:        'GST',
+  paye:       'PAYE',
+  penalty:    'Penalty / interest',
+  other:      'Other',
+};
+const TAX_KIND_ORDER: TaxPaymentKind[] = ['income_tax', 'gst', 'paye', 'penalty', 'other'];
 
 const fmt = (n: number) =>
   `$${n.toLocaleString('en-NZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -41,11 +52,18 @@ interface ReconcileRowProps {
   onMatchBills: (billEntryIds: string[], paidDate: string) => Promise<{ updated: number; failed: number; error?: string }>;
   onIgnore: () => void;
   onMarkPersonal: () => void;
+  /**
+   * Classify this transaction as a payment to Inland Revenue (income tax,
+   * GST, PAYE, penalty). Records it as a terminal 'tax' bank-txn status —
+   * NO expense entry is created, so it stays out of P&L + GST math. The
+   * optional sub-type feeds the "Paid to IRD" breakdown on the Money tab.
+   */
+  onMarkTax: (taxKind?: TaxPaymentKind) => void;
 }
 
 export function ReconcileRow({
   txn, entries, jobs,
-  onLinkToEntry, onCreateEntry, onSplitEntries, onMatchBills, onIgnore, onMarkPersonal,
+  onLinkToEntry, onCreateEntry, onSplitEntries, onMatchBills, onIgnore, onMarkPersonal, onMarkTax,
 }: ReconcileRowProps) {
   const isCredit = txn.amount > 0;
 
@@ -78,6 +96,11 @@ export function ReconcileRow({
   // Bill-match mode — settle several already-uploaded bills against this
   // one payment (the "paid 3–4 invoices at once" case). Debits only.
   const [showBillMatch, setShowBillMatch] = useState(false);
+  // Tax mode — classify as a payment to Inland Revenue. Auto-on when the
+  // classifier flags it; also reachable from the escape-hatch "Tax payment"
+  // button for anything it didn't catch.
+  const [showTaxForm, setShowTaxForm] = useState(false);
+  const showTax = (suggestion.kind === 'tax' || showTaxForm) && !showCreateForm;
 
   return (
     <div className="bg-card border border-border rounded-2xl overflow-hidden">
@@ -131,6 +154,7 @@ export function ReconcileRow({
             txn={txn}
             suggestion={suggestion}
             jobs={jobs}
+            entries={entries}
             onSubmit={async (rows) => {
               const result = await onSplitEntries(rows);
               if (result.failed > 0) {
@@ -143,6 +167,15 @@ export function ReconcileRow({
               }
             }}
             onCancel={() => setShowSplitForm(false)}
+          />
+        ) : showTax ? (
+          // Payment to Inland Revenue — record it (with sub-type) WITHOUT
+          // creating an expense entry, so it never touches P&L or GST math.
+          <TaxSuggestion
+            reason={suggestion.kind === 'tax' ? suggestion.reason : 'Payment to Inland Revenue'}
+            defaultKind={suggestion.kind === 'tax' ? suggestion.taxKind : undefined}
+            onConfirm={(kind) => onMarkTax(kind)}
+            onTreatAsExpense={() => { setShowTaxForm(false); setShowCreateForm(true); }}
           />
         ) : suggestion.kind === 'transfer' && !showCreateForm ? (
           // Transfer rows get a one-tap "ignore" — no new entry needed since
@@ -165,6 +198,7 @@ export function ReconcileRow({
               txn={txn}
               suggestion={suggestion}
               jobs={jobs}
+              entries={entries}
               onSubmit={(entry) => onCreateEntry(entry)}
             />
             {/* Discoverability hooks. Bill-match first (settles invoices
@@ -193,8 +227,11 @@ export function ReconcileRow({
         )}
         {/* Bottom-right escape hatches — always visible regardless of
             primary suggestion. Hidden during split form (it has its own
-            Cancel button to avoid mixed signals). */}
-        {!showSplitForm && !showBillMatch && !(suggestion.kind === 'transfer' && !showCreateForm) && (
+            Cancel button to avoid mixed signals) and while the transfer/tax
+            cards are shown (they carry their own primary actions). The
+            "Tax payment" hatch is debit-only — a credit from IRD is a refund
+            and should be logged as income, not tagged as a tax payment. */}
+        {!showSplitForm && !showBillMatch && !showTax && !(suggestion.kind === 'transfer' && !showCreateForm) && (
           <div className="flex items-center justify-end gap-1 pt-1">
             <button
               onClick={onMarkPersonal}
@@ -209,6 +246,17 @@ export function ReconcileRow({
             >
               Ignore
             </button>
+            {!isCredit && (
+              <>
+                <span className="text-muted-foreground/30">·</span>
+                <button
+                  onClick={() => setShowTaxForm(true)}
+                  className="text-[11px] text-muted-foreground hover:text-foreground px-2 h-7 rounded-md hover:bg-muted"
+                >
+                  Tax payment
+                </button>
+              </>
+            )}
           </div>
         )}
       </div>
@@ -238,6 +286,82 @@ function TransferSuggestion({
           className="flex-1 h-8 rounded-md bg-blue-600 text-white text-xs font-semibold hover:bg-blue-700 transition-colors"
         >
           Ignore (it&apos;s a transfer)
+        </button>
+        <button
+          onClick={onTreatAsExpense}
+          className="px-3 h-8 rounded-md bg-card border border-border text-xs font-medium text-muted-foreground hover:text-foreground"
+        >
+          Actually an expense
+        </button>
+      </div>
+    </div>
+  );
+}
+
+// ── Tax suggestion: record a payment to Inland Revenue ─────────────────────
+//
+// IRD payments (income tax / GST / PAYE / penalties) are NOT deductible
+// expenses, so we deliberately DON'T create an entry — we tag the bank txn
+// 'tax' and it drops out of the pending list without ever touching P&L or
+// GST math. The sub-type chips are optional context for the Money tab's
+// "Paid to IRD" breakdown; recording works with or without one.
+
+function TaxSuggestion({
+  reason, defaultKind, onConfirm, onTreatAsExpense,
+}: {
+  reason: string;
+  defaultKind?: TaxPaymentKind;
+  onConfirm: (kind?: TaxPaymentKind) => void;
+  onTreatAsExpense: () => void;
+}) {
+  const [kind, setKind] = useState<TaxPaymentKind | undefined>(defaultKind);
+  return (
+    <div className="rounded-xl bg-indigo-50 border border-indigo-200 p-3 space-y-2.5">
+      <div className="flex items-start gap-2">
+        <Landmark size={14} className="text-indigo-600 mt-0.5 shrink-0" strokeWidth={2} />
+        <div className="flex-1 min-w-0">
+          <p className="text-xs font-medium text-indigo-900">{reason}</p>
+          <p className="text-[11px] text-indigo-800 mt-0.5">
+            Not a deductible expense — recorded but kept out of profit &amp; GST.
+          </p>
+        </div>
+      </div>
+
+      {/* Sub-type chips — optional. Pre-selected from the classifier's guess
+          when it had one. Tap again to deselect. */}
+      <div>
+        <p className="text-[10px] font-semibold text-indigo-700/80 uppercase tracking-wide mb-1.5">
+          What kind? (optional)
+        </p>
+        <div className="flex flex-wrap gap-1.5">
+          {TAX_KIND_ORDER.map((k) => {
+            const active = kind === k;
+            return (
+              <button
+                key={k}
+                type="button"
+                onClick={() => setKind(active ? undefined : k)}
+                aria-pressed={active}
+                className={cn(
+                  'px-2.5 h-7 rounded-md text-[11px] font-medium border transition-colors',
+                  active
+                    ? 'bg-indigo-600 text-white border-indigo-600'
+                    : 'bg-card text-indigo-800 border-indigo-200 hover:border-indigo-400',
+                )}
+              >
+                {TAX_KIND_LABELS[k]}
+              </button>
+            );
+          })}
+        </div>
+      </div>
+
+      <div className="flex gap-1.5">
+        <button
+          onClick={() => onConfirm(kind)}
+          className="flex-1 h-8 rounded-md bg-indigo-600 text-white text-xs font-semibold hover:bg-indigo-700 transition-colors"
+        >
+          Record as tax payment
         </button>
         <button
           onClick={onTreatAsExpense}
@@ -300,11 +424,12 @@ const EXPENSE_CATEGORIES: ExpenseCategory[] = [
 ];
 
 function NewEntryForm({
-  txn, suggestion, jobs, onSubmit,
+  txn, suggestion, jobs, entries, onSubmit,
 }: {
   txn: BankTransaction;
   suggestion: Suggestion;
   jobs: ReturnType<typeof useStore>['jobs'];
+  entries: Entry[];
   onSubmit: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>) => void;
 }) {
   const isCredit = txn.amount > 0;
@@ -332,18 +457,10 @@ function NewEntryForm({
   const [isOverhead, setIsOverhead] = useState<boolean>(defaultIsOverhead);
   const [gstApplies, setGstApplies] = useState(true);
 
-  // Rank jobs by relevance to this bank transaction. Active matches
-  // (e.g. payee NICHOLSON → job with client Nicholson) bubble up first,
-  // then other active jobs, then recently-completed ones, then the rest.
-  const rankedJobs = useMemo(
-    () => rankJobs(
-      jobs,
-      // Context for fuzzy match — the bank txn's identifying text
-      [txn.payee, txn.particulars, txn.reference, txn.description]
-        .filter(Boolean).join(' '),
-    ),
-    [jobs, txn.payee, txn.particulars, txn.reference, txn.description],
-  );
+  // Context for the picker's fuzzy match / "likely match" ordering — the
+  // bank txn's identifying text (e.g. payee NICHOLSON → job client Nicholson).
+  const jobContext = [txn.payee, txn.particulars, txn.reference, txn.description]
+    .filter(Boolean).join(' ');
 
   const NZ_GST_RATE = 0.15;
   const ex = gstApplies ? grossAmount / (1 + NZ_GST_RATE) : grossAmount;
@@ -427,42 +544,20 @@ function NewEntryForm({
 
       {/* Job picker + overhead toggle */}
       <div className="flex items-center gap-2">
-        <select
+        <JobPicker
+          jobs={jobs}
+          entries={entries}
           value={jobId}
-          onChange={(e) => {
-            setJobId(e.target.value);
+          onChange={(id) => {
+            setJobId(id);
             // Picking a job implicitly cancels the overhead flag.
-            if (e.target.value) setIsOverhead(false);
+            if (id) setIsOverhead(false);
           }}
+          context={jobContext}
+          placeholder="No job"
           disabled={isOverhead}
-          className={cn(
-            'flex-1 h-8 px-2 rounded-md border border-input bg-background text-xs',
-            isOverhead && 'opacity-50',
-          )}
-        >
-          <option value="">No job</option>
-          {/* Render in tiers so the most relevant jobs are at the top, with
-              section headers via <optgroup>. The native select on iOS/Mac
-              respects optgroup labels and picks them out visually. */}
-          {(['active-match', 'active', 'recent', 'older'] as const).map((tier) => {
-            const inTier = rankedJobs.filter((r) => r.tier === tier);
-            if (inTier.length === 0) return null;
-            const label = tier === 'active-match' ? 'Likely match'
-              : tier === 'active' ? 'Active jobs'
-              : tier === 'recent' ? 'Recently completed'
-              : 'Older';
-            return (
-              <optgroup key={tier} label={label}>
-                {inTier.map((r) => (
-                  <option key={r.job.id} value={r.job.id}>
-                    {r.job.name}
-                    {r.job.clientName ? ` — ${r.job.clientName}` : ''}
-                  </option>
-                ))}
-              </optgroup>
-            );
-          })}
-        </select>
+          className="flex-1 min-w-0"
+        />
         <button
           type="button"
           onClick={() => {
@@ -539,11 +634,12 @@ interface SplitRowState {
 }
 
 function SplitForm({
-  txn, suggestion, jobs, onSubmit, onCancel,
+  txn, suggestion, jobs, entries, onSubmit, onCancel,
 }: {
   txn: BankTransaction;
   suggestion: Suggestion;
   jobs: ReturnType<typeof useStore>['jobs'];
+  entries: Entry[];
   onSubmit: (rows: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>[]) => Promise<void>;
   onCancel: () => void;
 }) {
@@ -559,14 +655,9 @@ function SplitForm({
   ]);
   const [saving, setSaving] = useState(false);
 
-  // Rank jobs by relevance — same as NewEntryForm.
-  const rankedJobs = useMemo(
-    () => rankJobs(
-      jobs,
-      [txn.payee, txn.particulars, txn.reference, txn.description].filter(Boolean).join(' '),
-    ),
-    [jobs, txn.payee, txn.particulars, txn.reference, txn.description],
-  );
+  // Context for the picker's fuzzy match / "likely match" ordering.
+  const jobContext = [txn.payee, txn.particulars, txn.reference, txn.description]
+    .filter(Boolean).join(' ');
 
   // Compute each row's gross dollar amount based on the active mode.
   // In percent mode the input is a percent of grossAmount.
@@ -614,27 +705,25 @@ function SplitForm({
   }
 
   /**
-   * Auto-balance the last empty row to make the totals match. Useful
-   * shortcut: enter the first N-1 amounts, tap Balance, get the last one
-   * filled in for you.
+   * Dump the entire unallocated remainder into one row — the "and the
+   * rest goes on this job" move. Adds to the row's current value rather
+   * than overwriting it, so tapping it after typing a partial amount
+   * tops that row up to balance instead of discarding what's there.
+   *
+   * Works in either mode: in percent mode the remainder is converted to
+   * a percentage of the transaction first, so the arithmetic still lands
+   * on exactly 100%.
    */
-  function balanceLastRow() {
-    const lastId = rows[rows.length - 1].id;
-    if (mode === 'amount') {
-      const otherTotal = rows
-        .filter((r) => r.id !== lastId)
-        .reduce((s, r) => s + rowGross(r), 0);
-      const need = Math.round((grossAmount - otherTotal) * 100) / 100;
-      if (need <= 0) return;
-      updateRow(lastId, { amountStr: need.toFixed(2) });
-    } else {
-      const otherPct = rows
-        .filter((r) => r.id !== lastId)
-        .reduce((s, r) => s + (parseFloat(r.amountStr) || 0), 0);
-      const need = Math.round((100 - otherPct) * 100) / 100;
-      if (need <= 0) return;
-      updateRow(lastId, { amountStr: need.toFixed(2) });
-    }
+  function fillRemaining(rowId: string) {
+    if (remaining <= 0.02) return;
+    const row = rows.find((r) => r.id === rowId);
+    if (!row) return;
+    const current = parseFloat(row.amountStr);
+    const base = Number.isFinite(current) ? current : 0;
+    const delta = mode === 'percent'
+      ? Math.round((remaining / grossAmount) * 100 * 100) / 100
+      : remaining;
+    updateRow(rowId, { amountStr: (Math.round((base + delta) * 100) / 100).toFixed(2) });
   }
 
   const NZ_GST_RATE = 0.15;
@@ -723,30 +812,43 @@ function SplitForm({
                 placeholder={mode === 'amount' ? '0.00' : '0'}
                 className="w-24 h-8 px-2 rounded-md border border-input bg-background text-xs tabular-nums focus:outline-none focus:ring-2 focus:ring-ring"
               />
-              <span className="text-[11px] text-muted-foreground shrink-0 w-12">
-                {mode === 'percent' && r.amountStr ? `≈ ${fmt(rowGross(r))}` : ''}
-              </span>
-              <select
-                value={r.isOverhead ? '__OH__' : r.jobId}
-                onChange={(e) => {
-                  const v = e.target.value;
-                  if (v === '__OH__') updateRow(r.id, { isOverhead: true, jobId: '' });
-                  else updateRow(r.id, { isOverhead: false, jobId: v });
-                }}
-                className="flex-1 min-w-0 h-8 px-2 rounded-md border border-input bg-background text-xs focus:outline-none focus:ring-2 focus:ring-ring"
-              >
-                <option value="">Pick a job…</option>
-                <option value="__OH__">Overhead (no job)</option>
-                {rankedJobs.length > 0 && (
-                  <optgroup label="Jobs">
-                    {rankedJobs.map((r) => (
-                      <option key={r.job.id} value={r.job.id}>
-                        {r.job.name} {r.job.clientName ? `· ${r.job.clientName}` : ''}
-                      </option>
-                    ))}
-                  </optgroup>
-                )}
-              </select>
+              {/* Per-row "take the rest". The footer's Balance-last button
+                  only ever targets the bottom row and reads as a tidy-up
+                  action; what you actually want, sitting on the row you're
+                  filling in, is "whatever's left goes here" — without doing
+                  the subtraction in your head at the paint counter. Shown
+                  on any row while there's an unallocated remainder, so it
+                  works whether you're on the last row or filling them out
+                  of order. Adds to whatever's already in the row rather
+                  than replacing it, so a part-typed amount isn't lost. */}
+              {mode === 'percent' && (
+                <span className="text-[11px] text-muted-foreground shrink-0 w-12">
+                  {r.amountStr ? `≈ ${fmt(rowGross(r))}` : ''}
+                </span>
+              )}
+              {remaining > 0.02 && (
+                <button
+                  type="button"
+                  onClick={() => fillRemaining(r.id)}
+                  title={`Add the remaining ${fmt(remaining)} to this row`}
+                  className="shrink-0 h-8 px-2 rounded-md border border-primary/40 bg-primary/5 text-primary text-[11px] font-semibold tabular-nums hover:bg-primary/10 transition-colors"
+                >
+                  +{mode === 'percent'
+                    ? `${(Math.round((remaining / grossAmount) * 10000) / 100).toFixed(2)}%`
+                    : fmt(remaining)}
+                </button>
+              )}
+              <JobPicker
+                jobs={jobs}
+                entries={entries}
+                value={r.isOverhead ? '' : r.jobId}
+                overhead={r.isOverhead}
+                onChange={(v) => updateRow(r.id, { isOverhead: false, jobId: v })}
+                onOverhead={() => updateRow(r.id, { isOverhead: true, jobId: '' })}
+                context={jobContext}
+                placeholder="Pick a job…"
+                className="flex-1 min-w-0"
+              />
               {rows.length > 1 && (
                 <button
                   type="button"
@@ -801,15 +903,10 @@ function SplitForm({
           >
             <Plus size={11} strokeWidth={2} /> Add row
           </button>
-          {!balanced && (
-            <button
-              type="button"
-              onClick={balanceLastRow}
-              className="h-7 px-2 rounded-md text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-muted"
-            >
-              Balance last
-            </button>
-          )}
+          {/* "Balance last" used to live here. Removed once every row got
+              its own "+$X left" button — the per-row version does the same
+              job at the point of need and doesn't make you reason about
+              which row counts as "last". */}
         </div>
         <div className={cn(
           'text-[11px] tabular-nums font-semibold flex items-center gap-1',

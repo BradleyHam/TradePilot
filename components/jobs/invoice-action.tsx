@@ -539,7 +539,7 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
   return (
     <Sheet open={open} onOpenChange={onClose}>
       <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
-        <div className="h-auto max-h-[92vh] flex flex-col overflow-hidden">
+        <div className="h-auto max-h-[92vh] md:h-full md:max-h-none flex flex-col overflow-hidden">
           {/* Header */}
           <div className="shrink-0 px-4 pt-4 pb-3 border-b border-border bg-card">
             <div className="flex items-center gap-2">

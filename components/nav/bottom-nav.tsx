@@ -38,7 +38,7 @@ export function BottomNav() {
   const items = role === 'employee' ? EMPLOYEE_NAV_ITEMS : NAV_ITEMS;
 
   return (
-    <nav className="fixed bottom-0 left-0 right-0 z-50 bg-card border-t border-border md:hidden">
+    <nav className="fixed bottom-0 left-0 right-0 z-50 bg-card/90 backdrop-blur-lg border-t border-border/60 shadow-nav md:hidden">
       <div className="flex items-center justify-around h-16 px-2 pb-safe">
         {items.map(({ href, label, icon: Icon }) => {
           const active = pathname === href || pathname.startsWith(href + '/');
@@ -47,10 +47,10 @@ export function BottomNav() {
               key={href}
               href={href}
               className={cn(
-                'flex flex-col items-center justify-center gap-1 flex-1 py-2 rounded-xl transition-colors min-h-[52px]',
+                'flex flex-col items-center justify-center gap-1 flex-1 mx-0.5 py-2 rounded-2xl transition-all min-h-[52px]',
                 active
-                  ? 'text-primary'
-                  : 'text-muted-foreground hover:text-foreground'
+                  ? 'text-primary bg-primary/10'
+                  : 'text-muted-foreground hover:text-foreground hover:bg-muted/60'
               )}
             >
               <Icon

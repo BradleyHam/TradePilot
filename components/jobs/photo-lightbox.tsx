@@ -17,7 +17,7 @@
 
 import { useRef, useState } from 'react';
 import { Dialog as DialogPrimitive } from '@base-ui/react/dialog';
-import { ChevronLeft, ChevronRight, X, ExternalLink, Loader2, ImageOff, Trash2 } from 'lucide-react';
+import { ChevronLeft, ChevronRight, X, ExternalLink, Loader2, ImageOff, Trash2, Star } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 const IMAGE_EXTS = [
@@ -205,11 +205,21 @@ export function PhotoThumb({
   fileName,
   onOpen,
   onDelete,
+  onMakeCover,
+  isCover,
 }: {
   url: string | null;
   fileName: string;
   onOpen: () => void;
   onDelete?: () => Promise<{ ok: boolean; error?: string }>;
+  /**
+   * Pin this photo as the job's main image (the thumbnail staff see).
+   * Omit to hide the control — e.g. for non-owners. Called with `false`
+   * when it's already the cover, meaning "unpin, go back to auto".
+   */
+  onMakeCover?: (makeCover: boolean) => void;
+  /** True when this photo is currently the job's main image. */
+  isCover?: boolean;
 }) {
   const [loaded, setLoaded] = useState(false);
   const [errored, setErrored] = useState(false);
@@ -229,12 +239,15 @@ export function PhotoThumb({
   }
 
   return (
-    <div className="relative aspect-square">
+    <div className="relative aspect-square group">
       <button
         type="button"
         onClick={onOpen}
         aria-label={`Open ${fileName}`}
-        className="absolute inset-0 overflow-hidden rounded-xl bg-muted/60 transition active:scale-[0.98]"
+        className={cn(
+          'absolute inset-0 overflow-hidden rounded-xl bg-muted/60 transition active:scale-[0.98]',
+          isCover && 'ring-2 ring-primary ring-offset-1',
+        )}
       >
         {url && !errored && (
           <img
@@ -264,6 +277,24 @@ export function PhotoThumb({
           </span>
         )}
       </button>
+      {/* Pin as the job's main image. The current cover stays visible;
+          others reveal on hover/focus so the grid stays clean. */}
+      {onMakeCover && (
+        <button
+          type="button"
+          onClick={(e) => { e.stopPropagation(); onMakeCover(!isCover); }}
+          aria-label={isCover ? `${fileName} is the main image — tap to unpin` : `Make ${fileName} the main image`}
+          title={isCover ? 'Main image' : 'Make main image'}
+          className={cn(
+            'absolute left-1 top-1 flex h-7 w-7 items-center justify-center rounded-full backdrop-blur-sm transition active:scale-95',
+            isCover
+              ? 'bg-primary text-primary-foreground opacity-100'
+              : 'bg-black/45 text-white/90 opacity-0 group-hover:opacity-100 focus:opacity-100',
+          )}
+        >
+          <Star size={12} strokeWidth={2} fill={isCover ? 'currentColor' : 'none'} />
+        </button>
+      )}
       {onDelete && (
         <button
           type="button"

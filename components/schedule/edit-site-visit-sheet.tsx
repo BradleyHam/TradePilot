@@ -42,7 +42,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Trash2, CheckCircle2 } from 'lucide-react';
+import { Trash2, CheckCircle2, Plus } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 // ── Duration chip presets ────────────────────────────────────────────────
@@ -153,6 +153,16 @@ function EditForm({
   const [jobId, setJobId] = useState(item.jobId ?? '');
   const [notes, setNotes] = useState(item.notes ?? '');
   const [completed, setCompleted] = useState(item.completed);
+  const [location, setLocation] = useState(item.location ?? '');
+  const [clientName, setClientName] = useState(item.clientName ?? '');
+  const [clientEmail, setClientEmail] = useState(item.clientEmail ?? '');
+  const [clientPhone, setClientPhone] = useState(item.clientPhone ?? '');
+  // Start expanded if any contact detail is already on the row —
+  // otherwise collapsed, same "optional, not in your face" treatment as
+  // the add-form.
+  const [showContact, setShowContact] = useState(
+    !!(item.clientName || item.clientEmail || item.clientPhone),
+  );
 
   useEffect(() => {
     setTitle(item.title);
@@ -162,7 +172,15 @@ function EditForm({
     setJobId(item.jobId ?? '');
     setNotes(item.notes ?? '');
     setCompleted(item.completed);
-  }, [item.id, item.title, item.date, item.startTime, item.endTime, item.jobId, item.notes, item.completed]);
+    setLocation(item.location ?? '');
+    setClientName(item.clientName ?? '');
+    setClientEmail(item.clientEmail ?? '');
+    setClientPhone(item.clientPhone ?? '');
+    setShowContact(!!(item.clientName || item.clientEmail || item.clientPhone));
+  }, [
+    item.id, item.title, item.date, item.startTime, item.endTime, item.jobId, item.notes,
+    item.completed, item.location, item.clientName, item.clientEmail, item.clientPhone,
+  ]);
 
   // Which preset (if any) the current start→end span matches. Drives the
   // pressed look on the chips. Custom values leave every chip un-pressed.
@@ -189,6 +207,10 @@ function EditForm({
       startTime: startTime || undefined,
       endTime: endTime || undefined,
       jobId: jobId || undefined,
+      location: location.trim() || undefined,
+      clientName: clientName.trim() || undefined,
+      clientEmail: clientEmail.trim() || undefined,
+      clientPhone: clientPhone.trim() || undefined,
       notes: notes || undefined,
       completed,
     });
@@ -273,6 +295,14 @@ function EditForm({
         </div>
       </div>
 
+      <FormField label="Address">
+        <FormInput
+          placeholder="e.g. 12 Ballantyne Rd, Wanaka"
+          value={location}
+          onChange={(e) => setLocation(e.target.value)}
+        />
+      </FormField>
+
       <FormField label="Job (optional)">
         <Select value={jobId} onValueChange={(v) => setJobId(v ?? '')}>
           <SelectTrigger className="h-11 text-sm">
@@ -293,6 +323,44 @@ function EditForm({
           </SelectContent>
         </Select>
       </FormField>
+
+      {!showContact && (
+        <button
+          type="button"
+          onClick={() => setShowContact(true)}
+          className="flex items-center gap-1.5 text-xs text-primary py-1"
+        >
+          <Plus size={13} strokeWidth={2.4} />
+          Add client contact (optional)
+        </button>
+      )}
+
+      {showContact && (
+        <div className="rounded-xl border border-border bg-muted/20 p-3 space-y-2">
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide block">
+            Client contact (optional)
+          </label>
+          <FormInput
+            placeholder="Name"
+            value={clientName}
+            onChange={(e) => setClientName(e.target.value)}
+          />
+          <div className="grid grid-cols-2 gap-2">
+            <FormInput
+              type="email"
+              placeholder="Email"
+              value={clientEmail}
+              onChange={(e) => setClientEmail(e.target.value)}
+            />
+            <FormInput
+              type="tel"
+              placeholder="Phone"
+              value={clientPhone}
+              onChange={(e) => setClientPhone(e.target.value)}
+            />
+          </div>
+        </div>
+      )}
 
       <FormField label="Notes">
         <Textarea

@@ -275,6 +275,9 @@ const ACTIVITY_LABEL: Record<string, string> = {
   travel: 'Travel',
   quoting: 'Quoting',
   admin: 'Admin',
+  website: 'Website',
+  marketing: 'Marketing',
+  training: 'Training',
 };
 
 export function HoursByActivity({ entries }: HoursByActivityProps) {

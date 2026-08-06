@@ -364,7 +364,7 @@ function StockItemSheet({
   return (
     <Sheet open={open} onOpenChange={onClose}>
       <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
-        <div className="max-h-[92vh] flex flex-col overflow-hidden">
+        <div className="max-h-[92vh] md:max-h-none md:h-full flex flex-col overflow-hidden">
           <div className="shrink-0 px-4 pt-4 pb-3 border-b border-border bg-card">
             <div className="flex items-center gap-2">
               <Paintbrush size={18} className="text-primary shrink-0" strokeWidth={1.8} />

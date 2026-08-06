@@ -20,7 +20,7 @@ import { useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
-import { rankJobs } from '@/lib/job-match';
+import { JobPicker } from '@/components/shared/job-picker';
 import type { Entry } from '@/lib/types';
 import { ExternalLink, Plus, X, Split, Pencil, Trash2 } from 'lucide-react';
 import { cn } from '@/lib/utils';
@@ -134,11 +134,6 @@ export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps
 
   const [opening, setOpening] = useState(false);
 
-  const ranked = useMemo(
-    () => rankJobs(jobs, parserRaw?.jobHint),
-    [jobs, parserRaw?.jobHint],
-  );
-
   if (!bill || !primary) return null;
 
   const jobName = (jobId: string | undefined | null): string => {
@@ -246,8 +241,8 @@ export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps
 
   return (
     <Sheet open={open} onOpenChange={(o) => { if (!o) { setEditing(false); setPayOpen(false); onClose(); } }}>
-      <SheetContent side="bottom" className="rounded-t-2xl p-0">
-        <div className="max-h-[88dvh] flex flex-col overflow-hidden">
+      <SheetContent side="bottom" className="rounded-t-2xl p-0 [--desktop-sheet-w:40rem]">
+        <div className="max-h-[88dvh] md:max-h-none md:h-full flex flex-col overflow-hidden">
           {/* Header */}
           <SheetHeader className="shrink-0 px-4 pt-4 pb-3 border-b border-border text-left space-y-0">
             <div className="flex items-start justify-between gap-3 pr-8">
@@ -344,22 +339,17 @@ export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps
                 <div className="space-y-2">
                   {rows.map((row, i) => (
                     <div key={i} className="flex items-center gap-2">
-                      <select
+                      <JobPicker
+                        jobs={jobs}
+                        entries={entries}
                         value={row.jobId}
-                        onChange={(ev) => setRows((prev) =>
-                          prev.map((r, j) => j === i ? { ...r, jobId: ev.target.value } : r))}
-                        className="flex-1 min-w-0 h-11 px-2 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-                        aria-label={`Allocation ${i + 1} job`}
-                      >
-                        <option value="">Overhead (no job)</option>
-                        {ranked.map(({ job, tier }) => (
-                          <option key={job.id} value={job.id}>
-                            {tier === 'active-match' ? '★ ' : ''}
-                            {job.name}
-                            {job.clientName ? ` — ${job.clientName}` : ''}
-                          </option>
-                        ))}
-                      </select>
+                        onChange={(id) => setRows((prev) =>
+                          prev.map((r, j) => j === i ? { ...r, jobId: id } : r))}
+                        context={parserRaw?.jobHint}
+                        noJobLabel="Overhead (no job)"
+                        placeholder="Overhead (no job)"
+                        className="flex-1 min-w-0"
+                      />
                       {i === 0 ? (
                         // Remainder row — derived, so the split always balances.
                         <span className={cn(

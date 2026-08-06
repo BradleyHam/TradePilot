@@ -46,26 +46,45 @@
   --radius-2xl: calc(var(--radius) * 1.8);
   --radius-3xl: calc(var(--radius) * 2.2);
   --radius-4xl: calc(var(--radius) * 2.6);
+
+  /* Soft, layered elevation — warm-neutral shadows tuned for a light,
+     paper-like UI. Named tokens (not overrides of shadow-sm/md) so existing
+     utilities keep their meaning; these add depth without hard edges.
+     Usage: shadow-card, shadow-elevated, shadow-nav, shadow-btn. */
+  --shadow-card:
+    0 1px 2px oklch(0.2 0.02 60 / 0.04),
+    0 2px 6px oklch(0.2 0.02 60 / 0.05);
+  --shadow-elevated:
+    0 2px 4px oklch(0.2 0.02 60 / 0.05),
+    0 8px 24px oklch(0.2 0.02 60 / 0.08);
+  --shadow-nav:
+    0 -1px 2px oklch(0.2 0.02 60 / 0.03),
+    0 -6px 20px oklch(0.2 0.02 60 / 0.05);
+  --shadow-btn:
+    0 1px 2px oklch(0.45 0.17 46 / 0.25),
+    0 1px 1px oklch(0.2 0.02 60 / 0.06);
 }
 
 :root {
   --primary: oklch(0.65 0.21 46);
   --primary-foreground: oklch(1 0 0);
-  --background: oklch(0.98 0 0);
-  --foreground: oklch(0.15 0 0);
+  /* Barely-warm off-white background so pure-white cards lift off the page.
+     The tint is subtle enough to read as neutral but gives the app warmth. */
+  --background: oklch(0.985 0.004 70);
+  --foreground: oklch(0.16 0.01 60);
   --card: oklch(1 0 0);
-  --card-foreground: oklch(0.15 0 0);
+  --card-foreground: oklch(0.16 0.01 60);
   --popover: oklch(1 0 0);
-  --popover-foreground: oklch(0.15 0 0);
-  --secondary: oklch(0.96 0.005 46);
-  --secondary-foreground: oklch(0.25 0 0);
-  --muted: oklch(0.96 0 0);
-  --muted-foreground: oklch(0.52 0 0);
-  --accent: oklch(0.96 0.01 46);
-  --accent-foreground: oklch(0.25 0 0);
+  --popover-foreground: oklch(0.16 0.01 60);
+  --secondary: oklch(0.965 0.006 60);
+  --secondary-foreground: oklch(0.25 0.01 60);
+  --muted: oklch(0.965 0.005 70);
+  --muted-foreground: oklch(0.53 0.012 60);
+  --accent: oklch(0.96 0.012 46);
+  --accent-foreground: oklch(0.25 0.01 60);
   --destructive: oklch(0.577 0.245 27.325);
-  --border: oklch(0.9 0 0);
-  --input: oklch(0.9 0 0);
+  --border: oklch(0.915 0.004 70);
+  --input: oklch(0.915 0.004 70);
   --ring: oklch(0.65 0.21 46);
   --chart-1: oklch(0.65 0.21 46);
   --chart-2: oklch(0.55 0.15 250);
@@ -123,8 +142,15 @@
   }
   body {
     @apply bg-background text-foreground;
+    -webkit-font-smoothing: antialiased;
+    -moz-osx-font-smoothing: grayscale;
+    text-rendering: optimizeLegibility;
   }
   html {
     @apply font-sans;
+  }
+  /* Tighten tracking on large headings for a more polished, premium feel. */
+  h1, h2 {
+    letter-spacing: -0.011em;
   }
 }

@@ -23,10 +23,12 @@ const LOST_REASONS: { value: LostReason; label: string }[] = [
   { value: 'scope-changed',     label: 'Scope changed' },
   { value: 'project-cancelled', label: 'Project cancelled' },
   { value: 'timing',            label: 'Timing didn’t work' },
-  // "We declined it" reasons — Brad turned the job down, the client
-  // didn't walk. Distinguishable from competitive losses in insights.
-  { value: 'too-far',           label: 'Too far away' },
-  { value: 'wrong-fit',         label: 'Not our kind of work' },
+  // 'too-far' and 'wrong-fit' used to live here as the "we declined it"
+  // reasons, back when 'lost' was the only terminal non-win status. They're
+  // now `status = 'declined'` + `declineReason` (migration 040), which keeps
+  // them out of the win rate where they never belonged. Deliberately NOT
+  // offered here any more — the honest answer is "Turn this one down" on the
+  // job detail sheet. Historical rows carrying them still render fine.
   { value: 'other',             label: 'Other' },
 ];
 

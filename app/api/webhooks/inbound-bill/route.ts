@@ -49,6 +49,7 @@ import { parseDuluxSecureLinkEmail } from '@/lib/dulux-email-parser';
 import { extractDuluxShortLink, fetchDuluxSecurePdf } from '@/lib/dulux-secure-fetch';
 import { rankJobs } from '@/lib/job-match';
 import { rowToJob, entryToRow } from '@/lib/supabase/mappers';
+import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
 import type { Entry, Job, ParsedBill } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -120,33 +121,8 @@ export async function POST(req: Request) {
     );
   }
 
-  let authenticated = false;
-  const headerSecret = req.headers.get('x-webhook-secret');
-  if (headerSecret && headerSecret === expectedSecret) {
-    authenticated = true;
-  }
-  if (!authenticated) {
-    const basicHeader = req.headers.get('authorization');
-    if (basicHeader?.toLowerCase().startsWith('basic ')) {
-      const b64 = basicHeader.slice('basic '.length).trim();
-      try {
-        const decoded = Buffer.from(b64, 'base64').toString('utf-8');
-        const colonIdx = decoded.indexOf(':');
-        if (colonIdx !== -1) {
-          const user = decoded.slice(0, colonIdx);
-          const pass = decoded.slice(colonIdx + 1);
-          if (user === expectedSecret || pass === expectedSecret) {
-            authenticated = true;
-          }
-        } else if (decoded === expectedSecret) {
-          // Some clients omit the colon entirely.
-          authenticated = true;
-        }
-      } catch {
-        // Malformed base64 — fall through to 401.
-      }
-    }
-  }
+  // Constant-time comparison via the shared helper (lib/webhook-auth.ts).
+  const authenticated = webhookRequestAuthenticated(req, expectedSecret);
 
   if (!authenticated) {
     return NextResponse.json(

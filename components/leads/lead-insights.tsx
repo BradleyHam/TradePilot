@@ -18,7 +18,8 @@
 // data (no empty axes staring back at him — the golden UX rule).
 
 import { useMemo, useState } from 'react';
-import type { Job, JobStatus, WorkType, LeadSource } from '@/lib/types';
+import type { Job, JobStatus, WorkType, LeadSource, Quote } from '@/lib/types';
+import { jobHasWorkType, jobWorkTypes, WORK_TYPE_LABELS } from '@/lib/types';
 import { ChevronDown, BarChart3, X, ChevronRight } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -27,11 +28,20 @@ import { cn } from '@/lib/utils';
 // isn't 'lost'). "Lost" = explicitly lost. 'lead' / 'quoted' are still open
 // and don't count either way — a quote you haven't heard back on isn't a loss
 // yet, and counting it as one would make the win-rate read pessimistically.
+//
+// 'declined' is neither won nor lost, ON PURPOSE. Brad turned that work down
+// (out of area, wrong fit, too busy); nobody outbid him and there was never a
+// contest to lose. Counting a good decision as a loss made the win rate
+// punish him for it, which is the whole reason the status exists. It falls
+// out of every ratio below for free by being in neither set — but it also
+// isn't "open", so `statusMeta` labels it explicitly rather than letting it
+// masquerade as a live lead in the drill-down list.
 const WON_STATUSES: ReadonlySet<JobStatus> = new Set<JobStatus>([
   'accepted', 'booked', 'in-progress', 'completed', 'invoiced', 'paid',
 ]);
 function isWon(j: Job): boolean { return WON_STATUSES.has(j.status); }
 function isLost(j: Job): boolean { return j.status === 'lost'; }
+function isDeclined(j: Job): boolean { return j.status === 'declined'; }
 function isClosed(j: Job): boolean { return isWon(j) || isLost(j); }
 
 // When did this lead actually come in? Prefer the explicit lead date; fall
@@ -131,9 +141,49 @@ const TIMEFRAME_OPTIONS: { value: TimeFrame; label: string }[] = [
 ];
 
 
+/**
+ * Days from quote-sent to acceptance for a single won job, or null if we
+ * can't tell honestly.
+ *
+ * Both halves must be real stamps. The quote side uses the same rule as the
+ * follow-up ladder — latest `dateSent`, preferring status='sent' rows so a
+ * superseded draft doesn't restart the clock — but WITHOUT that module's
+ * `job.updatedAt` fallback: updatedAt moves on every edit, so falling back to
+ * it here would manufacture a duration out of noise. A job with no quote row
+ * simply doesn't count.
+ *
+ * Negatives are dropped rather than clamped to 0. They mean the two stamps
+ * disagree — most likely a job backfilled by migration 041, where acceptedAt
+ * was approximated from updatedAt and can land before the quote went out. A
+ * fake zero would drag the average down and look like real data.
+ */
+function daysToAccept(job: Job, quotes: Quote[]): number | null {
+  if (!job.acceptedAt) return null;
+  const mine = quotes.filter((q) => q.jobId === job.id && q.dateSent);
+  if (mine.length === 0) return null;
+  const sentRows = mine.filter((q) => q.status === 'sent');
+  const pool = sentRows.length > 0 ? sentRows : mine;
+  const sentISO = pool.map((q) => q.dateSent!.slice(0, 10)).sort().at(-1)!;
+
+  // Midday local on the quote date, so a same-day acceptance reads as 0 and
+  // timezone drift can't push a next-morning yes back to -1.
+  const sent = new Date(`${sentISO}T12:00:00`).getTime();
+  const accepted = new Date(job.acceptedAt).getTime();
+  if (Number.isNaN(sent) || Number.isNaN(accepted)) return null;
+
+  const days = Math.round((accepted - sent) / 86400000);
+  return days < 0 ? null : days;
+}
+
 interface LeadInsightsProps {
   /** All jobs from the store (open + closed). */
   jobs: Job[];
+  /**
+   * All quote rows from the store. Only used for `dateSent` — the start of
+   * the quote→acceptance clock. Optional so the panel still renders (minus
+   * that one stat) if a caller hasn't wired it up.
+   */
+  quotes?: Quote[];
   /** Active work-type filter, or 'all'. Lifted to the page so it also
    *  filters the chase-list. */
   filter: WorkType | 'all';
@@ -150,10 +200,13 @@ interface LeadInsightsProps {
 function statusMeta(j: Job): { label: string; cls: string } {
   if (isWon(j)) return { label: 'Won', cls: 'bg-emerald-100 text-emerald-800 border-emerald-200' };
   if (isLost(j)) return { label: 'Lost', cls: 'bg-red-100 text-red-800 border-red-200' };
+  // Muted, not red — it's a decision, not a defeat, and it's excluded from
+  // every rate on this panel.
+  if (isDeclined(j)) return { label: 'Turned down', cls: 'bg-slate-100 text-slate-600 border-slate-200' };
   return { label: 'Open', cls: 'bg-muted text-muted-foreground border-border' };
 }
 
-export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJob }: LeadInsightsProps) {
+export function LeadInsights({ jobs, quotes, filter, onFilter, open, onToggle, onSelectJob }: LeadInsightsProps) {
   // Timeframe is local to the panel (it scopes the insights only, NOT the
   // chase-list — that's the work-type filter's job). Default 'all'.
   const [timeframe, setTimeframe] = useState<TimeFrame>('all');
@@ -183,7 +236,11 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
   const scoped = useMemo(() => {
     const { start, end } = dateWindow;
     return jobs.filter((j) => {
-      if (filter !== 'all' && j.workType !== filter) return false;
+      // Match on the full type set: an interior+exterior job belongs in
+      // BOTH the Interior and Exterior views. Consequence, deliberately
+      // accepted: multi-type jobs are counted in more than one bucket, so
+      // the per-type counts can sum to more than the job total.
+      if (filter !== 'all' && !jobHasWorkType(j, filter)) return false;
       if (start || end) {
         const d = leadDayISO(j);
         if (!d) return false;
@@ -198,7 +255,7 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
   // data, so a one-man painter isn't staring at empty "Roof" tabs.
   const typesPresent = useMemo(() => {
     const present = new Set<WorkType>();
-    for (const j of jobs) if (j.workType) present.add(j.workType);
+    for (const j of jobs) for (const t of jobWorkTypes(j)) present.add(t);
     return WORK_TYPES.filter((t) => present.has(t));
   }, [jobs]);
 
@@ -210,6 +267,34 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
     const rate = closed > 0 ? Math.round((won / closed) * 100) : null;
     return { won, lost, closed, rate };
   }, [scoped]);
+
+  // ── Speed to yes ──────────────────────────────────────────────────────────
+  // How long customers take to accept, measured quote-sent → accepted.
+  //
+  // Median AND mean, because they answer different questions and one alone
+  // misleads. Quote-decision times are right-skewed — most come back inside a
+  // fortnight, then one job sits for four months and re-appears. The mean is
+  // the number Brad asked for; the median is the one that describes a typical
+  // customer. Showing both makes the skew visible instead of hiding it.
+  //
+  // `sample` is displayed for the same reason: an average over 2 jobs is a
+  // coincidence, not a metric, and Brad should be able to see which he's got.
+  const speedToYes = useMemo(() => {
+    if (!quotes || quotes.length === 0) return null;
+    const days = scoped
+      .filter(isWon)
+      .map((j) => daysToAccept(j, quotes))
+      .filter((d): d is number => d !== null)
+      .sort((a, b) => a - b);
+    if (days.length === 0) return null;
+
+    const mean = Math.round(days.reduce((s, d) => s + d, 0) / days.length);
+    const mid = Math.floor(days.length / 2);
+    const median = days.length % 2 === 0
+      ? Math.round((days[mid - 1] + days[mid]) / 2)
+      : days[mid];
+    return { mean, median, sample: days.length, fastest: days[0], slowest: days[days.length - 1] };
+  }, [scoped, quotes]);
 
   // ── Leads over time (week or month buckets, spanning the timeframe) ─────────
   const perWeek = useMemo(() => {
@@ -284,7 +369,7 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
   const byType = useMemo(() => {
     return typesPresent
       .map((t) => {
-        const rows = scoped.filter((j) => j.workType === t);
+        const rows = scoped.filter((j) => jobHasWorkType(j, t));
         const won = rows.filter(isWon).length;
         const closed = rows.filter(isClosed).length;
         return { type: t, count: rows.length, won, closed, rate: closed > 0 ? Math.round((won / closed) * 100) : null };
@@ -293,7 +378,10 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
       .sort((a, b) => b.count - a.count);
   }, [scoped, typesPresent]);
 
-  const untyped = useMemo(() => scoped.filter((j) => !j.workType).length, [scoped]);
+  const untyped = useMemo(
+    () => scoped.filter((j) => jobWorkTypes(j).length === 0).length,
+    [scoped],
+  );
 
   // ── By source + avg quote value ────────────────────────────────────────────
   const bySource = useMemo(() => {
@@ -426,6 +514,32 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
             <p className="text-xs text-muted-foreground">No closed quotes in this period yet — win rate appears once you&apos;ve won or lost a quote.</p>
           ))}
 
+          {/* Speed to yes — quote sent → accepted. Silent when there's no
+              honest sample (no acceptedAt stamps yet, or no quote rows to
+              start the clock), rather than showing a hollow "—". */}
+          {speedToYes && (
+            <section className="space-y-2">
+              <div className="flex items-baseline justify-between">
+                <h3 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide">Speed to yes</h3>
+                <span className="text-xs text-muted-foreground">
+                  from {speedToYes.sample} {speedToYes.sample === 1 ? 'quote' : 'quotes'}
+                </span>
+              </div>
+              <div className="flex items-baseline gap-2">
+                <span className="text-2xl font-bold tabular-nums">{speedToYes.mean}</span>
+                <span className="text-sm text-muted-foreground">
+                  {speedToYes.mean === 1 ? 'day' : 'days'} on average
+                </span>
+              </div>
+              <p className="text-xs text-muted-foreground">
+                Typically {speedToYes.median} {speedToYes.median === 1 ? 'day' : 'days'}
+                {speedToYes.slowest !== speedToYes.fastest && (
+                  <> · fastest {speedToYes.fastest}, slowest {speedToYes.slowest}</>
+                )}
+              </p>
+            </section>
+          )}
+
           {/* Leads over time */}
           {perWeek.total > 0 && (
             <section className="space-y-2">
@@ -526,8 +640,12 @@ export function LeadInsights({ jobs, filter, onFilter, open, onToggle, onSelectJ
                             >
                               <div className="flex-1 min-w-0">
                                 <p className="text-sm text-foreground truncate">{j.name}</p>
-                                {j.workType && (
-                                  <p className="text-[11px] text-muted-foreground capitalize">{j.workType}</p>
+                                {/* All the types, not just the summary —
+                                    "Interior · Exterior" beats "mixed". */}
+                                {jobWorkTypes(j).length > 0 && (
+                                  <p className="text-[11px] text-muted-foreground">
+                                    {jobWorkTypes(j).map((t) => WORK_TYPE_LABELS[t]).join(' · ')}
+                                  </p>
                                 )}
                               </div>
                               <span className={cn('shrink-0 px-2 py-0.5 rounded-md text-[11px] font-medium border', st.cls)}>

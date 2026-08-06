@@ -42,8 +42,10 @@ export default function SetPasswordPage() {
     const { error: updErr } = await supabase.auth.updateUser({ password });
     if (updErr) { setError(updErr.message); setStatus('ready'); return; }
     setStatus('done');
-    // Employees land on their hours screen; RoleGuard sorts the rest.
-    setTimeout(() => router.replace('/my/hours'), 1200);
+    // Send everyone to the app home. Owners (e.g. a password reset) stay on
+    // /entry; employees get bounced to /my/hours by RoleGuard. This keeps the
+    // one page working for both the invite flow and forgot-password resets.
+    setTimeout(() => router.replace('/entry'), 1200);
   }
 
   return (
