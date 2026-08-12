@@ -18,6 +18,7 @@
 import { NextResponse } from 'next/server';
 import { createClient, SupabaseClient } from '@supabase/supabase-js';
 import { secretMatches } from '@/lib/webhook-auth';
+import { sendBusinessNotificationSafe } from '@/lib/push-notify';
 
 // Don't try to prerender or static-optimise this route. It runs on demand.
 export const dynamic = 'force-dynamic';
@@ -218,6 +219,18 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
+
+  // Instant push — same rationale as the Tapi/email lead webhooks:
+  // speed-to-lead wins jobs, and website enquiries otherwise sit
+  // unseen until the app is next opened. Keyed on the job id so a
+  // form double-submit that got past dedupe can't double-buzz.
+  await sendBusinessNotificationSafe(admin, businessId, {
+    ruleKey: 'lead-arrived',
+    dedupeKey: inserted.id as string,
+    title: 'New lead (website)',
+    body: `${jobName}${name ? ` — ${name}` : ''}`,
+    url: '/leads',
+  });
 
   return NextResponse.json({ ok: true, jobId: inserted.id });
 }

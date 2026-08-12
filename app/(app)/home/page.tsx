@@ -24,7 +24,7 @@ import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
 import { rankJobs } from '@/lib/job-match';
 import { JobPicker } from '@/components/shared/job-picker';
-import type { ScheduleItem, ScheduleItemType, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason } from '@/lib/types';
+import type { ScheduleItem, ScheduleItemType, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason, DepositNotYetReason } from '@/lib/types';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
 import { QuoteCatchUpSheet } from '@/components/jobs/quote-catch-up-sheet';
 import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
@@ -58,7 +58,7 @@ import {
   Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
   Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split, Send,
-  Paintbrush, History,
+  Paintbrush, History, Settings,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
@@ -387,14 +387,20 @@ export default function HomePage() {
   // list self-clearing the moment the deposit is sent (or the job moves on).
   // Oldest-accepted first: the one most likely to have been forgotten floats
   // to the top.
+  // "Not yet" (migration 045) quiets a row without issuing anything:
+  // 'no_deposit' means no deposit is coming at all (hidden until the
+  // reason is cleared from the job sheet); any other reason pairs with
+  // depositSnoozeUntil and the row flows back when the date passes.
   const depositsToSend = useMemo(() => {
     return jobs
       .filter((j) =>
         j.status === 'accepted'
-        && !invoices.some((i) => i.jobId === j.id && i.kind === 'deposit'),
+        && !invoices.some((i) => i.jobId === j.id && i.kind === 'deposit')
+        && j.depositNotYetReason !== 'no_deposit'
+        && !(j.depositSnoozeUntil && j.depositSnoozeUntil > todayISO),
       )
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
-  }, [jobs, invoices]);
+  }, [jobs, invoices, todayISO]);
 
   // Quoted jobs gone quiet — the follow-up ladder (7d nudge → 3wk
   // "either way" message → a week later, prompt to mark lost). All the
@@ -490,7 +496,25 @@ export default function HomePage() {
 
   return (
     <div className="flex flex-col min-h-full">
-      <PageHeader title="This week" subtitle={subtitle} />
+      <PageHeader
+        title="This week"
+        subtitle={subtitle}
+        // Settings has no home on the phone — the bottom nav is full at
+        // seven tabs and the sidebar link is desktop-only, which left
+        // /settings (notifications toggle, Team, GST, quote template)
+        // unreachable on mobile. A gear on the Home header is the
+        // standard phone pattern; hidden on md+ where the sidebar link
+        // already covers it. 44px tap target per the golden rule.
+        action={
+          <Link
+            href="/settings"
+            aria-label="Settings"
+            className="md:hidden flex items-center justify-center w-11 h-11 -mr-2 rounded-xl text-muted-foreground hover:bg-muted active:bg-muted transition-colors"
+          >
+            <Settings size={20} strokeWidth={1.8} />
+          </Link>
+        }
+      />
 
       <div className="px-4 md:px-6 pb-6 space-y-4 w-full max-w-2xl mx-auto">
         {/* Quick add lives at the top: opening the app at 7am or 5:30pm,
@@ -601,6 +625,18 @@ export default function HomePage() {
             jobs={jobs}
             todayISO={todayISO}
             onIssueDeposit={(job) => setDepositForJob(job)}
+            // "Not yet" on a deposit card. 'no_deposit' is a decision (no
+            // wake date — the row is gone until the reason is cleared);
+            // "will sort in person" gets a week (you'll see them soon);
+            // the other delays get a fortnight.
+            onDepositNotYet={(job, reason) =>
+              updateJob(job.id, {
+                depositNotYetReason: reason,
+                depositSnoozeUntil: reason === 'no_deposit'
+                  ? ''
+                  : formatISODate(addDays(parseISODate(todayISO), reason === 'in_person' ? 7 : 14)),
+              })
+            }
             // "Followed up" on a quote flag — Brad chased, but this button
             // doesn't know how, so 'other' rather than a guess.
             onFollowedUp={(jobId) =>
@@ -608,6 +644,14 @@ export default function HomePage() {
             }
             onMarkLost={(jobId) =>
               updateJob(jobId, { status: 'lost', lostReason: 'no-reply' })
+            }
+            // "Give it a week" on a follow-up card. snoozeUntil hides the
+            // job from the ladder (lib/quote-follow-up.ts), the Leads
+            // lists AND the push notifications until the date passes,
+            // then everything resumes by itself — one field, all
+            // surfaces agree.
+            onSnoozeFollowUp={(jobId, untilISO) =>
+              updateJob(jobId, { snoozeUntil: untilISO })
             }
             onMarkInvoicePaid={(id, paidDate) => markInvoicePaid(id, paidDate)}
             onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
@@ -1320,8 +1364,8 @@ function WeekStatsSection({
 function MoneyFlagsCard({
   overdueInvoices, billsDueSoon, billDrafts, depositsToSend, quoteFollowUps, jobImports, jobs, todayISO,
   onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onConfirmDraftSplit, onDeleteDraft,
-  onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip, onIssueDeposit,
-  onFollowedUp, onMarkLost,
+  onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip, onIssueDeposit, onDepositNotYet,
+  onFollowedUp, onMarkLost, onSnoozeFollowUp,
 }: {
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
@@ -1332,8 +1376,10 @@ function MoneyFlagsCard({
   jobs: Job[];
   todayISO: string;
   onIssueDeposit: (job: Job) => void;
+  onDepositNotYet: (job: Job, reason: DepositNotYetReason) => void;
   onFollowedUp: (jobId: string) => void;
   onMarkLost: (jobId: string) => void;
+  onSnoozeFollowUp: (jobId: string, untilISO: string) => void;
   onMarkInvoicePaid: (invoiceId: string, paidDate: string) => void;
   onMarkBillPaid: (entryId: string, paidDate: string) => void;
   onConfirmDraft: (entryId: string, payload: { jobId: string | null; materials: MaterialInit[] }) => void;
@@ -1374,13 +1420,16 @@ function MoneyFlagsCard({
           <DepositToSendFlag
             jobs={depositsToSend}
             onIssueDeposit={onIssueDeposit}
+            onNotYet={onDepositNotYet}
           />
         )}
         {quoteFollowUps.length > 0 && (
           <QuoteFollowUpsFlag
             followUps={quoteFollowUps}
+            todayISO={todayISO}
             onFollowedUp={onFollowedUp}
             onMarkLost={onMarkLost}
+            onSnooze={onSnoozeFollowUp}
           />
         )}
         {overdueInvoices.length > 0 && (
@@ -1481,14 +1530,25 @@ function DepositToSendFlag({
 // day 7 → first nudge, day 21 → the short "either way" message, and a week
 // of silence after that → prompt to mark the job lost. One row per job,
 // showing only the most urgent stage. "Followed up" stamps lastContactedDate
-// (same as the Leads page's Mark contacted) so the row self-clears; Mark
-// lost is two-tap (inline confirm) because it changes the job's status.
+// (same as the Leads page's Mark contacted) so the row self-clears.
+//
+// Every card also gets the two "I'm not doing this today" outs (added
+// August 2026 — before that, a first-stage card offered ONLY chasing,
+// and an unactionable nag is a nag that gets ignored):
+//   - "Give it a week" → snoozeUntil +7d. Hides the job from the
+//     ladder, the Leads lists and push notifications, then resumes on
+//     its own. For the "they said they're deciding next week" case.
+//   - "Stop chasing" → two-tap Mark lost (no-reply), same as the old
+//     close-stage control but available at every stage — Brad decides
+//     when a lead is dead, not the ladder.
 function QuoteFollowUpsFlag({
-  followUps, onFollowedUp, onMarkLost,
+  followUps, todayISO, onFollowedUp, onMarkLost, onSnooze,
 }: {
   followUps: QuoteFollowUp[];
+  todayISO: string;
   onFollowedUp: (jobId: string) => void;
   onMarkLost: (jobId: string) => void;
+  onSnooze: (jobId: string, untilISO: string) => void;
 }) {
   const [open, setOpen] = useState(false);
 
@@ -1607,9 +1667,20 @@ function QuoteFollowUpsFlag({
                   >
                     Followed up
                   </button>
-                  {f.stage !== 'first' && (
-                    <MarkLostControl onConfirm={() => onMarkLost(f.job.id)} />
-                  )}
+                </div>
+                <div className="flex items-center gap-1.5">
+                  <button
+                    type="button"
+                    onClick={(e) => {
+                      e.stopPropagation();
+                      onSnooze(f.job.id, formatISODate(addDays(parseISODate(todayISO), 7)));
+                    }}
+                    className="flex-1 h-11 px-3 rounded-full border border-border bg-background text-foreground text-xs font-semibold hover:bg-accent transition-colors active:scale-95"
+                    title="Snooze this one for a week — it drops off Home, Leads and notifications, then comes back by itself"
+                  >
+                    Give it a week
+                  </button>
+                  <MarkLostControl onConfirm={() => onMarkLost(f.job.id)} />
                 </div>
               </li>
             );
@@ -1621,10 +1692,13 @@ function QuoteFollowUpsFlag({
 }
 
 /**
- * Two-tap Mark lost. First tap arms it ("Sure?"), second confirms.
- * Status changes are recoverable from the job sheet, but a fat-finger
- * at 5:30pm shouldn't silently kill a live lead — hence the confirm.
- * Disarms itself after a few seconds if the second tap never comes.
+ * Two-tap "Stop chasing" → Mark lost. First tap arms it ("Mark
+ * lost?"), second confirms. Status changes are recoverable from the
+ * job sheet, but a fat-finger at 5:30pm shouldn't silently kill a
+ * live lead — hence the confirm. Disarms itself after a few seconds
+ * if the second tap never comes. The armed label says exactly what
+ * the second tap does — "Stop chasing" alone could read as "just
+ * mute the reminders", and that's the OTHER button.
  */
 function MarkLostControl({ onConfirm }: { onConfirm: () => void }) {
   const [armed, setArmed] = useState(false);
@@ -1642,14 +1716,14 @@ function MarkLostControl({ onConfirm }: { onConfirm: () => void }) {
         }
       }}
       className={cn(
-        'shrink-0 h-11 px-3 rounded-full border text-xs font-semibold transition-colors active:scale-95',
+        'flex-1 h-11 px-3 rounded-full border text-xs font-semibold transition-colors active:scale-95',
         armed
           ? 'bg-red-600 border-red-600 text-white'
           : 'border-red-200 text-red-700 bg-red-50 hover:bg-red-100',
       )}
-      title="Mark this job as lost (no reply)"
+      title="Not following this one up — marks the job as lost (no reply)"
     >
-      {armed ? 'Sure?' : 'Mark lost'}
+      {armed ? 'Mark lost?' : 'Stop chasing'}
     </button>
   );
 }

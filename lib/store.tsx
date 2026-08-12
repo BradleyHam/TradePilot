@@ -474,6 +474,16 @@ interface StoreState {
   addQuoteAttachments: (
     quoteId: string,
     files: { file: File; kind: QuoteAttachmentKind; skipCompression?: boolean }[],
+    options?: {
+      /**
+       * Called after each file finishes (success OR failure) with the
+       * number done so far and the batch total. Lets callers show live
+       * "Uploading 3 of 8…" progress instead of a frozen spinner — see
+       * SiteVisitWrapUpSheet, where a 10-photo save used to sit on a
+       * static "Saving…" for a minute.
+       */
+      onProgress?: (done: number, total: number) => void;
+    },
   ) => Promise<{ inserted: number; failed: number; ids: string[] }>;
 
   /**
@@ -1817,9 +1827,15 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
    *   3. Insert a quote_attachments row.
    *   4. Mirror into local state.
    *
-   * Files are processed sequentially so a slow connection doesn't
-   * thrash the network. Each failure is logged but doesn't abort the
-   * batch — the user gets a partial success summary at the end.
+   * Files are processed with limited concurrency (3 in flight at a
+   * time) — enough parallelism that an 8-photo wrap-up doesn't take a
+   * minute of strictly-serial round-trips, capped so a slow rural
+   * connection isn't saturated by 10 simultaneous uploads. Each failure
+   * is logged but doesn't abort the batch — the user gets a partial
+   * success summary at the end.
+   *
+   * `options.onProgress(done, total)` fires as each file settles
+   * (success or failure), so callers can render live progress.
    *
    * Filenames are sanitised to ASCII-safe characters because Supabase
    * Storage rejects some Unicode patterns; the original name is
@@ -1828,14 +1844,29 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const addQuoteAttachments = useCallback(async (
     quoteId: string,
     files: { file: File; kind: QuoteAttachmentKind; skipCompression?: boolean }[],
+    options?: { onProgress?: (done: number, total: number) => void },
   ): Promise<{ inserted: number; failed: number; ids: string[] }> => {
     if (!businessId || files.length === 0) return { inserted: 0, failed: 0, ids: [] };
+    // Capture the narrowed value — the `!businessId` guard above doesn't
+    // propagate into the nested processOne closure, so TS sees
+    // `string | null` again inside it.
+    const biz = businessId;
 
+    const total = files.length;
     let inserted = 0;
     let failed = 0;
-    const ids: string[] = [];
+    let done = 0;
+    // ids collected per-slot then flattened, so the order of the result
+    // matches the order files were passed in even though slots finish
+    // out of order. Callers (e.g. testimonial panel) index into ids.
+    const idSlots: (string | null)[] = new Array(total).fill(null);
 
-    for (const { file, kind, skipCompression } of files) {
+    // Process one file end-to-end: compress → upload → insert row.
+    // Returns nothing; records its outcome in the shared counters.
+    // Counter updates are safe without locks — JS is single-threaded,
+    // and each `await` boundary only interleaves whole statements.
+    async function processOne(index: number): Promise<void> {
+      const { file, kind, skipCompression } = files[index];
       try {
         // Compress images. Non-images pass through unchanged. Callers can
         // opt out (skipCompression) for images that are already optimally
@@ -1850,7 +1881,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         }
 
         const safeName = prepared.name.replace(/[^a-zA-Z0-9._-]+/g, '_');
-        const storagePath = `${businessId}/${quoteId}/${crypto.randomUUID()}__${safeName}`;
+        const storagePath = `${biz}/${quoteId}/${crypto.randomUUID()}__${safeName}`;
 
         const { error: upErr } = await supabase.storage
           .from('quote-attachments')
@@ -1861,13 +1892,13 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (upErr) {
           console.error('[addQuoteAttachments] upload failed for', file.name, '—', describeError(upErr));
           failed++;
-          continue;
+          return;
         }
 
         const { data: insData, error: insErr } = await supabase
           .from('quote_attachments')
           .insert(quoteAttachmentToRow({
-            businessId,
+            businessId: biz,
             quoteId,
             kind,
             storagePath,
@@ -1883,23 +1914,40 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           // leak quota for rows that never got a DB record.
           await supabase.storage.from('quote-attachments').remove([storagePath]).catch(() => {});
           failed++;
-          continue;
+          return;
         }
 
         const persisted = rowToQuoteAttachment(insData);
         setQuoteAttachments((prev) => [persisted, ...prev]);
-        ids.push(persisted.id);
+        idSlots[index] = persisted.id;
         inserted++;
       } catch (err) {
         console.error('[addQuoteAttachments] unexpected error for', file.name, err);
         failed++;
+      } finally {
+        done++;
+        options?.onProgress?.(done, total);
       }
     }
+
+    // Simple worker pool: N workers each pull the next un-claimed index.
+    const CONCURRENCY = 3;
+    let nextIndex = 0;
+    const workers = Array.from(
+      { length: Math.min(CONCURRENCY, total) },
+      async () => {
+        while (nextIndex < total) {
+          const index = nextIndex++;
+          await processOne(index);
+        }
+      },
+    );
+    await Promise.all(workers);
 
     if (failed > 0) {
       setError(`${failed} of ${files.length} uploads failed — check console for details.`);
     }
-    return { inserted, failed, ids };
+    return { inserted, failed, ids: idSlots.filter((id): id is string => id !== null) };
   }, [businessId]);
 
   /**

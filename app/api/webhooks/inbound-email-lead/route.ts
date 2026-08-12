@@ -41,6 +41,7 @@ import {
 } from '@/lib/email-lead-parser';
 import { quoteToRow, quoteAttachmentToRow } from '@/lib/supabase/mappers';
 import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
+import { sendBusinessNotificationSafe } from '@/lib/push-notify';
 import type { QuoteAttachmentKind } from '@/lib/types';
 
 export const runtime = 'nodejs';
@@ -366,6 +367,18 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
+
+  // Instant push — same rationale as the Tapi webhook: forwarded
+  // enquiries land silently, and speed-to-lead wins jobs. Fired before
+  // the attachment pass (a slow upload shouldn't delay the buzz);
+  // keyed on the job id so retries can't double-buzz. Best-effort.
+  await sendBusinessNotificationSafe(admin, businessId, {
+    ruleKey: 'lead-arrived',
+    dedupeKey: inserted.id as string,
+    title: 'New lead (email)',
+    body: `${lead.name}${lead.clientName ? ` — ${lead.clientName}` : ''}`,
+    url: '/leads',
+  });
 
   // ── 7. Save any enquiry attachments (photos, plan PDFs) onto the lead ────
   // Best-effort: a storage/upload hiccup must never lose the lead we just

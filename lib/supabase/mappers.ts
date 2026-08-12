@@ -84,6 +84,8 @@ export function rowToJob(r: Row): Job {
     declineReason: asString(r.decline_reason),
     declinedFromStatus: asString(r.declined_from_status) as JobStatus | undefined,
     snoozeUntil: asString(r.snooze_until),
+    depositNotYetReason: asString(r.deposit_not_yet_reason) as Job['depositNotYetReason'],
+    depositSnoozeUntil: asString(r.deposit_snooze_until),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };
@@ -196,6 +198,10 @@ export function jobToRow(j: Partial<Job>): Row {
   if (j.declinedFromStatus !== undefined) out.declined_from_status = j.declinedFromStatus || null;
   // Empty string un-snoozes; a YYYY-MM-DD date snoozes until then.
   if (j.snoozeUntil !== undefined) out.snooze_until = j.snoozeUntil || null;
+  // Deposit "Not yet" pair (045). Empty string clears either one; the two
+  // move independently ('no_deposit' has a reason but no wake date).
+  if (j.depositNotYetReason !== undefined) out.deposit_not_yet_reason = j.depositNotYetReason || null;
+  if (j.depositSnoozeUntil !== undefined) out.deposit_snooze_until = j.depositSnoozeUntil || null;
   return out;
 }
 

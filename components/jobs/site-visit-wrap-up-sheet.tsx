@@ -284,6 +284,13 @@ export function SiteVisitWrapUpSheet({
   const [planDragActive, setPlanDragActive] = useState(false);
 
   const [saving, setSaving] = useState(false);
+  // Live upload progress. null while not uploading (including the
+  // job-save phase before uploads start). Drives the "Uploading 3 of 8…"
+  // button label + the slim progress bar — without it a 10-photo save
+  // sits on a frozen "Saving…" for the better part of a minute on rural
+  // mobile data, which reads as "the app is broken" rather than
+  // "the photos are on their way". Loud progress, not silent stall.
+  const [uploadProgress, setUploadProgress] = useState<{ done: number; total: number } | null>(null);
 
   // Sensible default for quote-ready-by: 2 days from now. Customers
   // hear "I'll get the quote to you in a couple of days" and the app
@@ -625,7 +632,14 @@ export function SiteVisitWrapUpSheet({
               kind: 'plan' as QuoteAttachmentKind,
             })),
           ];
-          await addQuoteAttachments(quoteId, batch);
+          // Kick off progress at 0 BEFORE the call so the button flips
+          // from "Saving…" to "Uploading 1 of N…" immediately — the
+          // first file's compress step alone can take a couple of
+          // seconds on a phone, and that gap used to look like a hang.
+          setUploadProgress({ done: 0, total: batch.length });
+          await addQuoteAttachments(quoteId, batch, {
+            onProgress: (done, total) => setUploadProgress({ done, total }),
+          });
         }
         // If quoteId is null, the user gets a soft failure — the job
         // patches still succeed, the files just didn't upload. Better
@@ -639,13 +653,18 @@ export function SiteVisitWrapUpSheet({
       onSaved(resolvedJobId, askVisitDate ? { visitDate } : {});
     } finally {
       setSaving(false);
+      setUploadProgress(null);
     }
   }
 
   if (!target) return null;
 
   return (
-    <Sheet open={open} onOpenChange={(o) => { if (!o) onCancel(); }}>
+    // While saving, swallow dismiss gestures (swipe-down / tap-outside) —
+    // the Skip button is already disabled, but the sheet itself could
+    // still be swiped away mid-upload, hiding the progress bar while
+    // files were still in flight and inviting a duplicate re-save.
+    <Sheet open={open} onOpenChange={(o) => { if (!o && !saving) onCancel(); }}>
       <SheetContent
         side="bottom"
         className="rounded-t-2xl max-h-[92dvh] overflow-y-auto"
@@ -1261,6 +1280,27 @@ export function SiteVisitWrapUpSheet({
             />
           </div>
 
+          {/* Upload progress — only while files are actually moving.
+              A slim determinate bar + count beats a spinner here: an
+              8-photo save on rural mobile data legitimately takes tens
+              of seconds, and the visible tick from "2 of 8" to "3 of 8"
+              is what tells Brad it's working, not wedged. */}
+          {saving && uploadProgress && (
+            <div className="pt-1">
+              <div className="h-1.5 rounded-full bg-muted overflow-hidden">
+                <div
+                  className="h-full rounded-full bg-primary transition-all duration-300"
+                  style={{
+                    width: `${Math.round((uploadProgress.done / Math.max(uploadProgress.total, 1)) * 100)}%`,
+                  }}
+                />
+              </div>
+              <p className="mt-1.5 text-[11px] text-muted-foreground text-center">
+                Keep this open until the upload finishes — nearly there.
+              </p>
+            </div>
+          )}
+
           <div className="flex gap-2 pt-2">
             <Button
               variant="outline"
@@ -1279,7 +1319,11 @@ export function SiteVisitWrapUpSheet({
               disabled={saving || (askVisitDate && !visitDate)}
             >
               {saving
-                ? 'Saving…'
+                ? uploadProgress
+                  // done+1 = the file currently in flight (clamped so the
+                  // last file reads "8 of 8", not "9 of 8").
+                  ? `Uploading ${Math.min(uploadProgress.done + 1, uploadProgress.total)} of ${uploadProgress.total}…`
+                  : 'Saving…'
                 : (() => {
                     // Build a fileset summary so Brad knows what's about
                     // to upload — e.g. "Save + upload 4 photos + 2 plans".

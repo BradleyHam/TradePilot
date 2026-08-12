@@ -695,9 +695,37 @@ export interface Job {
    * un-snoozes now.
    */
   snoozeUntil?: string;
+  /**
+   * Why the deposit hasn't been issued yet — the pill picked on the Home
+   * "Deposits to send" flag's "Not yet" flow (migration 045). Most reasons
+   * pair with `depositSnoozeUntil` for a temporary quieting; 'no_deposit'
+   * hides the job from the flag for good (no deposit is coming — small job,
+   * trusted client, or tender/progress-claim terms). Clearing it ('' → null)
+   * puts the job back on the flag.
+   */
+  depositNotYetReason?: DepositNotYetReason;
+  /**
+   * Local date (YYYY-MM-DD). While in the future, the job is hidden from
+   * the "Deposits to send" flag; on/after this date it flows back in
+   * automatically. Same shape as `snoozeUntil`, deliberately separate —
+   * snoozing a lead chase and quieting a deposit nag are different
+   * decisions. Clearing it ('' → null) un-snoozes now.
+   */
+  depositSnoozeUntil?: string;
   createdAt: string;
   updatedAt: string;
 }
+
+/**
+ * The "Not yet" pills on the Home deposits flag. All but 'no_deposit' are
+ * delays (the flag comes back on `depositSnoozeUntil`); 'no_deposit' is a
+ * decision — this job simply isn't getting a deposit invoice.
+ */
+export type DepositNotYetReason =
+  | 'dates_not_locked'
+  | 'client_hold'
+  | 'in_person'
+  | 'no_deposit';
 
 export interface Entry {
   id: string;

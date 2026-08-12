@@ -554,6 +554,98 @@ named "Exterior repaint — 99 Smoke Test Lane"; decline/delete it afterwards.
 
 ---
 
+## Push notifications (shipped August 2026)
+
+Web push to the installed PWA — roadmap item #4, "Tomorrow: McLeod 8am,
+Dulux bill due". iOS supports web push for Home-Screen-installed PWAs
+(16.4+), which is exactly what's on Brad's phone.
+
+**Architecture.** Three layers, all dependency-free:
+
+- `lib/web-push.ts` — VAPID (RFC 8292) + aes128gcm payload encryption
+  (RFC 8291), hand-rolled on node:crypto for the same reason as
+  `lib/zip-download.ts` (npm installs in the agent workspace break the
+  Mac's esbuild). **Verified byte-for-byte against the RFC 8291
+  Appendix A test vector** — `npx tsx scripts/test-web-push-crypto.ts`.
+  If that script passes, Apple/Google will accept our messages.
+- `lib/push-notify.ts` — `sendBusinessNotification()`: claims
+  `(business_id, rule_key, dedupe_key)` in `notification_log` via
+  insert-first (idempotent under cron overlap), fans out to every row
+  in `push_subscriptions`, prunes dead subscriptions on 404/410.
+  **The claim-before-send order is deliberate** — a transient push
+  outage can eat one reminder, but nothing can ever double-send.
+  Zero subscriptions → bails WITHOUT claiming, so pre-subscribe state
+  isn't burned.
+- `lib/notification-rules.ts` — pure rule evaluation (no I/O, mirrors
+  `lib/payroll.ts`). `npx tsx scripts/test-notification-rules.ts`
+  covers every rule against fixture worlds.
+
+**The anti-nag contract** (the most important design rule): a rule
+never re-fires the same dedupe key. Escalation is a NEW key per state
+(`t1` → `t0` → `late`), each once, ever. Everything self-clears when
+Brad does the thing (sends the quote, logs a contact, ticks eiFiled).
+Repeat-nagging trains the user to ignore push — then the important
+ones die with the noise. Keep this property when adding rules.
+
+**Rules (v1):** quote promises (`jobs.quote_ready_by` — due tomorrow /
+today / overdue), uncontacted leads (24h + 3d, skipped when
+`quote_ready_by` implies contact or the job is snoozed), quote
+follow-ups (`follow_up_date`), EI payday filing + monthly PAYE (reuses
+`lib/payroll.ts` date math so push and Home flags can't disagree), GST
+(pure date math, odd-month two-monthly cycle with the Mar→7-May and
+Nov→15-Jan exceptions — fix `gstDueDateForPeriodEnd` if myIR says the
+cycle differs), and a single tagged morning digest (today's schedule +
+attention counts; skipped entirely on a nothing-day).
+
+**Delivery paths:**
+
+- Daily: Vercel Cron (`vercel.json`) → `GET /api/cron/notifications`
+  at 18:45 UTC ≈ 6:45am NZST / 7:45am NZDT. Hobby-tier cron is
+  once-a-day with loose timing, so every rule survives late/missed
+  runs (state conditions, not exact-day matches). Auth: Vercel sends
+  `Authorization: Bearer <CRON_SECRET>`; `?token=<CRON_SECRET>` works
+  for manual testing and the response JSON says what fired/deduped.
+  Caps at 6 sends/run so a first-enable backlog isn't a push storm.
+- Instant: the three lead webhooks (tapi / email / website-enquiry)
+  fire a `lead-arrived` push right after their insert, keyed on the
+  job id, via the never-throwing `sendBusinessNotificationSafe` — a
+  push failure can't 500 a captured lead.
+
+**Client side.** `public/sw.js` (push + notificationclick ONLY — no
+fetch caching on purpose; a stale-cache bug in a money app is worse
+than no offline). Settings → Preferences → Notifications is a live
+toggle (`components/settings/notifications-row.tsx`): registers the SW,
+asks permission inside the tap gesture (Safari requirement), subscribes,
+POSTs to `/api/push/subscribe` (bearer-token owner auth, same pattern
+as `/api/employees`), and the route pushes a "Notifications are on"
+confirmation straight back to that device. Employees don't get push in
+v1 — every rule is money/pipeline state they're deliberately blind to.
+
+**Tables** (migration `044_push_notifications.sql`): `push_subscriptions`
+(endpoint unique → upsert key; owner-only RLS) and `notification_log`
+(the dedupe ledger; owner-read RLS, service-role writes).
+
+**Env vars (Vercel AND `.env.local`):**
+- `NEXT_PUBLIC_VAPID_PUBLIC_KEY` — public; the browser subscribes with
+  it, the sender signs with its pair. Changing it orphans every
+  existing subscription (each device must re-toggle) — don't rotate
+  casually.
+- `VAPID_PRIVATE_KEY` — secret pair of the above.
+- `VAPID_SUBJECT` — `mailto:` contact sent to the push services.
+- `CRON_SECRET` — Vercel injects it on cron calls; also the manual
+  test token.
+- Reuses `TRADEPILOT_BUSINESS_ID`, `SUPABASE_SERVICE_ROLE_KEY`.
+
+**iOS gotchas, learned so you don't re-learn:** push only exists for
+the INSTALLED PWA (Safari-in-browser has no PushManager — the Settings
+row says "Add to Home Screen first" instead of showing a dead toggle);
+permission must be requested inside a user gesture; every push must
+show a notification (`userVisibleOnly`) or iOS throttles the
+subscription; iOS silently evicts subscriptions sometimes — the 404/410
+prune + re-toggle handles it.
+
+---
+
 ## Brad's tax structure (confirmed April 2026)
 
 This is the source of truth for Brad's tax position. Update this section whenever something changes — every other tax-related decision in the app and in conversations should be consistent with what's written here.
@@ -676,8 +768,8 @@ These defaults need to move to a Settings UI / per-business table when we want t
 1. **"This week" home screen at `/`** — single dashboard with today's schedule, hours-vs-target, this-week's profit, overdue invoices, quick-add buttons. Pure read, no schema changes. NEXT.
 2. **Quote → invoice → schedule one-tap flow** — when a job moves to `accepted`, prompt to issue deposit invoice + schedule start date in one sheet. Mostly UI plumbing on top of existing pieces.
 3. **Photo-attached entries** — Supabase Storage bucket + `entries.photo_url` column + camera input on entry-form. Big workflow win for on-site logging.
-4. **Push notifications** — "Tomorrow: McLeod 8am, Dulux bill due." Requires VAPID + service worker + scheduled job. Heaviest lift.
-5. **Lead tracking** (after the above): pull from painterswanaka.co.nz contact form, paste-an-email parser, "haven't replied" notifications. Reuses #4's notification infra.
+4. **Push notifications** — SHIPPED August 2026, see the "Push notifications" section above.
+5. **Lead tracking** (after the above): pull from painterswanaka.co.nz contact form, paste-an-email parser, "haven't replied" notifications. Reuses #4's notification infra (the "haven't replied" part shipped with it — `lead-uncontacted` rule).
 6. **Settings UI for tax estimator deductions** + onboarding questionnaire — required before commercialising.
 
 ---

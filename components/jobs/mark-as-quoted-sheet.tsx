@@ -95,6 +95,10 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
   const dragDepth = useRef(0);
   // True while we read the dropped PDF + ask the AI for the total.
   const [parsing, setParsing] = useState(false);
+  // True once the PDF parse actually wrote something into the form.
+  // Drives the "filled from the PDF — check below" confirmation, so the
+  // auto-fill is visible rather than fields silently changing off-screen.
+  const [autofilled, setAutofilled] = useState(false);
   // Set once Brad manually edits a date — stops PDF auto-fill from clobbering it.
   const [datesTouched, setDatesTouched] = useState(false);
 
@@ -127,6 +131,7 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
     setStagedPdf(null);
     setError(null);
     setDatesTouched(false);
+    setAutofilled(false);
   }, [open, job, initialTotal, todayISO, defaultFollowUp]);
 
   async function handleSave() {
@@ -246,15 +251,22 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
         { ok?: boolean; parsed?: { totalAmountInclGst?: number; dateSent?: string } } | null;
       if (!res.ok || !json?.ok || !json.parsed) return;
       const { totalAmountInclGst: total, dateSent: sent } = json.parsed;
+      let filled = false;
       if (typeof total === 'number' && total > 0) {
-        setTotalIncl((cur) => (cur.trim() ? cur : String(total)));
+        setTotalIncl((cur) => {
+          if (cur.trim()) return cur;
+          filled = true;
+          return String(total);
+        });
       }
       // Dates: fill the send date from the quote and derive follow-up as
       // +5 days — unless Brad has already edited the date fields.
       if (sent && /^\d{4}-\d{2}-\d{2}$/.test(sent) && !datesTouched) {
         setDateSent(sent);
         setFollowUpDate(addDaysISO(sent, 5));
+        filled = true;
       }
+      if (filled) setAutofilled(true);
     } catch (err) {
       console.warn('[mark-as-quoted] auto-fill from PDF failed:', err);
     } finally {
@@ -322,9 +334,92 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
             </div>
           )}
 
+          {/* PDF drop zone FIRST — it's the fast path. Dropping the
+              quote PDF auto-fills the total + dates below, so leading
+              with it turns "fill in a form" into "drop a file, glance,
+              save". It used to sit last, labelled "(optional)", with
+              the total field autofocused — which popped the keyboard
+              and read as "type everything by hand". */}
+          <div>
+            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block flex items-center gap-1.5">
+              <FileText size={11} strokeWidth={1.8} />
+              Fastest way — drop in your quote PDF
+            </label>
+            {!stagedPdf ? (
+              <button
+                type="button"
+                onClick={() => pdfInputRef.current?.click()}
+                onDragEnter={handleDragEnter}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDropPdf}
+                className={cn(
+                  'w-full min-h-[88px] rounded-xl border-2 border-dashed transition-colors flex flex-col items-center justify-center gap-1.5 px-3 py-3 text-center',
+                  isDragOver
+                    ? 'border-primary bg-primary/10 text-primary'
+                    : 'border-primary/40 bg-primary/5 hover:bg-primary/10 text-foreground',
+                )}
+              >
+                <UploadCloud size={22} strokeWidth={1.7} className="text-primary" />
+                <span className="text-sm font-medium">
+                  {isDragOver ? 'Drop the PDF here' : 'Add the quote PDF — we’ll fill this form for you'}
+                </span>
+                <span className="text-[11px] font-normal text-muted-foreground">
+                  Reads the total and date sent, and keeps the PDF on the job. Tap to choose or drag it in.
+                </span>
+              </button>
+            ) : (
+              <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-muted/40 border border-border">
+                <FileText size={14} className="text-muted-foreground shrink-0" strokeWidth={1.8} />
+                <p className="text-xs text-foreground truncate flex-1 min-w-0">
+                  {stagedPdf.name}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => { setStagedPdf(null); setAutofilled(false); }}
+                  className="w-6 h-6 rounded-full hover:bg-background flex items-center justify-center text-muted-foreground hover:text-foreground"
+                  title="Remove"
+                >
+                  <X size={12} strokeWidth={2.2} />
+                </button>
+              </div>
+            )}
+            <input
+              ref={pdfInputRef}
+              type="file"
+              accept="application/pdf,.pdf"
+              className="hidden"
+              onChange={handlePickPdf}
+            />
+            {parsing ? (
+              <p className="mt-1 text-[11px] text-primary leading-snug flex items-center gap-1.5">
+                <Loader2 size={11} className="animate-spin" /> Reading the quote to fill in the details…
+              </p>
+            ) : autofilled ? (
+              <p className="mt-1 text-[11px] text-green-700 dark:text-green-500 leading-snug">
+                Filled from the PDF — double-check the numbers below before saving.
+              </p>
+            ) : (
+              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+                No PDF handy? Type it in below. If you used the AI-generated
+                quote, its PDF is already saved on the job — skip this.
+              </p>
+            )}
+          </div>
+
+          {/* Divider — visually separates the drop-a-file fast path
+              from the manual entry below. */}
+          <div className="flex items-center gap-3" aria-hidden="true">
+            <div className="h-px bg-border flex-1" />
+            <span className="text-[11px] text-muted-foreground">or fill it in yourself</span>
+            <div className="h-px bg-border flex-1" />
+          </div>
+
           {/* Total — the headline number. Inc-GST per NZ convention.
               Step 0.01 so cents work, but the field shows just the
-              integer dollar amount until the user types decimals. */}
+              integer dollar amount until the user types decimals.
+              No autoFocus: it popped the keyboard over the drop zone
+              and made the sheet read as type-first. */}
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block flex items-center gap-1.5">
               <DollarSign size={11} strokeWidth={1.8} />
@@ -340,7 +435,6 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
                 value={totalIncl}
                 onChange={(e) => setTotalIncl(e.target.value)}
                 className="w-full h-10 pl-7 pr-3 rounded-lg border border-input bg-background text-sm"
-                autoFocus
               />
             </div>
             {/* Echo the ex-GST figure that actually gets stored — the
@@ -385,73 +479,6 @@ export function MarkAsQuotedSheet({ open, job, initialTotal, onSaved, onCancel }
             <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
               Default is 5 days — adjust for tighter or looser windows.
             </p>
-          </div>
-
-          {/* Optional PDF attach — for when the quote was prepared
-              outside the app (Word, Pages, accounting tool). Attaches
-              as a quote_pdf kind so it lives with the job for
-              reference. AI-generated quotes already have their PDF
-              tied to the draft; this is the manual escape hatch. */}
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block flex items-center gap-1.5">
-              <FileText size={11} strokeWidth={1.8} />
-              Quote PDF (optional)
-            </label>
-            {!stagedPdf ? (
-              <button
-                type="button"
-                onClick={() => pdfInputRef.current?.click()}
-                onDragEnter={handleDragEnter}
-                onDragOver={handleDragOver}
-                onDragLeave={handleDragLeave}
-                onDrop={handleDropPdf}
-                className={cn(
-                  'w-full min-h-[88px] rounded-xl border-2 border-dashed transition-colors flex flex-col items-center justify-center gap-1.5 px-3 py-3 text-center',
-                  isDragOver
-                    ? 'border-primary bg-primary/10 text-primary'
-                    : 'border-input bg-background hover:bg-accent text-foreground',
-                )}
-              >
-                <UploadCloud size={22} strokeWidth={1.7} className={isDragOver ? 'text-primary' : 'text-muted-foreground'} />
-                <span className="text-sm font-medium">
-                  {isDragOver ? 'Drop the PDF here' : 'Drag & drop your quote PDF'}
-                </span>
-                <span className="text-[11px] font-normal text-muted-foreground">
-                  or click to choose — we&apos;ll read the total for you
-                </span>
-              </button>
-            ) : (
-              <div className="flex items-center gap-2 px-3 py-2.5 rounded-lg bg-muted/40 border border-border">
-                <FileText size={14} className="text-muted-foreground shrink-0" strokeWidth={1.8} />
-                <p className="text-xs text-foreground truncate flex-1 min-w-0">
-                  {stagedPdf.name}
-                </p>
-                <button
-                  type="button"
-                  onClick={() => setStagedPdf(null)}
-                  className="w-6 h-6 rounded-full hover:bg-background flex items-center justify-center text-muted-foreground hover:text-foreground"
-                  title="Remove"
-                >
-                  <X size={12} strokeWidth={2.2} />
-                </button>
-              </div>
-            )}
-            <input
-              ref={pdfInputRef}
-              type="file"
-              accept="application/pdf,.pdf"
-              className="hidden"
-              onChange={handlePickPdf}
-            />
-            {parsing ? (
-              <p className="mt-1 text-[11px] text-primary leading-snug flex items-center gap-1.5">
-                <Loader2 size={11} className="animate-spin" /> Reading the quote to fill the total…
-              </p>
-            ) : (
-              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
-                Skip this if you used the AI-generated PDF — that&apos;s already saved on the job.
-              </p>
-            )}
           </div>
 
           <div className="flex gap-2 pt-2">

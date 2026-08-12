@@ -7,8 +7,9 @@ import { supabase } from '@/lib/supabase/client';
 import { Separator } from '@/components/ui/separator';
 import { Badge } from '@/components/ui/badge';
 import {
-  Building2, User, Palette, Bell, Database, Info, ChevronRight, Hammer, LogOut, FileText, Users,
+  Building2, User, Palette, Database, Info, ChevronRight, Hammer, LogOut, FileText, Users,
 } from 'lucide-react';
+import { NotificationsRow } from '@/components/settings/notifications-row';
 import { cn } from '@/lib/utils';
 
 interface SettingRowProps {
@@ -133,7 +134,7 @@ export default function SettingsPage() {
 
         {/* Preferences */}
         <SettingSection title="Preferences">
-          <SettingRow icon={Bell} label="Notifications" value="Coming soon" badge="Soon" />
+          <NotificationsRow />
           <SettingRow icon={Palette} label="Appearance" value="Light mode" />
         </SettingSection>
 

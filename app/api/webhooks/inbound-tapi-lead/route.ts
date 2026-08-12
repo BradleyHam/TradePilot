@@ -35,6 +35,7 @@ import {
   normaliseForDedup,
 } from '@/lib/tapi-lead-parser';
 import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
+import { sendBusinessNotificationSafe } from '@/lib/push-notify';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
@@ -188,6 +189,19 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
+
+  // Instant push — a new lead is the one thing worth buzzing Brad's
+  // pocket for the moment it lands (speed-to-lead wins jobs; these
+  // arrive silently otherwise). Keyed on the job id, so a provider
+  // retry that somehow got past dedupe still can't double-buzz.
+  // Best-effort: a push failure must never 500 a captured lead.
+  await sendBusinessNotificationSafe(admin, businessId, {
+    ruleKey: 'lead-arrived',
+    dedupeKey: inserted.id as string,
+    title: 'New lead (Tapi)',
+    body: `${lead.name}${lead.clientName ? ` — ${lead.clientName}` : ''}`,
+    url: '/leads',
+  });
 
   console.info('[inbound-tapi-lead] lead created', {
     jobId: inserted.id,
