@@ -253,6 +253,14 @@ export function SiteVisitWrapUpSheet({
   const [stainProduct, setStainProduct] = useState('');
   const [windowDoorCount, setWindowDoorCount] = useState('');
   const [daysEstimate, setDaysEstimate] = useState('');
+  // Who's on the tools for that estimate. "3 days" solo and "3 days
+  // with Suzie" are the same daysEstimate but double the labour —
+  // crew × days = person-days is what actually prices the job.
+  const [crewSize, setCrewSize] = useState<'' | '1' | '2' | '3'>('');
+  // Client name — only shown in create-from-visit mode, where we'd
+  // otherwise mint the job with clientName 'New lead' and the quote/
+  // texts end up addressed to nobody.
+  const [clientNameInput, setClientNameInput] = useState('');
   const [addonChips, setAddonChips] = useState<Set<string>>(new Set());
   const [siteLogisticsChips, setSiteLogisticsChips] = useState<Set<string>>(new Set());
   const [commercialChips, setCommercialChips] = useState<Set<string>>(new Set());
@@ -341,6 +349,12 @@ export function SiteVisitWrapUpSheet({
       setStainProduct(j.stainProduct ?? '');
       setWindowDoorCount(j.windowDoorCount != null ? String(j.windowDoorCount) : '');
       setDaysEstimate(j.daysEstimate != null ? String(j.daysEstimate) : '');
+      setCrewSize(
+        j.crewSize === 1 || j.crewSize === 2 || j.crewSize === 3
+          ? (String(j.crewSize) as '1' | '2' | '3')
+          : '',
+      );
+      setClientNameInput('');
       setAddonChips(new Set(j.addonItems ?? []));
       setSiteLogisticsChips(new Set(j.siteLogistics ?? []));
       setCommercialChips(new Set(j.commercialSignals ?? []));
@@ -356,6 +370,8 @@ export function SiteVisitWrapUpSheet({
       setStainProduct('');
       setWindowDoorCount('');
       setDaysEstimate('');
+      setCrewSize('');
+      setClientNameInput('');
       setAddonChips(new Set());
       setSiteLogisticsChips(new Set());
       setCommercialChips(new Set());
@@ -526,6 +542,7 @@ export function SiteVisitWrapUpSheet({
           ? Math.min(Math.abs(parseInt(windowDoorCount, 10)), 200)
           : undefined,
         daysEstimate: daysEstimate ? Math.abs(parseFloat(daysEstimate)) : undefined,
+        crewSize: crewSize ? parseInt(crewSize, 10) : undefined,
         addonItems: Array.from(addonChips),
         siteLogistics: Array.from(siteLogisticsChips),
         commercialSignals: Array.from(commercialChips),
@@ -565,10 +582,10 @@ export function SiteVisitWrapUpSheet({
           // we have at this point (often it's the property address, e.g.
           // "Jac's ensuite", which is fine). User can rename later.
           name: target.visitTitle || 'Site visit',
-          // Without a separate client-name field on the visit, we use a
-          // placeholder. The wrap-up doesn't capture a client name yet —
-          // a future enhancement would add a quick "client name" field.
-          clientName: 'New lead',
+          // Use the typed client name when given; 'New lead' only as the
+          // fallback so downstream surfaces (quote header, texts) aren't
+          // addressed to a placeholder unless they truly have to be.
+          clientName: clientNameInput.trim() || 'New lead',
           status: 'lead',
           ...structuredFields,
           createdAt: now,
@@ -663,6 +680,27 @@ export function SiteVisitWrapUpSheet({
               </>
             )}
           </div>
+
+          {/* Client name — create-from-visit only. Without it the new
+              job is minted as client 'New lead' and every downstream
+              surface (quote header, follow-up texts) addresses nobody.
+              Optional like everything else: skip it and the fallback
+              still applies. */}
+          {target?.mode === 'create-from-visit' && (
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                Client name
+              </label>
+              <input
+                type="text"
+                autoComplete="off"
+                placeholder="Who's the quote for? (optional)"
+                value={clientNameInput}
+                onChange={(e) => setClientNameInput(e.target.value)}
+                className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
+              />
+            </div>
+          )}
 
           {/* Visit date — catch-up mode only. The normal flow reads the
               date off the schedule_item that was ticked; here there is
@@ -1095,25 +1133,68 @@ export function SiteVisitWrapUpSheet({
           </div>
 
           {/* Time estimate — Brad's gut feel after walking the site.
-              The AI compares this against the area × prep math; when
-              they disagree by more than ~30%, it's a useful prompt
-              for a second look. Decimal allowed for half-days. */}
+              Two parts, because "4 days" is meaningless without knowing
+              who's on it: 4 days solo and 4 days as a pair are the same
+              number but double the labour. Crew chips + working days →
+              person-days, which is what the quote AI prices labour from.
+              The AI also compares the estimate against the area × prep
+              math; >30% apart is flagged for a second look. */}
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-              Days estimate (gut feel)
+              Time estimate (gut feel)
             </label>
-            <input
-              type="number"
-              inputMode="decimal"
-              min={0}
-              step="0.5"
-              placeholder="e.g. 4"
-              value={daysEstimate}
-              onChange={(e) => setDaysEstimate(sanitizeNonNegDecimal(e.target.value))}
-              className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm"
-            />
+            <div className="flex flex-wrap gap-2 mb-2">
+              {([
+                { v: '1' as const, label: 'Just me' },
+                { v: '2' as const, label: '2 of us' },
+                { v: '3' as const, label: '3 of us' },
+              ]).map(({ v, label }) => {
+                const selected = crewSize === v;
+                return (
+                  <button
+                    key={v}
+                    type="button"
+                    aria-pressed={selected}
+                    onClick={() => setCrewSize(selected ? '' : v)}
+                    className={cn(
+                      'px-3 py-2 rounded-lg text-sm font-medium border transition-colors min-h-[40px]',
+                      selected
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'bg-background text-foreground border-border hover:border-primary/40',
+                    )}
+                  >
+                    {label}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="flex items-center gap-2">
+              <input
+                type="number"
+                inputMode="decimal"
+                min={0}
+                step="0.5"
+                placeholder="e.g. 4"
+                value={daysEstimate}
+                onChange={(e) => setDaysEstimate(sanitizeNonNegDecimal(e.target.value))}
+                className="w-28 h-10 px-3 rounded-lg border border-input bg-background text-sm"
+              />
+              <span className="text-sm text-muted-foreground shrink-0">
+                working days
+                {/* Live person-days readout — makes the crew × days
+                    meaning visible at capture time, so a wrong tap is
+                    obvious on the spot rather than in the quote. */}
+                {daysEstimate && crewSize && parseFloat(daysEstimate) > 0 && crewSize !== '1' && (
+                  <span className="text-foreground font-medium">
+                    {' '}≈ {Math.round(parseFloat(daysEstimate) * parseInt(crewSize, 10) * 10) / 10} person-days
+                  </span>
+                )}
+              </span>
+            </div>
             <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
-              How many working days do you think? Half-days are fine (e.g. 3.5).
+              Days actually on the tools with that crew — not calendar days.
+              Half-days fine (e.g. 3.5). Don&apos;t pad for rain; weather risk
+              goes in the quote&apos;s timeline note instead.
             </p>
           </div>
 
@@ -1170,7 +1251,7 @@ export function SiteVisitWrapUpSheet({
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block flex items-center gap-1.5">
               <CalendarClock size={11} strokeWidth={1.8} />
-              I'll send the quote by
+              I&apos;ll send the quote by
             </label>
             <input
               type="date"

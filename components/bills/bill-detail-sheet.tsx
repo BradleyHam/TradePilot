@@ -264,7 +264,7 @@ export function BillDetailSheet({ entryId, open, onClose }: BillDetailSheetProps
           </SheetHeader>
 
           {/* Scrollable body */}
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+          <div className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-3 space-y-4">
             {/* Facts */}
             <div className="grid grid-cols-2 gap-x-4 gap-y-2 text-sm">
               <div>

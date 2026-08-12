@@ -33,6 +33,23 @@ const SOURCES: { value: LeadSource; label: string }[] = [
   { value: 'manual',   label: 'Other'        },
 ];
 
+const NZ_GST_RATE = 0.15;
+
+/**
+ * Digits + one decimal point. Strips $, commas, minus signs and `e`
+ * notation that a bare number input would happily accept. Same
+ * sanitiser as the quote catch-up sheet — money fields should behave
+ * identically wherever they appear.
+ */
+function sanitizeAmount(raw: string): string {
+  let s = raw.replace(/[^\d.]/g, '');
+  const firstDot = s.indexOf('.');
+  if (firstDot !== -1) {
+    s = s.slice(0, firstDot + 1) + s.slice(firstDot + 1).replace(/\./g, '');
+  }
+  return s;
+}
+
 interface JobFormProps {
   defaultValues?: Partial<Job>;
   onSave: (data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) => void;
@@ -78,7 +95,19 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
   const [status, setStatus] = useState<JobStatus>(defaultValues?.status ?? 'lead');
   const [estimatedValue, setEstimatedValue] = useState(defaultValues?.estimatedValue?.toString() ?? '');
   const [quoteAmount, setQuoteAmount] = useState(defaultValues?.quoteAmount?.toString() ?? '');
+  // Which way the typed quote figure is quoted. job.quoteAmount is
+  // stored EX-GST (every money calc in the app is ex-GST) but a number
+  // remembered from a conversation is usually the incl-GST one the
+  // customer heard. Silently assuming ex-GST is the Aubrey Road / J16
+  // bug class — same explicit chips as the quote catch-up sheet.
+  // Defaults to 'ex': an existing stored amount round-trips unchanged.
+  const [quoteBasis, setQuoteBasis] = useState<'ex' | 'incl'>('ex');
   const [startDate, setStartDate] = useState(defaultValues?.startDate ?? '');
+  // Gut time estimate — working days on the tools × who's on it.
+  // Captured at the wrap-up normally; editable here so a stale or
+  // missing estimate can be fixed without re-running the wrap-up.
+  const [daysEstimate, setDaysEstimate] = useState(defaultValues?.daysEstimate?.toString() ?? '');
+  const [crewSize, setCrewSize] = useState(defaultValues?.crewSize?.toString() ?? '');
   const [notes, setNotes] = useState(defaultValues?.notes ?? '');
   // Optional scope fields. Power the "estimating coach" data layer — the
   // values feed downstream insights ($/m² benchmarks, win-rate by work type).
@@ -108,7 +137,16 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
       location: location || undefined,
       status,
       estimatedValue: estimatedValue ? parseFloat(estimatedValue) : undefined,
-      quoteAmount: quoteAmount ? parseFloat(quoteAmount) : undefined,
+      // Convert to the stored ex-GST convention per the basis chips.
+      quoteAmount: quoteAmount
+        ? (quoteBasis === 'incl'
+            ? Math.round((parseFloat(quoteAmount) / (1 + NZ_GST_RATE)) * 100) / 100
+            : parseFloat(quoteAmount))
+        : undefined,
+      daysEstimate: daysEstimate ? Math.abs(parseFloat(daysEstimate)) : undefined,
+      crewSize: crewSize
+        ? Math.min(Math.max(Math.abs(parseInt(crewSize, 10)) || 1, 1), 6)
+        : undefined,
       startDate: startDate || undefined,
       leadDate: leadDate || undefined,
       source: source || undefined,
@@ -262,16 +300,121 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
 
       {isLead ? (
         <Field label="Estimated value ($)">
-          <Input type="number" inputMode="numeric" placeholder="Rough ballpark, optional" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} />
+          <Input
+            type="text"
+            inputMode="decimal"
+            placeholder="Rough ballpark, optional"
+            value={estimatedValue}
+            onChange={(e) => setEstimatedValue(sanitizeAmount(e.target.value))}
+          />
         </Field>
       ) : (
-        <div className="grid grid-cols-2 gap-3">
-          <Field label="Estimated value ($)">
-            <Input type="number" inputMode="numeric" placeholder="0" value={estimatedValue} onChange={(e) => setEstimatedValue(e.target.value)} />
-          </Field>
-          <Field label="Quote amount ($)">
-            <Input type="number" inputMode="numeric" placeholder="0" value={quoteAmount} onChange={(e) => setQuoteAmount(e.target.value)} />
-          </Field>
+        <>
+          <div className="grid grid-cols-2 gap-3">
+            {/* Two money fields side by side used to share placeholder
+                "0" with nothing explaining the difference — hints below
+                each keep them from being filled interchangeably. */}
+            <Field label="Estimated value ($)">
+              <Input
+                type="text"
+                inputMode="decimal"
+                placeholder="Rough ballpark"
+                value={estimatedValue}
+                onChange={(e) => setEstimatedValue(sanitizeAmount(e.target.value))}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+                Your guess before quoting.
+              </p>
+            </Field>
+            <Field label="Quote amount ($)">
+              <Input
+                type="text"
+                inputMode="decimal"
+                placeholder="As on the quote"
+                value={quoteAmount}
+                onChange={(e) => setQuoteAmount(sanitizeAmount(e.target.value))}
+              />
+              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+                The number you sent.
+              </p>
+            </Field>
+          </div>
+          {/* GST basis — only shown once there's a figure to convert.
+              Wrong basis silently throws profit, $/h and the tax
+              estimate out by 15%. */}
+          {quoteAmount && (
+            <div>
+              <div className="flex gap-1">
+                {([
+                  { v: 'ex' as const, label: '+ GST' },
+                  { v: 'incl' as const, label: 'incl GST' },
+                ]).map((o) => (
+                  <button
+                    key={o.v}
+                    type="button"
+                    onClick={() => setQuoteBasis(o.v)}
+                    aria-pressed={quoteBasis === o.v}
+                    className={cn(
+                      'flex-1 h-10 rounded-lg border text-xs font-medium transition-colors',
+                      quoteBasis === o.v
+                        ? 'bg-primary text-primary-foreground border-primary'
+                        : 'bg-background border-input text-muted-foreground',
+                    )}
+                  >
+                    {o.label}
+                  </button>
+                ))}
+              </div>
+              {Number.isFinite(parseFloat(quoteAmount)) && parseFloat(quoteAmount) > 0 && (
+                <p className="mt-1 text-[11px] text-muted-foreground">
+                  Quote saves as $
+                  {(quoteBasis === 'incl'
+                    ? Math.round((parseFloat(quoteAmount) / (1 + NZ_GST_RATE)) * 100) / 100
+                    : parseFloat(quoteAmount)
+                  ).toLocaleString('en-NZ')}{' '}
+                  ex GST
+                </p>
+              )}
+            </div>
+          )}
+        </>
+      )}
+
+      {/* Gut time estimate — working days on the tools + who's on it.
+          days × crew = person-days, which is what the quote AI prices
+          labour from. Normally captured at the site-visit wrap-up;
+          editable here so it can be fixed later without re-wrapping. */}
+      {!isLead && (
+        <div>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Days estimate">
+              <Input
+                type="number"
+                inputMode="decimal"
+                min={0}
+                step="0.5"
+                placeholder="e.g. 4"
+                value={daysEstimate}
+                onChange={(e) => setDaysEstimate(e.target.value)}
+              />
+            </Field>
+            <Field label="Crew size">
+              <Input
+                type="number"
+                inputMode="numeric"
+                min={1}
+                max={6}
+                step="1"
+                placeholder="1 = solo"
+                value={crewSize}
+                onChange={(e) => setCrewSize(e.target.value)}
+              />
+            </Field>
+          </div>
+          <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+            Working days on the tools with that crew — not calendar days, no
+            rain padding.
+          </p>
         </div>
       )}
 

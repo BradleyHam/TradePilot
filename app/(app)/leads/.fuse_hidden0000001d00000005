@@ -694,7 +694,7 @@ export default function LeadsPage() {
           website form or Tapi (phone, walk-in, referral). Reuses the shared
           JobForm with lead-friendly defaults (status = lead, today's date). */}
       <Sheet open={showAddLead} onOpenChange={setShowAddLead}>
-        <SheetContent side="bottom" className="h-[92vh] overflow-y-auto rounded-t-2xl pb-10">
+        <SheetContent side="bottom" className="h-[92vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
           <SheetHeader className="pb-4">
             <SheetTitle>New lead</SheetTitle>
           </SheetHeader>

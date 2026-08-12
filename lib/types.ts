@@ -611,11 +611,23 @@ export interface Job {
    */
   siteLogistics?: string[];
   /**
-   * Brad's gut estimate of the job duration in days (decimal allowed
-   * for half-days). Sanity-checked against area+prep math by the AI —
-   * if they disagree by >30% something's worth a second look.
+   * Brad's gut estimate of the job duration in WORKING days (decimal
+   * allowed for half-days) — days actually on the tools with the crew
+   * in `crewSize`, not calendar days. Weather padding does NOT belong
+   * here; rain risk is a quote-timeline caveat, not a labour input.
+   * Sanity-checked against area+prep math by the AI — if they disagree
+   * by >30% something's worth a second look.
    */
   daysEstimate?: number;
+  /**
+   * How many people on the tools for `daysEstimate` — 3 days solo and
+   * 3 days as a pair are the same daysEstimate but double the labour.
+   * daysEstimate × crewSize = person-days, which is what actually
+   * prices the job. 1 = Brad solo (the usual). Optional: legacy rows
+   * and quick wrap-ups won't have it; treat missing as "probably 1,
+   * unverified".
+   */
+  crewSize?: number;
   /**
    * Soft commercial factors that move the quote price ±15% without
    * changing the cost basis. Examples: 'referral', 'repeat-customer',

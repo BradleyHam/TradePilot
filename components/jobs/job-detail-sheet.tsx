@@ -428,7 +428,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
           {/* Scrollable body — same max-width container so the content column
               stays a comfortable reading width. Phone is unaffected (max-w-2xl
               is wider than any phone viewport). */}
-          <div className="flex-1 min-h-0 overflow-y-auto">
+          <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
             <div className="mx-auto w-full max-w-2xl px-4 md:px-6 pt-4 pb-10 space-y-5">
           {/* Client info — read-only block + inline editor toggle.
               The wrap-up auto-creates jobs with clientName='New lead'

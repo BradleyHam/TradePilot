@@ -202,7 +202,9 @@ function QuoteCatchUpForm({
                   onClick={() => setBasis(o.v)}
                   aria-pressed={basis === o.v}
                   className={cn(
-                    'flex-1 h-8 rounded-lg border text-[11px] font-medium transition-colors',
+                    // h-11 = 44px — the app-wide minimum tap target. These
+                    // were h-8 (32px); a mis-tap here is a silent 15% error.
+                    'flex-1 h-11 rounded-lg border text-xs font-medium transition-colors',
                     basis === o.v
                       ? 'bg-primary text-primary-foreground border-primary'
                       : 'bg-background border-input text-muted-foreground',

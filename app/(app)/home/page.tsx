@@ -532,8 +532,20 @@ export default function HomePage() {
               type: 'hours',
               hours: fields.hours,
               activity: fields.activity,
+              // Brad's own login ticking his own row — same 'owner'
+              // default as the full EntryForm. Without this, Home-logged
+              // hours landed with workerKind undefined: a third unlabelled
+              // bucket in every by-worker rollup, and job costing couldn't
+              // rate them. (Suzie's hours come via /my/hours, not here.)
+              workerKind: 'owner',
               description: fields.description.trim() || item.title,
-              entryDate: todayISO,
+              // Ticking an overdue row usually means the work happened on
+              // the day the row was scheduled — put the hours on THAT day
+              // so the hours-by-day allocation is right. Future-dated rows
+              // (ticked early) still log as today: work can't happen on a
+              // date that hasn't arrived. String compare is safe on
+              // YYYY-MM-DD.
+              entryDate: item.date && item.date < todayISO ? item.date : todayISO,
               gstApplies: false,
               createdAt: new Date().toISOString(),
             });

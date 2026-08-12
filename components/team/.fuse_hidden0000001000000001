@@ -52,7 +52,7 @@ export function EmployeeDetailSheet({
 }) {
   return (
     <Sheet open={open} onOpenChange={(o) => { if (!o) onClose(); }}>
-      <SheetContent side="bottom" className="h-[90vh] overflow-y-auto rounded-t-2xl pb-10">
+      <SheetContent side="bottom" className="h-[90vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
         <SheetHeader className="pb-3">
           <SheetTitle>{member?.displayName ?? 'Employee'}</SheetTitle>
         </SheetHeader>

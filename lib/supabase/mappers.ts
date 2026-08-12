@@ -73,6 +73,7 @@ export function rowToJob(r: Row): Job {
     addonItems: Array.isArray(r.addon_items) ? (r.addon_items as string[]) : undefined,
     siteLogistics: Array.isArray(r.site_logistics) ? (r.site_logistics as string[]) : undefined,
     daysEstimate: asNumber(r.days_estimate),
+    crewSize: asNumber(r.crew_size),
     commercialSignals: Array.isArray(r.commercial_signals) ? (r.commercial_signals as string[]) : undefined,
     lostReason: (asString(r.lost_reason) as LostReason | undefined),
     wonReason: (asString(r.won_reason) as WonReason | undefined),
@@ -159,6 +160,7 @@ export function jobToRow(j: Partial<Job>): Row {
     out.site_logistics = j.siteLogistics && j.siteLogistics.length > 0 ? j.siteLogistics : null;
   }
   if (j.daysEstimate !== undefined) out.days_estimate = j.daysEstimate ?? null;
+  if (j.crewSize !== undefined) out.crew_size = j.crewSize ?? null;
   if (j.commercialSignals !== undefined) {
     out.commercial_signals = j.commercialSignals && j.commercialSignals.length > 0 ? j.commercialSignals : null;
   }

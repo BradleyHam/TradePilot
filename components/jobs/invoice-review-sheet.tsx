@@ -213,7 +213,7 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
             </SheetTitle>
           </SheetHeader>
 
-          <div className="flex-1 overflow-y-auto px-4 py-3 space-y-4">
+          <div className="flex-1 overflow-y-auto overflow-x-hidden px-4 py-3 space-y-4">
             {/* PDF preview */}
             <div className="rounded-xl border border-border overflow-hidden bg-muted/30">
               <div className="flex items-center justify-between px-3 py-2 border-b border-border/60">

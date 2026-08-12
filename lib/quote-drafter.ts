@@ -253,6 +253,19 @@ ${accessTable}
    and add a \`warnings\` entry asking Brad to sanity-check before
    sending.
 
+6. **Cross-check the painter's gut estimate.** When the job context
+   includes a gut estimate, it means working days on the tools for the
+   stated crew — days × crew = person-days of labour. Compare that
+   against the labour implied by your own area × prep × coats math.
+   If they disagree by more than ~30%, do NOT silently pick one: add a
+   \`warnings\` entry naming both numbers and which way they differ
+   (e.g. "Your gut says 6 person-days; the m² math says 9 — check
+   whether the area or the estimate is off"). Anchor pricing on rates/
+   comparables, but treat a big mismatch as a sign the inputs need a
+   second look. Express \`timeline.duration\` in working days for the
+   stated crew, and put weather/rain risk in \`timeline.notes\` (never
+   padded into the day count) when any exterior work is in scope.
+
 ## Resene PD rates (inflated to ${currentYear}, ex-GST)
 
 ${ratesTable}
@@ -338,13 +351,36 @@ function buildUserMessage(input: DraftQuoteInput): string {
 
   // Wrap-up data
   const wrapUp: string[] = [];
-  if (job.workType) wrapUp.push(`Work type: ${job.workType}`);
+  // Prefer the multi-select breakdown over the derived single value —
+  // an interior+exterior job used to reach the model as just "mixed",
+  // which says nothing about what's actually being painted.
+  if (job.workTypes && job.workTypes.length > 0) {
+    wrapUp.push(`Work types: ${job.workTypes.join(' + ')}`);
+  } else if (job.workType) {
+    wrapUp.push(`Work type: ${job.workType}`);
+  }
   if (job.surfaceAreaM2) wrapUp.push(`Paint area (walls/cladding, not floor): ${job.surfaceAreaM2} m²`);
   if (job.prepLevel) wrapUp.push(`Prep level: ${job.prepLevel}`);
   if (job.coatsCount) wrapUp.push(`Coats: ${job.coatsCount}`);
   if (job.stainProduct) wrapUp.push(`Product: ${job.stainProduct}`);
   if (job.windowDoorCount != null) wrapUp.push(`Windows + doors in painted area: ${job.windowDoorCount}`);
-  if (job.daysEstimate) wrapUp.push(`Painter's gut estimate: ${job.daysEstimate} days`);
+  // Gut estimate is WORKING days on the tools for the stated crew —
+  // crew × days = person-days, the number that actually prices labour.
+  // != null (not falsy) so a legit 0.5-day touch-up isn't dropped.
+  if (job.daysEstimate != null) {
+    const crew = job.crewSize;
+    if (crew && crew > 1) {
+      wrapUp.push(
+        `Painter's gut estimate: ${job.daysEstimate} working days with ${crew} on site`
+        + ` (≈ ${Math.round(job.daysEstimate * crew * 10) / 10} person-days of labour)`,
+      );
+    } else {
+      wrapUp.push(
+        `Painter's gut estimate: ${job.daysEstimate} working days`
+        + (crew === 1 ? ' solo' : ' (crew size not recorded — assume solo, unverified)'),
+      );
+    }
+  }
   if (job.addonItems && job.addonItems.length > 0) {
     wrapUp.push(`Add-ons in scope: ${job.addonItems.join(', ')}`);
   }

@@ -254,7 +254,7 @@ function MonthCalendar({
 
       {/* Day detail */}
       <Sheet open={!!selectedDay} onOpenChange={(o) => { if (!o) setSelectedDay(null); }}>
-        <SheetContent side="bottom" className="rounded-t-2xl pb-8 max-h-[80vh] overflow-y-auto">
+        <SheetContent side="bottom" className="rounded-t-2xl px-4 pb-8 max-h-[80vh] overflow-y-auto">
           <SheetHeader className="pb-2">
             <SheetTitle>{selectedDay ? prettyDate(selectedDay) : ''}</SheetTitle>
           </SheetHeader>

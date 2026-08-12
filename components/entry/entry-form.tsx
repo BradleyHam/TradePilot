@@ -332,22 +332,38 @@ export function EntryForm({
           what payroll pays from, so there's no helper-hours capture
           here any more. */}
       {type === 'hours' && (
-        <div className="grid grid-cols-2 gap-3">
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-              Who
-            </label>
-            <Select value={workerKind} onValueChange={(v) => setWorkerKind(v as WorkerKind)}>
-              <SelectTrigger className="h-9 text-sm">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {(Object.keys(WORKER_KIND_LABELS) as WorkerKind[]).map((k) => (
-                  <SelectItem key={k} value={k}>{WORKER_KIND_LABELS[k]}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+        <div>
+          <div className="grid grid-cols-2 gap-3">
+            <div>
+              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                Who
+              </label>
+              <Select value={workerKind} onValueChange={(v) => setWorkerKind(v as WorkerKind)}>
+                <SelectTrigger className="h-9 text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {(Object.keys(WORKER_KIND_LABELS) as WorkerKind[]).map((k) => (
+                    <SelectItem key={k} value={k}>{WORKER_KIND_LABELS[k]}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </div>
           </div>
+          {/* Payroll trap warning. An hours row logged HERE for an
+              employee tier carries no loggedByUserId, so payroll (which
+              pays from /my/hours rows) never sees it — the hours cost
+              into job stats but nobody gets paid for them, and the
+              wage-deduction paper trail the income-splitting setup
+              depends on goes missing. Warn, don't block: a one-off
+              cash-job helper legitimately lands here. */}
+          {(workerKind === 'helper' || workerKind === 'apprentice' || workerKind === 'experienced') && (
+            <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-500 leading-snug">
+              Heads up: if this is someone on payroll (e.g. Suzie), they should
+              log it from their own login instead — hours logged here don&apos;t
+              reach payroll. Use this only for one-off helpers you pay directly.
+            </p>
+          )}
         </div>
       )}
 

@@ -856,7 +856,7 @@ export default function SchedulePage() {
 
       {/* Add schedule sheet */}
       <Sheet open={showAdd} onOpenChange={setShowAdd}>
-        <SheetContent side="bottom" className="h-[85vh] overflow-y-auto rounded-t-2xl pb-10">
+        <SheetContent side="bottom" className="h-[85vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
           <SheetHeader className="pb-4">
             <SheetTitle>Add schedule item</SheetTitle>
           </SheetHeader>
@@ -1041,7 +1041,7 @@ export default function SchedulePage() {
           card on either view to open this; uses the same EntryForm as the
           dedicated /entries page so the experience is consistent. */}
       <Sheet open={!!editingHoursId} onOpenChange={(open) => !open && setEditingHoursId(null)}>
-        <SheetContent side="bottom" className="h-[90vh] overflow-y-auto rounded-t-2xl pb-10">
+        <SheetContent side="bottom" className="h-[90vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
           <SheetHeader className="pb-4">
             <SheetTitle>Edit hours entry</SheetTitle>
           </SheetHeader>
@@ -2002,7 +2002,7 @@ function MonthView({
 
       {/* Day detail sheet — opens when a day is tapped. */}
       <Sheet open={!!selectedDay} onOpenChange={(open) => !open && setSelectedDay(null)}>
-        <SheetContent side="bottom" className="h-[80vh] overflow-y-auto rounded-t-2xl pb-10">
+        <SheetContent side="bottom" className="h-[80vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
           <SheetHeader className="pb-4">
             <SheetTitle>
               {selectedDay && format(parseISODate(selectedDay), 'EEEE, d MMMM yyyy')}

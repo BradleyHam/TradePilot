@@ -53,7 +53,7 @@ function SheetContent({
         data-slot="sheet-content"
         data-side={side}
         className={cn(
-          // px-4/pb-4 are the sheet's default gutters. Sheet bodies are
+          // px-5/pb-4 are the sheet's default gutters. Sheet bodies are
           // authored as bare divs, so without a gutter here every form
           // field runs edge-to-edge — worst on the md+ right-drawer where
           // the sheet meets the window edge. Declared BEFORE `className`
@@ -61,7 +61,20 @@ function SheetContent({
           // and `p-0` (full-bleed sheets like job/bill detail, which own
           // their internal padding) strips it entirely — twMerge resolves
           // the p-vs-px/pb conflict in the consumer's favour.
-          "fixed z-50 flex flex-col gap-4 px-4 pb-4 bg-popover bg-clip-padding text-sm text-popover-foreground shadow-lg transition duration-200 ease-in-out data-ending-style:opacity-0 data-starting-style:opacity-0 data-[side=bottom]:inset-x-0 data-[side=bottom]:bottom-0 data-[side=bottom]:h-auto data-[side=bottom]:border-t data-[side=bottom]:data-ending-style:translate-y-[2.5rem] data-[side=bottom]:data-starting-style:translate-y-[2.5rem] data-[side=left]:inset-y-0 data-[side=left]:left-0 data-[side=left]:h-full data-[side=left]:w-3/4 data-[side=left]:border-r data-[side=left]:data-ending-style:translate-x-[-2.5rem] data-[side=left]:data-starting-style:translate-x-[-2.5rem] data-[side=right]:inset-y-0 data-[side=right]:right-0 data-[side=right]:h-full data-[side=right]:w-3/4 data-[side=right]:border-l data-[side=right]:data-ending-style:translate-x-[2.5rem] data-[side=right]:data-starting-style:translate-x-[2.5rem] data-[side=top]:inset-x-0 data-[side=top]:top-0 data-[side=top]:h-auto data-[side=top]:border-b data-[side=top]:data-ending-style:translate-y-[-2.5rem] data-[side=top]:data-starting-style:translate-y-[-2.5rem] data-[side=left]:sm:max-w-sm data-[side=right]:sm:max-w-sm",
+          //
+          // Phone gets 20px, md+ steps back to 16px: on a phone the sheet
+          // is the whole screen and 16px reads as cramped against the
+          // bezel, but the md+ drawer is already floating in whitespace so
+          // it doesn't need the extra.
+          //
+          // overflow-x-hidden: sheets scroll with `overflow-y-auto`, and
+          // per the CSS spec setting one overflow axis to a scrolling
+          // value makes the other compute to `auto` too. So any child
+          // rendering even 1px wider than the phone viewport (iOS gives
+          // date/number inputs a slightly wide intrinsic size) let the
+          // whole sheet pan sideways, hiding content off-screen. Clipping
+          // the x-axis here kills the side-scroll for every sheet at once.
+          "fixed z-50 flex flex-col gap-4 overflow-x-hidden px-5 pb-4 md:px-4 bg-popover bg-clip-padding text-sm text-popover-foreground shadow-lg transition duration-200 ease-in-out data-ending-style:opacity-0 data-starting-style:opacity-0 data-[side=bottom]:inset-x-0 data-[side=bottom]:bottom-0 data-[side=bottom]:h-auto data-[side=bottom]:border-t data-[side=bottom]:data-ending-style:translate-y-[2.5rem] data-[side=bottom]:data-starting-style:translate-y-[2.5rem] data-[side=left]:inset-y-0 data-[side=left]:left-0 data-[side=left]:h-full data-[side=left]:w-3/4 data-[side=left]:border-r data-[side=left]:data-ending-style:translate-x-[-2.5rem] data-[side=left]:data-starting-style:translate-x-[-2.5rem] data-[side=right]:inset-y-0 data-[side=right]:right-0 data-[side=right]:h-full data-[side=right]:w-3/4 data-[side=right]:border-l data-[side=right]:data-ending-style:translate-x-[2.5rem] data-[side=right]:data-starting-style:translate-x-[2.5rem] data-[side=top]:inset-x-0 data-[side=top]:top-0 data-[side=top]:h-auto data-[side=top]:border-b data-[side=top]:data-ending-style:translate-y-[-2.5rem] data-[side=top]:data-starting-style:translate-y-[-2.5rem] data-[side=left]:sm:max-w-sm data-[side=right]:sm:max-w-sm",
           // Desktop (md+): bottom sheets become a right-side drawer. The app's
           // forms are all authored as `side="bottom"` phone sheets; full-width
           // form fields on a wide monitor are unusable, and a drawer keeps the
