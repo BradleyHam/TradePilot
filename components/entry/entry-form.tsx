@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource, WorkerKind } from '@/lib/types';
+import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource, WorkerKind, BusinessMember } from '@/lib/types';
 import { EXPENSE_CATEGORIES, ACTIVITY_TYPES } from '@/lib/mock-data';
 import { WORKER_KIND_LABELS } from '@/lib/worker-rates';
 import { useStore } from '@/lib/store';
@@ -47,6 +47,23 @@ const ENTRY_TYPES: { value: EntryType; label: string }[] = [
 
 const OVERHEAD_PREFIX = '[OH] ';
 
+// Split `total` hours across `n` activities in half-hour steps, spreading
+// any remainder half-hours across the first rows: 6h/3 → [2,2,2];
+// 7h/2 → [3.5,3.5]; 5h/3 → [2,1.5,1.5]. Integer maths on half-hour units
+// so we never emit 1.9999.
+function evenSplit(total: number, n: number): number[] {
+  if (n <= 0 || !isFinite(total) || total <= 0) return Array(Math.max(n, 0)).fill(0);
+  const halves = Math.round(total * 2);
+  const base = Math.floor(halves / n);
+  const rem = halves - base * n;
+  return Array.from({ length: n }, (_, i) => (base + (i < rem ? 1 : 0)) / 2);
+}
+
+// The "Who" quick-select: Brad, each employee by name, or a one-off
+// "someone else" (tier picker, not on payroll). Stored as 'me' | 'other' |
+// a BusinessMember id.
+type WhoSel = 'me' | 'other' | string;
+
 // Lead source chip options for the enquiry form. Ordered roughly by how
 // often Brad gets leads from each channel — most-common first so the chip
 // he wants is usually one tap. GMB attribution is fuzzy in practice (people
@@ -69,8 +86,17 @@ export function EntryForm({
   onSave,
   onCancel,
 }: EntryFormProps) {
-  const { jobs, entries } = useStore();
+  const { jobs, entries, teamMembers } = useStore();
   const today = new Date().toISOString().split('T')[0];
+
+  // Editing an existing row (has an id) vs creating. Some create flows pass
+  // partial defaultValues (e.g. schedule pre-fills entryDate), so presence of
+  // defaultValues alone doesn't mean edit.
+  const isEdit = Boolean(defaultValues?.id);
+  // Employees get "log on their behalf" pills. Payroll pays from rows
+  // attributed via loggedByUserId, so a pill-tap here genuinely reaches
+  // their timesheet — see handleSave.
+  const employeeMembers = teamMembers.filter((m) => m.role === 'employee');
 
   // When prefilling from an existing entry, strip the `[OH]` prefix so the
   // user sees the raw description and the Overhead toggle reflects the flag
@@ -86,14 +112,34 @@ export function EntryForm({
   const [amount, setAmount] = useState(defaultValues?.amount?.toString() ?? '');
   const [hours, setHours] = useState(defaultValues?.hours?.toString() ?? '');
   const [category, setCategory] = useState<ExpenseCategory | ''>(defaultValues?.category ?? '');
-  const [activity, setActivity] = useState<ActivityType | ''>(defaultValues?.activity ?? '');
-  // Hours-entry worker tier — defaults to 'owner' (Brad solo) for new
-  // entries, preserves whatever was saved when editing. Helper hours are
-  // no longer captured here — employees log their own time from their
-  // own login (/my/hours), which is what payroll pays from. (The legacy
-  // helperHours field still exists on old entries and job-stats still
-  // honours it — we just stopped creating new ones.)
-  const [workerKind, setWorkerKind] = useState<WorkerKind>(defaultValues?.workerKind ?? 'owner');
+  // Activities are multi-select in create mode: pick 2+ and the total gets
+  // split into one entry per activity (see the split UI below). Edit mode is
+  // single-select — an existing row IS one entry, we can't fan it out.
+  const [activities, setActivities] = useState<ActivityType[]>(
+    defaultValues?.activity ? [defaultValues.activity] : [],
+  );
+  // Per-activity hours (as strings, forgiving input) when 2+ activities are
+  // selected. Keyed by activity. Rebuilt on selection/total change.
+  const [splitHours, setSplitHours] = useState<Record<string, string>>({});
+  // Who did the work — 'me' (Brad), an employee member id (logged on their
+  // behalf, reaches payroll), or 'other' (one-off helper tier, not on
+  // payroll). Seeded from the row being edited: an attributed row maps back
+  // to its member pill; an unattributed non-owner tier maps to 'other'.
+  const [whoSel, setWhoSel] = useState<WhoSel>(() => {
+    const lb = defaultValues?.loggedByUserId;
+    if (lb) {
+      const m = teamMembers.find((t) => t.userId === lb);
+      return m && m.role === 'employee' ? m.id : 'me';
+    }
+    return (defaultValues?.workerKind ?? 'owner') === 'owner' ? 'me' : 'other';
+  });
+  // Worker tier for the 'other' path — defaults to 'helper' (the common
+  // one-off case). Preserves whatever was saved when editing.
+  const [workerKind, setWorkerKind] = useState<WorkerKind>(
+    (defaultValues?.workerKind && defaultValues.workerKind !== 'owner')
+      ? defaultValues.workerKind
+      : 'helper',
+  );
   const [jobId, setJobId] = useState(defaultValues?.jobId ?? '');
   // Overhead = no job, deliberately. Distinct from "I forgot to pick one".
   // Stored as `[OH]` description prefix; jobId stays null.
@@ -115,15 +161,66 @@ export function EntryForm({
   const [paymentRef, setPaymentRef] = useState(defaultValues?.paymentRef ?? '');
   const [company, setCompany] = useState(defaultValues?.company ?? '');
 
+  // Resolve the Who selection into the two fields the entry carries.
+  // - 'me'      → owner tier. Preserves an existing self-attribution when
+  //               editing (Brad's own /my/hours rows carry his uid).
+  // - member id → that member's tier + loggedByUserId = their auth uid, so
+  //               payroll picks the hours up exactly as if they'd logged it
+  //               from their own login.
+  // - 'other'   → picked tier, NO attribution (one-off helpers aren't on
+  //               payroll). Editing away a member attribution clears it.
+  function resolveWho(): { workerKind: WorkerKind; loggedByUserId?: string } {
+    if (whoSel === 'me') {
+      const orig = defaultValues?.loggedByUserId;
+      const origIsSelf = orig && teamMembers.find((m) => m.userId === orig)?.role !== 'employee';
+      return {
+        workerKind: 'owner',
+        // '' clears the column on edit; undefined leaves it unset on create.
+        loggedByUserId: origIsSelf ? orig : (isEdit ? '' : undefined),
+      };
+    }
+    if (whoSel === 'other') {
+      return { workerKind, loggedByUserId: isEdit ? '' : undefined };
+    }
+    const member = employeeMembers.find((m) => m.id === whoSel);
+    if (!member) return { workerKind: 'owner', loggedByUserId: isEdit ? '' : undefined };
+    return { workerKind: member.workerKind ?? 'helper', loggedByUserId: member.userId };
+  }
+
   function handleSave() {
     if (!description.trim()) return;
+
+    // Multi-activity hours (create mode only): one entry per activity with
+    // its slice of the hours. Same description/date/who/job on every slice —
+    // the activity + hours are the only thing that differ.
+    if (type === 'hours' && !isEdit && activities.length > 1) {
+      const who = resolveWho();
+      for (const a of activities) {
+        const h = parseFloat(splitHours[a] ?? '');
+        if (!isFinite(h) || h <= 0) continue;
+        onSave({
+          jobId: jobId || undefined,
+          type,
+          hours: h,
+          activity: a,
+          gstApplies: false,
+          description: description.trim(),
+          entryDate: entryDate || today,
+          workerKind: who.workerKind,
+          loggedByUserId: who.loggedByUserId,
+        });
+      }
+      return;
+    }
+
+    const who = type === 'hours' ? resolveWho() : undefined;
     onSave({
       jobId: jobId || undefined,
       type,
       category: (category as ExpenseCategory) || undefined,
       amount: amount ? parseFloat(amount) : undefined,
       hours: hours ? parseFloat(hours) : undefined,
-      activity: (activity as ActivityType) || undefined,
+      activity: activities[0] || undefined,
       supplier: supplier || undefined,
       gstApplies: type === 'expense' || type === 'income' || type === 'bill',
       // Tag overheads in the description so they're greppable later. Only
@@ -142,10 +239,11 @@ export function EntryForm({
       // Only attach lead source for enquiries — the picker is hidden for
       // other types so the state could be stale from a prior chip flip.
       leadSource: type === 'enquiry' ? (leadSource || undefined) : undefined,
-      // Worker tier — only meaningful for hours-type entries. The picker
-      // is hidden for other types so stale state from a chip flip
+      // Who did the work — only meaningful for hours-type entries. The
+      // picker is hidden for other types so stale state from a chip flip
       // doesn't leak through.
-      workerKind: type === 'hours' ? workerKind : undefined,
+      workerKind: who?.workerKind,
+      loggedByUserId: who?.loggedByUserId,
     });
   }
 
@@ -274,7 +372,7 @@ export function EntryForm({
         {type === 'hours' && (
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-              Hours
+              {activities.length > 1 ? 'Total hours' : 'Hours'}
             </label>
             <input
               type="number"
@@ -282,7 +380,18 @@ export function EntryForm({
               placeholder="0"
               step="0.5"
               value={hours}
-              onChange={(e) => setHours(e.target.value)}
+              onChange={(e) => {
+                setHours(e.target.value);
+                // Editing the total re-splits evenly across the selected
+                // activities — the total is the source of truth here; the
+                // per-activity rows below are for fine-tuning after.
+                if (activities.length > 1) {
+                  const parts = evenSplit(parseFloat(e.target.value), activities.length);
+                  setSplitHours(Object.fromEntries(
+                    activities.map((a, i) => [a, parts[i] ? String(parts[i]) : '']),
+                  ));
+                }
+              }}
               className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
             />
           </div>
@@ -307,62 +416,148 @@ export function EntryForm({
           </div>
         )}
 
-        {/* Activity */}
-        {type === 'hours' && (
-          <div>
-            <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-              Activity
-            </label>
-            <Select value={activity} onValueChange={(v) => setActivity(v as ActivityType)}>
-              <SelectTrigger className="h-9 text-sm">
-                <SelectValue placeholder="Select" />
-              </SelectTrigger>
-              <SelectContent>
-                {ACTIVITY_TYPES.map((a) => (
-                  <SelectItem key={a} value={a} className="capitalize">{a}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
-          </div>
-        )}
       </div>
 
-      {/* Who did the work — only for hours entries. Defaults to "Me".
-          Employees (Suzie) log their own hours from /my/hours — that's
-          what payroll pays from, so there's no helper-hours capture
-          here any more. */}
+      {/* Activity — tap pills, multi-select in create mode. Picking 2+
+          splits the total into one entry per activity: even split by
+          default (half-hour steps), fine-tune per row below. Edit mode is
+          single-select because an existing row is one entry. */}
       {type === 'hours' && (
         <div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
-              <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-                Who
-              </label>
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+            Activity{isEdit ? '' : ' — tap all that apply'}
+          </label>
+          <div className="flex flex-wrap gap-2">
+            {ACTIVITY_TYPES.map((a) => {
+              const selected = activities.includes(a);
+              return (
+                <button
+                  key={a}
+                  type="button"
+                  onClick={() => {
+                    const next = isEdit
+                      ? (selected ? [] : [a])
+                      : (selected ? activities.filter((x) => x !== a) : [...activities, a]);
+                    setActivities(next);
+                    if (next.length > 1) {
+                      const parts = evenSplit(parseFloat(hours), next.length);
+                      setSplitHours(Object.fromEntries(
+                        next.map((x, i) => [x, parts[i] ? String(parts[i]) : '']),
+                      ));
+                    }
+                  }}
+                  className={cn(
+                    'px-3 py-2 rounded-lg text-sm font-medium border capitalize transition-colors min-h-[44px]',
+                    selected
+                      ? 'bg-primary text-primary-foreground border-primary'
+                      : 'bg-background text-muted-foreground border-border hover:border-primary/40 hover:text-foreground',
+                  )}
+                >
+                  {a}
+                </button>
+              );
+            })}
+          </div>
+
+          {/* The split — one row per selected activity. Adjusting a row
+              updates the total (the rows are the truth once you're
+              hand-tuning); editing the total up top re-splits evenly. */}
+          {activities.length > 1 && (
+            <div className="mt-2 space-y-1.5">
+              {activities.map((a) => (
+                <div key={a} className="flex items-center gap-2">
+                  <span className="flex-1 text-sm capitalize text-foreground">{a}</span>
+                  <input
+                    type="number"
+                    inputMode="decimal"
+                    step="0.5"
+                    min="0"
+                    value={splitHours[a] ?? ''}
+                    onChange={(e) => {
+                      const next = { ...splitHours, [a]: e.target.value };
+                      setSplitHours(next);
+                      const sum = activities.reduce(
+                        (s, x) => s + (parseFloat(next[x] ?? '') || 0), 0);
+                      setHours(sum > 0 ? String(Math.round(sum * 100) / 100) : '');
+                    }}
+                    className="w-20 h-11 px-3 rounded-lg border border-input bg-background text-sm text-right focus:outline-none focus:ring-2 focus:ring-ring"
+                  />
+                  <span className="text-sm text-muted-foreground w-4">h</span>
+                </div>
+              ))}
+              <p className="text-[11px] text-muted-foreground leading-snug">
+                Saves as {activities.length} entries — one per activity.
+              </p>
+            </div>
+          )}
+        </div>
+      )}
+
+      {/* Who did the work — quick-select pills. "Me" (Brad), one pill per
+          employee (logs on their behalf WITH loggedByUserId, so payroll
+          picks it up exactly like a /my/hours row — the old "logged here
+          never reaches payroll" trap is gone for the pills), and "Someone
+          else" for one-off helpers, which reveals the tier picker and
+          keeps the payroll warning. */}
+      {type === 'hours' && (
+        <div>
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+            Who
+          </label>
+          <div className="flex flex-wrap gap-2">
+            {([
+              { key: 'me' as WhoSel, label: 'Me' },
+              ...employeeMembers.map((m: BusinessMember) => ({
+                key: m.id as WhoSel,
+                label: m.displayName || 'Team member',
+              })),
+              { key: 'other' as WhoSel, label: 'Someone else' },
+            ]).map(({ key, label }) => (
+              <button
+                key={key}
+                type="button"
+                onClick={() => setWhoSel(key)}
+                className={cn(
+                  'px-3 py-2 rounded-lg text-sm font-medium border transition-colors min-h-[44px]',
+                  whoSel === key
+                    ? 'bg-primary text-primary-foreground border-primary'
+                    : 'bg-background text-muted-foreground border-border hover:border-primary/40 hover:text-foreground',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+          {/* Attribution note — make the payroll consequence loud in both
+              directions, since the two pills look identical. */}
+          {whoSel !== 'me' && whoSel !== 'other' && (
+            <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
+              Logged on {employeeMembers.find((m) => m.id === whoSel)?.displayName ?? 'their'}&apos;s
+              behalf — counts for payroll, same as if they logged it themselves.
+            </p>
+          )}
+          {whoSel === 'other' && (
+            <div className="mt-2">
               <Select value={workerKind} onValueChange={(v) => setWorkerKind(v as WorkerKind)}>
-                <SelectTrigger className="h-9 text-sm">
+                <SelectTrigger className="h-9 text-sm w-full max-w-60">
                   <SelectValue />
                 </SelectTrigger>
                 <SelectContent>
-                  {(Object.keys(WORKER_KIND_LABELS) as WorkerKind[]).map((k) => (
-                    <SelectItem key={k} value={k}>{WORKER_KIND_LABELS[k]}</SelectItem>
-                  ))}
+                  {(Object.keys(WORKER_KIND_LABELS) as WorkerKind[])
+                    .filter((k) => k !== 'owner')
+                    .map((k) => (
+                      <SelectItem key={k} value={k}>{WORKER_KIND_LABELS[k]}</SelectItem>
+                    ))}
                 </SelectContent>
               </Select>
+              {/* Payroll trap warning — still real for this path: no
+                  attribution, so payroll never sees these hours. Fine for
+                  a one-off cash-job helper, wrong for staff. */}
+              <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-500 leading-snug">
+                One-off helpers only — these hours don&apos;t reach payroll. For
+                someone on payroll, use their pill above instead.
+              </p>
             </div>
-          </div>
-          {/* Payroll trap warning. An hours row logged HERE for an
-              employee tier carries no loggedByUserId, so payroll (which
-              pays from /my/hours rows) never sees it — the hours cost
-              into job stats but nobody gets paid for them, and the
-              wage-deduction paper trail the income-splitting setup
-              depends on goes missing. Warn, don't block: a one-off
-              cash-job helper legitimately lands here. */}
-          {(workerKind === 'helper' || workerKind === 'apprentice' || workerKind === 'experienced') && (
-            <p className="mt-1.5 text-[11px] text-amber-600 dark:text-amber-500 leading-snug">
-              Heads up: if this is someone on payroll (e.g. Suzie), they should
-              log it from their own login instead — hours logged here don&apos;t
-              reach payroll. Use this only for one-off helpers you pay directly.
-            </p>
           )}
         </div>
       )}

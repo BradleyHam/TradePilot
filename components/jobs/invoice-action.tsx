@@ -10,6 +10,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { Button } from '@/components/ui/button';
 import { Receipt, Upload, Undo2, Download } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { LogHoursPrompt, shouldPromptForHours } from './log-hours-prompt';
 
 const NZ_GST_RATE = 0.15;
 
@@ -47,8 +48,13 @@ interface InvoiceActionProps {
  *     action; not built tonight.
  */
 export function InvoiceAction({ job, open, onClose, invoice, initialFile }: InvoiceActionProps) {
-  const { invoices, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId, ensureJobHasQuote, addQuoteAttachments, getQuoteTemplate, quotes, resolveLogoUrl } = useStore();
+  const { invoices, entries, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId, ensureJobHasQuote, addQuoteAttachments, getQuoteTemplate, quotes, resolveLogoUrl } = useStore();
   const isEdit = invoice != null;
+
+  // Opens the "no hours on this job" quick-add right after a save that
+  // marked the invoice paid. Lives OUTSIDE the main Sheet (which will have
+  // closed by then) so the prompt survives onClose(). Null = closed.
+  const [hoursPromptJobId, setHoursPromptJobId] = useState<string | null>(null);
 
   // Invoice-PDF generation state (the "Download invoice PDF" button).
   const [pdfBusy, setPdfBusy] = useState(false);
@@ -414,6 +420,12 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       const wasPaid = invoice.paid;
       if (!wasPaid && markPaid) {
         markInvoicePaid(invoice.id, paidDate);
+        // Paid with zero hours on the job → prompt to backfill them so the
+        // $/h maths can exist. Uses the form's CURRENT kind (deposits are
+        // exempt — paid-before-work is their normal state).
+        if (shouldPromptForHours({ jobId: job.id, kind }, entries)) {
+          setHoursPromptJobId(job.id);
+        }
       }
       // Note: paid → unpaid would need to delete the linked income entry too.
       // Not handling it here; user can do via SQL if needed.
@@ -472,7 +484,12 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       // addInvoice resolves null (and has already surfaced the error +
       // rolled back the optimistic row), so there's nothing to mark paid.
       const created = await createdPromise;
-      if (created) markInvoicePaid(created.id, paidDate);
+      if (created) {
+        markInvoicePaid(created.id, paidDate);
+        if (shouldPromptForHours({ jobId: job.id, kind }, entries)) {
+          setHoursPromptJobId(job.id);
+        }
+      }
     }
 
     setSubmitting(false);
@@ -537,6 +554,7 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
   const allInvoiced = totalInvoicedSoFar >= totalWorkValue && totalWorkValue > 0;
 
   return (
+    <>
     <Sheet open={open} onOpenChange={onClose}>
       <SheetContent side="bottom" className="rounded-t-2xl p-0" showCloseButton={false}>
         <div className="h-auto max-h-[92vh] md:h-full md:max-h-none flex flex-col overflow-hidden">
@@ -791,6 +809,12 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
         </div>
       </SheetContent>
     </Sheet>
+
+    {/* "No hours on this job" quick-add — opens after Save & mark paid when
+        the job has zero hours logged. Sibling of the main Sheet so it can
+        show after that sheet has closed. */}
+    <LogHoursPrompt jobId={hoursPromptJobId} onClose={() => setHoursPromptJobId(null)} />
+    </>
   );
 }
 

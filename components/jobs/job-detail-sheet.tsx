@@ -20,7 +20,7 @@ import { downloadJobPhotos, isPhotoAttachment } from '@/lib/download-job-photos'
 import { cn } from '@/lib/utils';
 import { formatEntryDate } from '@/lib/format-date';
 import { JOB_STATUSES } from '@/lib/mock-data';
-import { JobStatus, LostReason, WonReason } from '@/lib/types';
+import { JobStatus, LostReason, WonReason, DepositNotYetReason } from '@/lib/types';
 import { jobStats, entryExGst } from '@/lib/job-stats';
 import { hoursByWorker, blendedTargetRate, allWorkerRates, describeMix } from '@/lib/worker-rates';
 import { HourlyRateGauge, IncomeVsExpenses, HoursByActivity } from './job-charts';
@@ -56,6 +56,23 @@ const TYPE_COLOR: Record<string, string> = {
   expense: 'text-red-500', income: 'text-green-500', hours: 'text-blue-500',
   enquiry: 'text-violet-500', quote: 'text-amber-500', bill: 'text-orange-500', note: 'text-slate-500',
 };
+
+// Labels for the deposit "Not yet" reason picked on Home's deposits flag.
+// Keep in sync with DEPOSIT_NOT_YET_PILLS in app/(app)/home/page.tsx —
+// lowercase here because they render mid-sentence ("Deposit reminder off —").
+const DEPOSIT_NOT_YET_LABELS: Record<DepositNotYetReason, string> = {
+  dates_not_locked: 'dates not locked in',
+  client_hold: 'client asked to hold',
+  in_person: 'sorting it in person',
+  no_deposit: 'no deposit for this job',
+};
+
+// Local-time today as YYYY-MM-DD (UTC drift moves the date near midnight NZ
+// time — same guard as Home's date helpers).
+function localTodayISO(): string {
+  const d = new Date();
+  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
 
 // Human-readable labels for the outcome reasons stored on a job. Keep these
 // in sync with the chip options in `outcome-sheet.tsx` — same wording so the
@@ -838,6 +855,38 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                 </Button>
               );
             })()}
+
+          {/* Deposit reminder quieted via Home's "Not yet" (045). Shown only
+              while the suppression is live — accepted, no deposit invoice yet,
+              and either "no deposit for this job" (indefinite) or a snooze
+              date still in the future. Without this line the 'no_deposit'
+              choice would be invisible and irreversible; "Turn back on"
+              clears both fields so the Home flag picks the job up again. */}
+          {liveJob.status === 'accepted'
+            && liveJob.depositNotYetReason
+            && !invoices.some((i) => i.jobId === liveJob.id && i.kind === 'deposit')
+            && (liveJob.depositNotYetReason === 'no_deposit'
+              || (liveJob.depositSnoozeUntil && liveJob.depositSnoozeUntil > localTodayISO()))
+            && (
+              <div className="flex items-center gap-2 rounded-xl border border-border bg-muted/40 px-3 py-2">
+                <p className="flex-1 text-xs text-muted-foreground">
+                  Deposit reminder off — {DEPOSIT_NOT_YET_LABELS[liveJob.depositNotYetReason]}
+                  {liveJob.depositNotYetReason !== 'no_deposit' && liveJob.depositSnoozeUntil
+                    ? ` · back ${formatEntryDate(liveJob.depositSnoozeUntil)}`
+                    : ''}
+                </p>
+                <button
+                  type="button"
+                  onClick={() => updateJob(liveJob.id, {
+                    depositNotYetReason: '' as unknown as DepositNotYetReason,
+                    depositSnoozeUntil: '',
+                  })}
+                  className="shrink-0 h-11 px-3 rounded-full border border-border bg-background text-foreground text-xs font-semibold hover:bg-accent transition-colors active:scale-95"
+                >
+                  Turn back on
+                </button>
+              </div>
+            )}
 
           <Separator />
 

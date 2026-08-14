@@ -5,6 +5,7 @@ import { useStore } from '@/lib/store';
 import type { Invoice } from '@/lib/types';
 import { Receipt, CheckCircle2, Circle } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { LogHoursPrompt, shouldPromptForHours } from './log-hours-prompt';
 
 const fmt = (n: number) =>
   `$${n.toLocaleString('en-NZ', { minimumFractionDigits: 2, maximumFractionDigits: 2 })}`;
@@ -28,7 +29,7 @@ interface InvoicesListProps {
  * inline action that opens a small popover for the payment date.
  */
 export function InvoicesList({ jobId, onEdit }: InvoicesListProps) {
-  const { invoices, markInvoicePaid } = useStore();
+  const { invoices, entries, markInvoicePaid } = useStore();
 
   const list = invoices
     .filter((i) => i.jobId === jobId)
@@ -36,6 +37,9 @@ export function InvoicesList({ jobId, onEdit }: InvoicesListProps) {
 
   const [activePaidPopoverId, setActivePaidPopoverId] = useState<string | null>(null);
   const [paidDate, setPaidDate] = useState<string>(() => new Date().toISOString().slice(0, 10));
+  // Set right after mark-paid when the job has zero hours logged — opens
+  // the "add the hours so the $/h dial works" prompt. Null = closed.
+  const [hoursPromptJobId, setHoursPromptJobId] = useState<string | null>(null);
 
   if (list.length === 0) return null;
 
@@ -129,6 +133,12 @@ export function InvoicesList({ jobId, onEdit }: InvoicesListProps) {
                       onClick={() => {
                         markInvoicePaid(inv.id, paidDate);
                         setActivePaidPopoverId(null);
+                        // Payday is the last natural moment to catch a job
+                        // with no hours — after this it's closed out and the
+                        // $/h insight never exists for it.
+                        if (shouldPromptForHours(inv, entries)) {
+                          setHoursPromptJobId(jobId);
+                        }
                       }}
                       className="h-9 px-3 rounded-lg bg-primary text-primary-foreground text-sm font-semibold"
                     >
@@ -144,6 +154,11 @@ export function InvoicesList({ jobId, onEdit }: InvoicesListProps) {
           );
         })}
       </div>
+
+      {/* "No hours on this job" quick-add — fires after mark-paid when the
+          job has zero hours logged. Non-blocking: the invoice is already
+          paid; dismissing loses nothing. */}
+      <LogHoursPrompt jobId={hoursPromptJobId} onClose={() => setHoursPromptJobId(null)} />
     </div>
   );
 }

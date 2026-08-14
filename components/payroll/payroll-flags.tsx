@@ -5,9 +5,12 @@
  * IRD gets its two follow-ups. Three flag types, all self-clearing:
  *
  *   1. "Pay {name}"      — a fortnight has ended with no pay run recorded.
- *                          Expands into a mark-paid form: hours × rate
- *                          pre-filled from her logged time, gross editable,
- *                          optional PAYE/net from the IRD calculator.
+ *                          Expands into a mark-paid form. Net-first: Brad
+ *                          reads the net off his banking app, the PAYE off
+ *                          the IRD calculator, and the gross fills itself
+ *                          (gross = net + PAYE). Any two of the three money
+ *                          fields derive the third; hours × rate pre-fills
+ *                          gross when the employee logged time.
  *   2. "File payday info" — a pay run is recorded but the myIR employment
  *                          information isn't (due 2 working days after
  *                          pay day). One tap to clear.
@@ -208,6 +211,14 @@ function PayEmployeeFlag({
   const [gross, setGross] = useState(String(suggestedGross || ''));
   const [paye, setPaye] = useState('');
   const [net, setNet] = useState('');
+  // Which money fields Brad has actually typed in. gross = net + PAYE, so
+  // whenever two values are known the untyped third fills itself — and a
+  // field he typed is never overwritten. The hours × rate gross prefill
+  // counts as NOT typed, so entering net + PAYE replaces the suggestion.
+  // Net comes first in the layout: the net is the number sitting in his
+  // banking app, the PAYE comes off the IRD calculator, and the gross —
+  // the number the books actually need — is derived.
+  const [touched, setTouched] = useState({ gross: false, paye: false, net: false });
   const [saving, setSaving] = useState(false);
 
   // Forgive "$1,487.50" / "1487.5" / " 1487 " — the tired-painter rule.
@@ -216,6 +227,54 @@ function PayEmployeeFlag({
     return Number.isFinite(n) && n > 0 ? n : undefined;
   };
   const grossNum = parseAmount(gross);
+
+  // Round to cents and render without float noise ("1487.5" not "1487.499…").
+  const r2 = (n: number): string => String(Math.round(n * 100) / 100);
+
+  // One handler per money field. Each marks its own field typed, then fills
+  // whichever counterpart can be derived — preferring a field with no value
+  // over overwriting a visible (but untyped) one, and never touching a
+  // typed field. All reads use this render's state, which is current: only
+  // the field being edited changes before the derivation runs.
+  const onNetChange = (s: string) => {
+    setNet(s);
+    setTouched((t) => ({ ...t, net: true }));
+    const n = parseAmount(s);
+    if (n == null) return;
+    const p = parseAmount(paye);
+    const g = parseAmount(gross);
+    if (p != null && !touched.gross) setGross(r2(n + p));
+    else if (p == null && g != null && g >= n && !touched.paye) setPaye(r2(g - n));
+  };
+  const onPayeChange = (s: string) => {
+    setPaye(s);
+    setTouched((t) => ({ ...t, paye: true }));
+    const p = parseAmount(s);
+    if (p == null) return;
+    const n = parseAmount(net);
+    const g = parseAmount(gross);
+    if (n != null && !touched.gross) setGross(r2(n + p));
+    else if (n == null && g != null && g > p && !touched.net) setNet(r2(g - p));
+  };
+  const onGrossChange = (s: string) => {
+    setGross(s);
+    setTouched((t) => ({ ...t, gross: true }));
+    const g = parseAmount(s);
+    if (g == null) return;
+    const p = parseAmount(paye);
+    const n = parseAmount(net);
+    if (p != null && g > p && !touched.net) setNet(r2(g - p));
+    else if (p == null && n != null && g >= n && !touched.paye) setPaye(r2(g - n));
+  };
+
+  // All three filled but they don't add up — usually a KiwiSaver or student
+  // loan deduction hiding in the gap, or a typo. Warn, never block: the
+  // typed gross is what saves, and Brad may know something the maths doesn't.
+  const payeNum = parseAmount(paye);
+  const netNum = parseAmount(net);
+  const mismatch =
+    grossNum != null && payeNum != null && netNum != null
+    && Math.abs(netNum + payeNum - grossNum) > 0.02;
 
   const save = async () => {
     if (!grossNum || saving) return;
@@ -280,40 +339,49 @@ function PayEmployeeFlag({
               />
             </label>
             <label className="block">
-              <span className="text-xs text-muted-foreground">Gross ($)</span>
+              <span className="text-xs text-muted-foreground">Net paid ($)</span>
               <input
                 type="text"
                 inputMode="decimal"
-                value={gross}
-                onChange={(e) => setGross(e.target.value)}
-                placeholder={String(suggestedGross || '')}
+                value={net}
+                onChange={(e) => onNetChange(e.target.value)}
+                placeholder="What hit their account"
                 className={inputCls}
               />
             </label>
             <label className="block">
-              <span className="text-xs text-muted-foreground">PAYE withheld (optional)</span>
+              <span className="text-xs text-muted-foreground">PAYE withheld</span>
               <input
                 type="text"
                 inputMode="decimal"
                 value={paye}
-                onChange={(e) => setPaye(e.target.value)}
+                onChange={(e) => onPayeChange(e.target.value)}
                 placeholder="From the IRD calculator"
                 className={inputCls}
               />
             </label>
             <label className="block">
-              <span className="text-xs text-muted-foreground">Net paid (optional)</span>
+              <span className="text-xs text-muted-foreground">Gross ($) — auto from net + PAYE</span>
               <input
                 type="text"
                 inputMode="decimal"
-                value={net}
-                onChange={(e) => setNet(e.target.value)}
-                placeholder="What hit her account"
+                value={gross}
+                onChange={(e) => onGrossChange(e.target.value)}
+                placeholder={String(suggestedGross || '')}
                 className={inputCls}
               />
             </label>
           </div>
+          {mismatch && (
+            <p className="text-xs text-amber-600 dark:text-amber-500 leading-snug">
+              These don&apos;t add up: {fmtMoney(netNum!)} net + {fmtMoney(payeNum!)} PAYE
+              = {fmtMoney(netNum! + payeNum!)}, but gross says {fmtMoney(grossNum!)}.
+              Fine if KiwiSaver or student loan also came out — otherwise
+              double-check the IRD calculator.
+            </p>
+          )}
           <p className="text-xs text-muted-foreground">
+            Enter any two and the third fills itself (gross = net + PAYE).
             Saves the gross as a wages expense (no GST) on the pay date, then
             reminds you to file payday info and pay the PAYE.
           </p>
@@ -322,7 +390,7 @@ function PayEmployeeFlag({
             disabled={!grossNum || saving}
             onClick={() => void save()}
           >
-            {saving ? 'Saving…' : grossNum ? `Mark paid — ${fmtMoney(grossNum)} gross` : 'Enter the gross amount'}
+            {saving ? 'Saving…' : grossNum ? `Mark paid — ${fmtMoney(grossNum)} gross` : 'Enter net + PAYE (or gross)'}
           </Button>
         </div>
       )}

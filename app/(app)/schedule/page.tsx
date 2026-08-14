@@ -695,7 +695,9 @@ export default function SchedulePage() {
   // handleFormSave so the entry shape stays consistent across the app.
   function handleAddEntry(data: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) {
     addEntry({
-      id: `ent_${Date.now()}`,
+      // UUID, not Date.now() — a multi-activity hours split saves several
+      // entries in the same millisecond, and timestamp ids collide.
+      id: `ent_${crypto.randomUUID()}`,
       businessId: businessId ?? '',
       createdAt: new Date().toISOString(),
       ...data,

@@ -33,6 +33,7 @@ import { BillDetailSheet } from '@/components/bills/bill-detail-sheet';
 import { PayrollFlags } from '@/components/payroll/payroll-flags';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { InvoiceAction } from '@/components/jobs/invoice-action';
+import { LogHoursPrompt, shouldPromptForHours } from '@/components/jobs/log-hours-prompt';
 import { EditScheduleItemSheet, type ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
@@ -220,6 +221,10 @@ export default function HomePage() {
   // When set, the InvoiceAction sheet opens in create mode for this job —
   // pre-filled as a deposit. Driven by the "Deposits to send" Home flag.
   const [depositForJob, setDepositForJob] = useState<Job | null>(null);
+  // "No hours on this job" quick-add — fires after the overdue-invoices
+  // flag's Mark paid when the invoice's job has zero hours logged, so the
+  // hourly-rate maths can exist before the job is closed out. Null = closed.
+  const [hoursPromptJobId, setHoursPromptJobId] = useState<string | null>(null);
 
   // Reschedule sheet — opened by tapping any Today row. Stores item ids
   // (not the items themselves) so we re-resolve from the live store on
@@ -653,7 +658,15 @@ export default function HomePage() {
             onSnoozeFollowUp={(jobId, untilISO) =>
               updateJob(jobId, { snoozeUntil: untilISO })
             }
-            onMarkInvoicePaid={(id, paidDate) => markInvoicePaid(id, paidDate)}
+            onMarkInvoicePaid={(id, paidDate) => {
+              markInvoicePaid(id, paidDate);
+              // Paid with zero hours on the job → prompt to backfill them
+              // (deposits exempt — paid-before-work is their normal state).
+              const inv = invoices.find((i) => i.id === id);
+              if (inv?.jobId && shouldPromptForHours(inv, entries)) {
+                setHoursPromptJobId(inv.jobId);
+              }
+            }}
             onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
             onConfirmDraft={(id, { jobId, materials }) =>
               void confirmBillDraftWithMaterials(id, { jobId, materials })
@@ -844,6 +857,10 @@ export default function HomePage() {
         target={reschedulingTarget}
         jobs={jobs}
       />
+
+      {/* "No hours on this job" quick-add — opens right after Mark paid on
+          the overdue-invoices flag when the job has zero hours logged. */}
+      <LogHoursPrompt jobId={hoursPromptJobId} onClose={() => setHoursPromptJobId(null)} />
     </div>
   );
 }
@@ -1459,13 +1476,29 @@ function MoneyFlagsCard({
 // job's quote + the quote template), so the booking-securing invoice is one
 // review-and-save away — matching the rest of the dashboard's keep-it-on-Home
 // action loop.
+// Each card also gets a "Not yet" out (added August 2026 — same lesson as
+// the follow-up ladder: a nag with no "not now" option is a nag that gets
+// ignored). Tapping it swaps the buttons for four reason pills; picking one
+// records the reason on the job and quiets the row — a week for "sort in
+// person", a fortnight for the two delays, for good for "no deposit".
+const DEPOSIT_NOT_YET_PILLS: { reason: DepositNotYetReason; label: string; hint: string }[] = [
+  { reason: 'dates_not_locked', label: 'Dates not locked in', hint: 'Comes back in 2 weeks' },
+  { reason: 'client_hold', label: 'Client asked to hold', hint: 'Comes back in 2 weeks' },
+  { reason: 'in_person', label: 'Will sort in person', hint: 'Comes back in a week' },
+  { reason: 'no_deposit', label: 'No deposit for this job', hint: "Won't ask again" },
+];
+
 function DepositToSendFlag({
-  jobs, onIssueDeposit,
+  jobs, onIssueDeposit, onNotYet,
 }: {
   jobs: Job[];
   onIssueDeposit: (job: Job) => void;
+  onNotYet: (job: Job, reason: DepositNotYetReason) => void;
 }) {
   const [open, setOpen] = useState(false);
+  // Job id currently showing the reason pills instead of its buttons.
+  // One at a time is plenty — picking a reason removes the row anyway.
+  const [pickingFor, setPickingFor] = useState<string | null>(null);
 
   return (
     <div>
@@ -1496,29 +1529,74 @@ function DepositToSendFlag({
       </button>
       {open && (
         <ul className="px-2 pb-2 space-y-2 bg-muted/30">
-          {jobs.map((job) => (
-            <li
-              key={job.id}
-              className="bg-card border border-border rounded-xl flex items-center gap-3 px-3 py-2 min-h-[56px]"
-            >
-              <div className="flex-1 min-w-0">
-                <p className="text-sm font-semibold text-foreground truncate">
-                  {job.name}
-                </p>
-                <p className="text-xs text-muted-foreground truncate">
-                  {job.clientName}
-                  {job.quoteAmount ? ` · quote ${fmtMoney(job.quoteAmount)}` : ''}
-                </p>
-              </div>
-              <button
-                type="button"
-                onClick={(e) => { e.stopPropagation(); onIssueDeposit(job); }}
-                className="shrink-0 h-11 px-4 rounded-full bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold transition-colors active:scale-95"
+          {jobs.map((job) => {
+            const picking = pickingFor === job.id;
+            return (
+              <li
+                key={job.id}
+                className="bg-card border border-border rounded-xl px-3 py-2.5 space-y-2"
               >
-                Issue deposit
-              </button>
-            </li>
-          ))}
+                <div className="flex-1 min-w-0">
+                  <p className="text-sm font-semibold text-foreground truncate">
+                    {job.name}
+                  </p>
+                  <p className="text-xs text-muted-foreground truncate">
+                    {job.clientName}
+                    {job.quoteAmount ? ` · quote ${fmtMoney(job.quoteAmount)}` : ''}
+                  </p>
+                </div>
+                {picking ? (
+                  <>
+                    <p className="text-xs text-muted-foreground">
+                      No worries — why not?
+                    </p>
+                    <div className="grid grid-cols-2 gap-1.5">
+                      {DEPOSIT_NOT_YET_PILLS.map((p) => (
+                        <button
+                          key={p.reason}
+                          type="button"
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            setPickingFor(null);
+                            onNotYet(job, p.reason);
+                          }}
+                          title={p.hint}
+                          className="min-h-11 px-3 py-1.5 rounded-xl border border-border bg-background text-foreground text-xs font-semibold hover:bg-accent transition-colors active:scale-95 text-center leading-snug"
+                        >
+                          {p.label}
+                        </button>
+                      ))}
+                    </div>
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setPickingFor(null); }}
+                      className="w-full h-11 px-3 rounded-full text-muted-foreground text-xs font-semibold hover:bg-accent transition-colors"
+                    >
+                      Cancel
+                    </button>
+                  </>
+                ) : (
+                  <div className="flex items-center gap-1.5">
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); setPickingFor(job.id); }}
+                      title="Quiet this one for a bit and note why — it comes back by itself"
+                      className="flex-1 h-11 px-3 rounded-full border border-border bg-background text-foreground text-xs font-semibold hover:bg-accent transition-colors active:scale-95"
+                    >
+                      Not yet
+                    </button>
+                    <button
+                      type="button"
+                      onClick={(e) => { e.stopPropagation(); onIssueDeposit(job); }}
+                      className="flex-1 h-11 px-3 rounded-full bg-primary hover:bg-primary/90 text-primary-foreground text-xs font-semibold transition-colors active:scale-95"
+                    >
+                      Issue deposit
+                    </button>
+                  </div>
+                )}
+              </li>
+            );
+          })}
         </ul>
       )}
     </div>

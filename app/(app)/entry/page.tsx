@@ -103,7 +103,9 @@ export default function EntryPage() {
     }
 
     const entry: Entry = {
-      id: `ent_${Date.now()}`,
+      // UUID, not Date.now() — a multi-activity hours split saves several
+      // entries in the same millisecond, and timestamp ids collide.
+      id: `ent_${crypto.randomUUID()}`,
       businessId: businessId ?? '',
       createdAt: nowIso,
       ...data,
