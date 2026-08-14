@@ -154,3 +154,17 @@
     letter-spacing: -0.011em;
   }
 }
+/* iOS safe-area utilities. The manifest sets viewportFit: 'cover', so in
+   the installed PWA the web view draws edge-to-edge — under the status
+   bar / Dynamic Island at the top and the home indicator at the bottom.
+   Without these, every page header rendered beneath the iPhone's clock
+   (which is how the Home settings gear stayed invisible for a day).
+   `pb-safe` was already referenced by the bottom nav but never defined —
+   Tailwind silently ignores unknown classes, so it did nothing until now.
+   In desktop browsers env() resolves to 0 and both are no-ops. */
+@utility pt-safe {
+  padding-top: env(safe-area-inset-top);
+}
+@utility pb-safe {
+  padding-bottom: env(safe-area-inset-bottom);
+}
