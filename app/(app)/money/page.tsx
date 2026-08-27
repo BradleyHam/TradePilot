@@ -16,8 +16,9 @@ import {
 } from '@/components/money/timeframe-selector';
 import {
   earnedIncomeInWindow, cashIncomeExGstInWindow, earnedIncomeByMonth,
-  expensesInWindow,
+  expensesInWindow, incurredExpenseBreakdown, incurredExpensesInWindow,
 } from '@/lib/income-allocator';
+import { unbilledLabourInWindow } from '@/lib/labour-accrual';
 import { MonthlyData, CategoryData } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import {
@@ -70,14 +71,27 @@ export default function MoneyPage() {
   );
   const revenue = basis === 'earned' ? earnedRevenue : cashRevenue;
 
-  // Expenses — ex-GST, INCLUDING paid bills (by paidDate, matching the
-  // payments-basis GST registration). This was previously expense-type
-  // entries only, at gross — which omitted every supplier bill (the
-  // biggest cost) and disagreed with Home's numbers.
-  const expenses = useMemo(
+  // Expenses, ex-GST. Two versions, matching the two bases — otherwise
+  // profit compares earned revenue against cash costs and flatters every
+  // month with an unpaid bill or an un-invoiced sub in it.
+  //
+  // Cash: expense entries by date + PAID bills by paidDate. Payments
+  // basis, same as the GST return and the tax estimate.
+  const cashExpenses = useMemo(
     () => expensesInWindow(entries, frame.start, frame.end),
     [entries, frame.start, frame.end],
   );
+  // Earned: costs when INCURRED — bills from their bill date paid or not,
+  // plus sub/helper hours nobody has invoiced yet. Management figure; it
+  // never reaches GST or income tax.
+  const incurred = useMemo(
+    () => incurredExpenseBreakdown(entries, frame.start, frame.end),
+    [entries, frame.start, frame.end],
+  );
+  const expenses = basis === 'earned' ? incurred.total : cashExpenses;
+  // What part of the earned-basis number hasn't left the bank yet — the
+  // line that explains an Expenses card bigger than the Cash view.
+  const notYetPaid = incurred.billedUnpaid + incurred.unbilledLabour;
   const profit = revenue - expenses;
   const totalHoursInWindow = useMemo(
     () => windowEntries.filter((e) => e.type === 'hours').reduce((s, e) => s + (e.hours ?? 0), 0),
@@ -148,7 +162,10 @@ export default function MoneyPage() {
       return {
         month: format(m, 'MMM'),
         revenue: basis === 'earned' ? earnedRev : cashRev,
-        expenses: expensesInWindow(entries, mStart, mEnd),
+        // Costs follow the same basis as the bars they sit against.
+        expenses: basis === 'earned'
+          ? incurredExpensesInWindow(entries, mStart, mEnd)
+          : expensesInWindow(entries, mStart, mEnd),
       };
     });
   }, [entries, jobs, chartRange, basis, now]);
@@ -170,16 +187,27 @@ export default function MoneyPage() {
       if (e.type === 'expense') {
         inWindow = e.entryDate >= frame.start && e.entryDate <= frame.end;
       } else if (e.type === 'bill') {
-        inWindow = !!e.paid && !!e.paidDate && e.paidDate >= frame.start && e.paidDate <= frame.end;
+        // Earned basis dates a bill by the bill itself; cash basis waits
+        // for the payment. Same rule as the Expenses card, so the bars
+        // always sum to it.
+        inWindow = basis === 'earned'
+          ? e.entryDate >= frame.start && e.entryDate <= frame.end
+          : !!e.paid && !!e.paidDate && e.paidDate >= frame.start && e.paidDate <= frame.end;
       }
       if (!inWindow) continue;
       const cat = e.category ?? 'other';
       map[cat] = (map[cat] ?? 0) + exGst(e);
     }
+    // Sub / helper hours nobody has invoiced yet are a labour cost — on the
+    // earned basis they belong in the breakdown like any other.
+    if (basis === 'earned') {
+      const labour = unbilledLabourInWindow(entries, frame.start, frame.end);
+      if (labour > 0) map.labour = (map.labour ?? 0) + labour;
+    }
     return Object.entries(map)
       .map(([category, amount]) => ({ category, amount }))
       .sort((a, b) => b.amount - a.amount);
-  }, [entries, frame.start, frame.end]);
+  }, [entries, frame.start, frame.end, basis]);
 
   const fmt = (n: number) => `$${n.toLocaleString('en-NZ')}`;
 
@@ -237,8 +265,8 @@ export default function MoneyPage() {
             </div>
             <p className="text-[10px] text-muted-foreground italic flex-1">
               {basis === 'earned'
-                ? 'Income split across months by hours worked. Pending jobs excluded.'
-                : 'Income on the date payment hit the bank.'}
+                ? 'Income split across months by hours worked; costs counted when incurred, paid or not.'
+                : 'Income and costs on the date the money moved.'}
             </p>
           </div>
         </div>
@@ -259,6 +287,9 @@ export default function MoneyPage() {
             value={fmt(expenses)}
             icon={Receipt}
             accent="red"
+            subvalue={basis === 'earned' && notYetPaid > 0
+              ? `Incl. ${fmt(notYetPaid)} not paid yet`
+              : undefined}
           />
           <StatCard
             label="Estimated profit"

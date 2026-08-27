@@ -5,6 +5,7 @@ import { EntryType, Entry, ExpenseCategory, ActivityType, LeadSource, WorkerKind
 import { EXPENSE_CATEGORIES, ACTIVITY_TYPES } from '@/lib/mock-data';
 import { WORKER_KIND_LABELS } from '@/lib/worker-rates';
 import { useStore } from '@/lib/store';
+import { lastCostRateFor } from '@/lib/labour-accrual';
 import { JobPicker } from '@/components/shared/job-picker';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -20,6 +21,13 @@ import { cn } from '@/lib/utils';
 interface EntryFormProps {
   defaultType?: EntryType;
   /**
+   * Lock the form to `defaultType` (or the edited row's type) and hide the
+   * entry-type pill row entirely. Used by callers that are explicitly an
+   * hours flow (e.g. the schedule's "Log hours") where offering Expense /
+   * Income / Quote etc. is just noise.
+   */
+  lockType?: boolean;
+  /**
    * If provided, the form starts in "edit" mode: fields are prefilled, save
    * button reads "Update", and an `onDelete` button (if supplied) is shown.
    */
@@ -32,6 +40,21 @@ interface EntryFormProps {
    */
   onDelete?: () => void;
   onSave: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) => void;
+  /**
+   * Create an ADDITIONAL entry, on top of the one `onSave` handles.
+   *
+   * Only used by hours edit sheets. An hours row is one person's shift, so
+   * tagging a second person on an existing row can't be done by editing that
+   * row — the extra people need rows of their own. Supply this and the Who
+   * pills go multi-select in edit mode: the first person picked updates the
+   * row being edited (via `onSave`), everyone else comes through here as a
+   * new entry with the same date / job / activity / hours.
+   *
+   * Leave it out and edit mode stays single-select (tapping a pill swaps
+   * who the row belongs to), which is the right behaviour for callers that
+   * can only write back to one id.
+   */
+  onSaveAdditional?: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) => void;
   onCancel: () => void;
 }
 
@@ -80,10 +103,12 @@ const LEAD_SOURCE_OPTIONS: { value: LeadSource; label: string }[] = [
 
 export function EntryForm({
   defaultType = 'expense',
+  lockType = false,
   defaultValues,
   submitLabel,
   onDelete,
   onSave,
+  onSaveAdditional,
   onCancel,
 }: EntryFormProps) {
   const { jobs, entries, teamMembers } = useStore();
@@ -93,6 +118,11 @@ export function EntryForm({
   // partial defaultValues (e.g. schedule pre-fills entryDate), so presence of
   // defaultValues alone doesn't mean edit.
   const isEdit = Boolean(defaultValues?.id);
+  // Can this form fan a save out into more than one row? Always true when
+  // creating. On edit it needs `onSaveAdditional` — without it there is
+  // nowhere for a second person's entry to go, so the pills stay
+  // single-select rather than promising something the caller can't do.
+  const canFanOut = !isEdit || Boolean(onSaveAdditional);
   // Employees get "log on their behalf" pills. Payroll pays from rows
   // attributed via loggedByUserId, so a pill-tap here genuinely reaches
   // their timesheet — see handleSave.
@@ -121,18 +151,23 @@ export function EntryForm({
   // Per-activity hours (as strings, forgiving input) when 2+ activities are
   // selected. Keyed by activity. Rebuilt on selection/total change.
   const [splitHours, setSplitHours] = useState<Record<string, string>>({});
-  // Who did the work — 'me' (Brad), an employee member id (logged on their
+  // Who did the work — 'me' (Brad), employee member ids (logged on their
   // behalf, reaches payroll), or 'other' (one-off helper tier, not on
-  // payroll). Seeded from the row being edited: an attributed row maps back
-  // to its member pill; an unattributed non-owner tier maps to 'other'.
-  const [whoSel, setWhoSel] = useState<WhoSel>(() => {
+  // payroll). MULTI-select: pick everyone who was on site and each person
+  // gets their own entry with the full hours (two people on an 8h day both
+  // worked 8h). On edit, multi-select needs `onSaveAdditional` — the row
+  // being edited is one person's, and the extras become new rows beside it.
+  // Seeded from the row being edited: an attributed row maps back to its
+  // member pill; an unattributed non-owner tier → 'other'.
+  const [whoSels, setWhoSels] = useState<WhoSel[]>(() => {
     const lb = defaultValues?.loggedByUserId;
     if (lb) {
       const m = teamMembers.find((t) => t.userId === lb);
-      return m && m.role === 'employee' ? m.id : 'me';
+      return [m && m.role === 'employee' ? m.id : 'me'];
     }
-    return (defaultValues?.workerKind ?? 'owner') === 'owner' ? 'me' : 'other';
+    return [(defaultValues?.workerKind ?? 'owner') === 'owner' ? 'me' : 'other'];
   });
+  const whoSel = whoSels[0] ?? 'me'; // representative, used by edit-mode paths
   // Worker tier for the 'other' path — defaults to 'helper' (the common
   // one-off case). Preserves whatever was saved when editing.
   const [workerKind, setWorkerKind] = useState<WorkerKind>(
@@ -140,6 +175,43 @@ export function EntryForm({
       ? defaultValues.workerKind
       : 'helper',
   );
+  // Name for the 'other' path — the subbie or one-off helper who has no
+  // login to attribute to. Optional; without it the row can only ever say
+  // "Subcontractor", which is no help months later.
+  const [workerName, setWorkerName] = useState(defaultValues?.workerName ?? '');
+  // What this person costs per hour, ex-GST. Drives the unbilled-labour
+  // accrual (lib/labour-accrual.ts) — leave it blank and the hours cost
+  // the job nothing, which is the honest answer when Brad doesn't know
+  // the rate yet.
+  const [costRate, setCostRate] = useState(
+    defaultValues?.workerCostRate ? String(defaultValues.workerCostRate) : '',
+  );
+  // Once he's typed in the rate box we stop auto-filling it from history,
+  // so a remembered rate can never overwrite what he just entered.
+  const [rateTouched, setRateTouched] = useState(Boolean(defaultValues?.workerCostRate));
+  // Has the worker actually invoiced these hours? Ticking it retires the
+  // accrual so their bill is the only thing counting. Normally set by the
+  // prompt when confirming that bill; this is the manual fallback.
+  const [labourBilled, setLabourBilled] = useState(Boolean(defaultValues?.labourBilled));
+
+  /** Pre-fill the rate with what this person was last paid, unless Brad
+   *  has already typed one. Called from the name + tier controls rather
+   *  than an effect (the repo lints against setState inside effects). */
+  function autoFillRate(name: string, kind: WorkerKind) {
+    if (rateTouched) return;
+    const remembered = lastCostRateFor(entries, name, kind);
+    setCostRate(remembered ? String(remembered) : '');
+  }
+  // What this person was last paid — shown as the placeholder so the box
+  // reads as "same as last time?" rather than empty.
+  const rememberedRate = lastCostRateFor(entries, workerName, workerKind);
+  // Live "so what does this shift cost me" hint. Rounded — it's a sanity
+  // check next to the box, not an invoice.
+  const parsedRate = parseFloat(costRate);
+  const parsedHours = parseFloat(hours);
+  const costHint = (parsedRate > 0 && parsedHours > 0)
+    ? `= $${Math.round(parsedRate * parsedHours).toLocaleString('en-NZ')} for ${parsedHours}h`
+    : undefined;
   const [jobId, setJobId] = useState(defaultValues?.jobId ?? '');
   // Overhead = no job, deliberately. Distinct from "I forgot to pick one".
   // Stored as `[OH]` description prefix; jobId stays null.
@@ -169,51 +241,167 @@ export function EntryForm({
   //               from their own login.
   // - 'other'   → picked tier, NO attribution (one-off helpers aren't on
   //               payroll). Editing away a member attribution clears it.
-  function resolveWho(): { workerKind: WorkerKind; loggedByUserId?: string } {
-    if (whoSel === 'me') {
+  /** '' clears a name the row used to carry; undefined leaves the column
+   *  alone entirely (so a save never writes worker_name unless a name is
+   *  actually in play). */
+  const clearNameIfAny = defaultValues?.workerName ? '' : undefined;
+  /** 0 clears a rate the row used to carry (0 accrues nothing); undefined
+   *  leaves the column untouched. */
+  const clearRateIfAny = defaultValues?.workerCostRate ? 0 : undefined;
+  const clearBilledIfAny = defaultValues?.labourBilled ? false : undefined;
+
+  /** Which Who pill an existing hours row belongs to. Mirrors the seeding
+   *  logic for `whoSels` — same row in, same pill out. */
+  function selForEntry(e: Entry): WhoSel {
+    if (e.loggedByUserId) {
+      const m = teamMembers.find((t) => t.userId === e.loggedByUserId);
+      return m && m.role === 'employee' ? m.id : 'me';
+    }
+    return (e.workerKind ?? 'owner') === 'owner' ? 'me' : 'other';
+  }
+
+  /**
+   * Who already has hours on this job + day, other than the row being
+   * edited. Tagging a second person creates a row for them, and that row is
+   * NOT visible the next time this entry is opened — so without this guard,
+   * re-tapping Suzie on a later edit would quietly log her hours twice.
+   * Double-counted hours move payroll and the job's cost, so the pills say
+   * she's already on, and the save skips her.
+   */
+  const siblingSels: Set<WhoSel> = new Set(
+    type === 'hours' && isEdit
+      ? entries
+          .filter((e) => e.type === 'hours'
+            && e.id !== defaultValues?.id
+            && e.entryDate === (entryDate || today)
+            && (e.jobId ?? '') === (jobId || ''))
+          .map(selForEntry)
+      : [],
+  );
+
+  function resolveWho(sel: WhoSel = whoSel): {
+    workerKind: WorkerKind;
+    loggedByUserId?: string;
+    workerName?: string;
+    workerCostRate?: number;
+    labourBilled?: boolean;
+  } {
+    if (sel === 'me') {
       const orig = defaultValues?.loggedByUserId;
       const origIsSelf = orig && teamMembers.find((m) => m.userId === orig)?.role !== 'employee';
       return {
         workerKind: 'owner',
         // '' clears the column on edit; undefined leaves it unset on create.
         loggedByUserId: origIsSelf ? orig : (isEdit ? '' : undefined),
+        workerName: clearNameIfAny,
+        // Brad's own time isn't a cost to the job — it's what the job pays
+        // him. Never accrues.
+        workerCostRate: clearRateIfAny,
+        labourBilled: clearBilledIfAny,
       };
     }
-    if (whoSel === 'other') {
-      return { workerKind, loggedByUserId: isEdit ? '' : undefined };
+    if (sel === 'other') {
+      const rate = parseFloat(costRate);
+      const priced = Number.isFinite(rate) && rate > 0;
+      return {
+        workerKind,
+        loggedByUserId: isEdit ? '' : undefined,
+        workerName: workerName.trim() || clearNameIfAny,
+        workerCostRate: priced ? rate : clearRateIfAny,
+        labourBilled: priced ? labourBilled : clearBilledIfAny,
+      };
     }
-    const member = employeeMembers.find((m) => m.id === whoSel);
-    if (!member) return { workerKind: 'owner', loggedByUserId: isEdit ? '' : undefined };
-    return { workerKind: member.workerKind ?? 'helper', loggedByUserId: member.userId };
+    const member = employeeMembers.find((m) => m.id === sel);
+    if (!member) {
+      return {
+        workerKind: 'owner',
+        loggedByUserId: isEdit ? '' : undefined,
+        workerName: clearNameIfAny,
+        workerCostRate: clearRateIfAny,
+        labourBilled: clearBilledIfAny,
+      };
+    }
+    // A team member has their own name — a typed-in one would only ever
+    // contradict it. No cost rate either: staff are paid through pay runs,
+    // and accruing them here would double-count the wages.
+    return {
+      workerKind: member.workerKind ?? 'helper',
+      loggedByUserId: member.userId,
+      workerName: clearNameIfAny,
+      workerCostRate: clearRateIfAny,
+      labourBilled: clearBilledIfAny,
+    };
+  }
+
+  /** Toggle a Who pill. Toggles membership but never empties the set —
+   *  hours always belong to somebody, and a save with nobody picked would
+   *  silently drop attribution. When the caller can't take extra rows
+   *  (`canFanOut` false) a tap replaces instead, so edit stays a swap. */
+  function toggleWho(key: WhoSel) {
+    if (!canFanOut) {
+      setWhoSels([key]);
+      return;
+    }
+    setWhoSels((prev) => {
+      if (prev.includes(key)) {
+        const next = prev.filter((k) => k !== key);
+        return next.length > 0 ? next : prev;
+      }
+      return [...prev, key];
+    });
   }
 
   function handleSave() {
     if (!description.trim()) return;
 
-    // Multi-activity hours (create mode only): one entry per activity with
-    // its slice of the hours. Same description/date/who/job on every slice —
-    // the activity + hours are the only thing that differ.
-    if (type === 'hours' && !isEdit && activities.length > 1) {
-      const who = resolveWho();
-      for (const a of activities) {
-        const h = parseFloat(splitHours[a] ?? '');
-        if (!isFinite(h) || h <= 0) continue;
-        onSave({
-          jobId: jobId || undefined,
-          type,
-          hours: h,
-          activity: a,
-          gstApplies: false,
-          description: description.trim(),
-          entryDate: entryDate || today,
-          workerKind: who.workerKind,
-          loggedByUserId: who.loggedByUserId,
-        });
+    // Multi-activity and/or multi-person hours (create mode only): one entry
+    // per PERSON per ACTIVITY. Same description/date/job on every row — the
+    // person, activity and hours are the only things that differ. Everyone
+    // picked gets the full hours (two people on an 8h day both worked 8h);
+    // the activity split, when present, applies to each person alike.
+    if (type === 'hours' && !isEdit && (activities.length > 1 || whoSels.length > 1)) {
+      let slices: { activity: ActivityType | undefined; hours: number | undefined }[];
+      if (activities.length > 1) {
+        slices = activities
+          .map((a) => ({ activity: a as ActivityType | undefined, hours: parseFloat(splitHours[a] ?? '') }))
+          .filter((s) => isFinite(s.hours!) && s.hours! > 0);
+      } else {
+        slices = [{
+          activity: activities[0] || undefined,
+          hours: hours ? parseFloat(hours) : undefined,
+        }];
+      }
+      if (slices.length === 0) return;
+      for (const sel of whoSels) {
+        const who = resolveWho(sel);
+        for (const s of slices) {
+          onSave({
+            jobId: jobId || undefined,
+            type,
+            hours: s.hours,
+            activity: s.activity,
+            gstApplies: false,
+            description: description.trim(),
+            entryDate: entryDate || today,
+            workerKind: who.workerKind,
+            loggedByUserId: who.loggedByUserId,
+            workerName: who.workerName,
+            workerCostRate: who.workerCostRate,
+            labourBilled: who.labourBilled,
+          });
+        }
       }
       return;
     }
 
     const who = type === 'hours' ? resolveWho() : undefined;
+    // Editing an hours row and more than one person is now tagged: the row
+    // itself becomes the first person's (below), and everyone else needs a
+    // row of their own. Same date, job, activity, description and hours —
+    // two people on a 6.5h day each worked 6.5h, same rule as create mode.
+    const extraWhoSels = type === 'hours' && isEdit && onSaveAdditional
+      ? whoSels.slice(1)
+      : [];
     onSave({
       jobId: jobId || undefined,
       type,
@@ -244,12 +432,43 @@ export function EntryForm({
       // doesn't leak through.
       workerKind: who?.workerKind,
       loggedByUserId: who?.loggedByUserId,
+      workerName: who?.workerName,
+      workerCostRate: who?.workerCostRate,
+      labourBilled: who?.labourBilled,
     });
+
+    // The extra people, as new rows. Deliberately after the primary save:
+    // if anything here fails, the edit the user actually made is already in.
+    for (const sel of extraWhoSels) {
+      // They already have hours on this job + day — see `siblingSels`.
+      if (siblingSels.has(sel)) continue;
+      const extra = resolveWho(sel);
+      onSaveAdditional!({
+        jobId: jobId || undefined,
+        type: 'hours',
+        hours: hours ? parseFloat(hours) : undefined,
+        activity: activities[0] || undefined,
+        gstApplies: false,
+        description: description.trim(),
+        entryDate: entryDate || today,
+        workerKind: extra.workerKind,
+        // `resolveWho` returns ''/0 to CLEAR a column on the row being
+        // edited. A new row has nothing to clear, so those become undefined
+        // — an unset rate reads as "rate unknown" downstream, where 0 would
+        // read as "this person cost the job nothing".
+        loggedByUserId: extra.loggedByUserId || undefined,
+        workerName: extra.workerName || undefined,
+        workerCostRate: extra.workerCostRate || undefined,
+        labourBilled: extra.labourBilled || undefined,
+      });
+    }
   }
 
   return (
     <div className="space-y-3">
-      {/* Type selector */}
+      {/* Type selector — hidden entirely when the caller locked the type
+          (e.g. the schedule's "Log hours", which is only ever hours). */}
+      {!lockType && (
       <div>
         <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
           Entry type
@@ -271,6 +490,7 @@ export function EntryForm({
           ))}
         </div>
       </div>
+      )}
 
       {/* Lead source — enquiry only. Tap-no-type, optional. Sits between
           Entry type and Description because "Enquiry → where from?" is the
@@ -502,7 +722,7 @@ export function EntryForm({
       {type === 'hours' && (
         <div>
           <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-            Who
+            Who{canFanOut ? ' — tap all that apply' : ''}
           </label>
           <div className="flex flex-wrap gap-2">
             {([
@@ -516,29 +736,72 @@ export function EntryForm({
               <button
                 key={key}
                 type="button"
-                onClick={() => setWhoSel(key)}
+                onClick={() => toggleWho(key)}
+                aria-pressed={whoSels.includes(key)}
                 className={cn(
                   'px-3 py-2 rounded-lg text-sm font-medium border transition-colors min-h-[44px]',
-                  whoSel === key
+                  whoSels.includes(key)
                     ? 'bg-primary text-primary-foreground border-primary'
-                    : 'bg-background text-muted-foreground border-border hover:border-primary/40 hover:text-foreground',
+                    : siblingSels.has(key)
+                      // Already has their own hours on this job + day. Shown
+                      // as on-site-but-elsewhere so it doesn't read as
+                      // "nobody logged them".
+                      ? 'bg-primary/10 text-foreground border-primary/40'
+                      : 'bg-background text-muted-foreground border-border hover:border-primary/40 hover:text-foreground',
                 )}
               >
                 {label}
+                {!whoSels.includes(key) && siblingSels.has(key) && (
+                  <span className="ml-1.5 text-[11px] font-normal opacity-70">already logged</span>
+                )}
               </button>
             ))}
           </div>
+          {/* Multi-person note — spell out exactly what saves, since "8h for
+              two people" could plausibly mean 8h each or 4h each. It's 8h
+              each: everyone picked gets the full hours. */}
+          {canFanOut && whoSels.length > 1 && (
+            <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
+              {isEdit ? (
+                // Editing: this row belongs to the first person picked, the
+                // rest get rows of their own. Say the hours out loud — "6.5h
+                // for two people" could just as easily read as 3.25h each.
+                <>
+                  Updates this entry and adds one for each other person tagged,
+                  same {hours ? `${hours}h` : 'hours'} each.
+                  {whoSels.slice(1).some((k) => siblingSels.has(k))
+                    && ' Anyone already logged on this day is left alone.'}
+                </>
+              ) : (
+                <>
+                  Saves separate entries — each person gets the
+                  {activities.length > 1 ? ' split' : ' full'} hours
+                  ({whoSels.length} {activities.length > 1 ? `× ${activities.length} entries` : 'entries'}).
+                </>
+              )}
+            </p>
+          )}
           {/* Attribution note — make the payroll consequence loud in both
               directions, since the two pills look identical. */}
-          {whoSel !== 'me' && whoSel !== 'other' && (
+          {whoSels.some((k) => k !== 'me' && k !== 'other') && (
             <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
-              Logged on {employeeMembers.find((m) => m.id === whoSel)?.displayName ?? 'their'}&apos;s
+              Logged on {employeeMembers
+                .filter((m) => whoSels.includes(m.id))
+                .map((m) => m.displayName || 'their')
+                .join(' and ')}&apos;s
               behalf — counts for payroll, same as if they logged it themselves.
             </p>
           )}
-          {whoSel === 'other' && (
+          {whoSels.includes('other') && (
             <div className="mt-2">
-              <Select value={workerKind} onValueChange={(v) => setWorkerKind(v as WorkerKind)}>
+              <Select
+                value={workerKind}
+                onValueChange={(v) => {
+                  const k = v as WorkerKind;
+                  setWorkerKind(k);
+                  autoFillRate(workerName, k);
+                }}
+              >
                 <SelectTrigger className="h-9 text-sm w-full max-w-60">
                   <SelectValue />
                 </SelectTrigger>
@@ -550,6 +813,62 @@ export function EntryForm({
                     ))}
                 </SelectContent>
               </Select>
+              {/* Their name. Optional — never block a save over it — but it's
+                  the difference between "Subcontractor · 8h" and "Dave · 8h"
+                  when Brad looks back at the job in three months. */}
+              <label className="mt-2 text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                {workerKind === 'subcontractor' ? 'Subcontractor' : 'Their name'} (optional)
+              </label>
+              <input
+                type="text"
+                value={workerName}
+                onChange={(e) => {
+                  setWorkerName(e.target.value);
+                  autoFillRate(e.target.value, workerKind);
+                }}
+                placeholder={workerKind === 'subcontractor' ? "e.g. Dave, or Dave's Plastering" : 'e.g. Dave'}
+                className="w-full max-w-60 h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+              {/* What they cost. Ex-GST like every other number in the app.
+                  With a rate, these hours become a cost on the job and on
+                  the Earned month the day they're logged; without one they
+                  cost nothing — better than a guessed number moving the
+                  job's profit. */}
+              <label className="mt-2 text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                Their rate $/hour ex-GST (optional)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.5"
+                  min={0}
+                  value={costRate}
+                  onChange={(e) => { setRateTouched(true); setCostRate(e.target.value); }}
+                  placeholder={rememberedRate ? String(rememberedRate) : 'e.g. 45'}
+                  className="w-28 h-9 px-3 rounded-lg border border-input bg-background text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+                {costHint && (
+                  <span className="text-[11px] text-muted-foreground">{costHint}</span>
+                )}
+              </div>
+              {/* Manual retire-the-accrual tick. The usual way this gets set
+                  is the prompt when their bill is confirmed against the job;
+                  this is here for the times that prompt was missed. */}
+              {isEdit && parseFloat(costRate) > 0 && (
+                <label className="mt-2 flex items-start gap-2 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={labourBilled}
+                    onChange={(e) => setLabourBilled(e.target.checked)}
+                    className="mt-0.5 h-4 w-4 rounded border-input accent-primary"
+                  />
+                  <span className="text-[11px] text-muted-foreground leading-snug">
+                    They&apos;ve invoiced these hours — their bill is in the books, so
+                    stop counting this as money still owed.
+                  </span>
+                </label>
+              )}
               {/* Payroll trap warning — still real for this path: no
                   attribution, so payroll never sees these hours. Fine for
                   a one-off cash-job helper, wrong for staff. */}
@@ -718,7 +1037,11 @@ export function EntryForm({
           onClick={handleSave}
           disabled={!description.trim()}
         >
-          {submitLabel ?? (defaultValues ? 'Update' : 'Save Entry')}
+          {/* isEdit, not defaultValues — a pre-seeded CREATE form (the day
+              sheet's "Log hours", the NL parser's hand-off) carries
+              defaultValues with no id, and labelling that "Update" reads
+              like it's editing something that doesn't exist yet. */}
+          {submitLabel ?? (isEdit ? 'Update' : 'Save Entry')}
         </Button>
       </div>
     </div>

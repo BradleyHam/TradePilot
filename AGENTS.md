@@ -142,6 +142,8 @@ Migrations beyond `schema.sql` live in `supabase/migrations/`. Currently:
 - **Jobs from the legacy Finances sheet keep their `J1`/`J2`/... IDs** in `jobs.legacy_id`. UUIDs are the primary key.
 - **"OH" job IDs in the importer map to `null` job_id**, not a sentinel row.
 - **NZ tax year = 1 April → 31 March.** `lib/tax-estimator.ts` has helpers (`taxYearOf`, `previousTaxYearOf`, `daysIntoTaxYear`).
+- **Per-job profit charges ALL labour; business-wide totals don't.** `lib/job-stats.ts` adds employee wages (`payrollLabourCost` = their hours x the payroll rate) and sub/helper labour (`contractorLabourCost`) to a job's expenses, so `expectedProfit` is what's actually left for Brad and `ownerRate` (profit / his own hours) is a real take-home rate. That wage is ALSO paid through a pay run, which is where Money and the tax estimator see it — so rolling per-job figures up into a business total, or letting `payrollLabourCost` anywhere near `estimateTax` / `expensesInWindow`, counts the same money twice. Management figure only, same fence as `unbilledLabourCost` in `lib/labour-accrual.ts`.
+- **`expectedHourlyRate` is not anybody's rate.** It's revenue over everyone's hours — a pricing yardstick. The number to show a person is `ownerRate`.
 
 ---
 

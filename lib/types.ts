@@ -743,6 +743,35 @@ export interface Entry {
    */
   workerKind?: WorkerKind;
   /**
+   * Name of the person who did the work, when they aren't on the team —
+   * a subcontractor or one-off helper with no login. Free text, optional,
+   * only meaningful for `type === 'hours'` rows with no `loggedByUserId`
+   * and a non-owner `workerKind`. Display-only: it's what stops a row
+   * reading "Subcontractor · 8h" with no way to remember which sub.
+   */
+  workerName?: string;
+  /**
+   * What this person COSTS per hour, ex-GST. Only for `type === 'hours'`
+   * rows worked by someone not on payroll (a subcontractor or one-off
+   * helper) — payroll wages arrive via pay runs instead, and accruing
+   * them here would double-count.
+   *
+   * NOT the same number as the `worker_rate_*` settings: those are
+   * charge-out TARGETS for the hourly-rate gauge (what an hour should
+   * earn); this is what the hour costs. Undefined = unknown, which
+   * accrues nothing rather than guessing. See `lib/labour-accrual.ts`.
+   */
+  workerCostRate?: number;
+  /**
+   * True once the worker has actually invoiced these hours — their bill
+   * is now in the books, so the accrual must stop or the cost counts
+   * twice. Set by the prompt when confirming a bill against the job, or
+   * by hand on the entry.
+   */
+  labourBilled?: boolean;
+  /** The bill entry that covered these hours, when it was linked at confirm time. */
+  labourBillEntryId?: string;
+  /**
    * LEGACY (write path removed July 2026). Additional hours from a
    * helper on the same shift, captured on Brad's own entry via the old
    * "+ helper hrs" form field. Employees now log their own hours from
@@ -1317,6 +1346,17 @@ export interface ScheduleItem {
   clientName?: string;
   clientEmail?: string;
   clientPhone?: string;
+  /**
+   * People on this booking who have no login — subcontractors, one-off
+   * helpers. Plain names (migration 048), the same escape hatch
+   * `Entry.workerName` uses for logged hours.
+   *
+   * Staff and Brad himself are NOT here: they have auth users, so they
+   * go through `ScheduleAssignment` where the RLS gates can see them.
+   * The two lists are independent — a booking can have a named sub on it
+   * whether or not it overrides the job team.
+   */
+  crewNames?: string[];
   completed: boolean;
   /**
    * When set, this scheduled day was skipped — the user couldn't / didn't

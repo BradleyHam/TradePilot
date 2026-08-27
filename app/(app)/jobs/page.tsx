@@ -14,6 +14,7 @@ import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sh
 import { Briefcase, Plus, Search, Filter } from 'lucide-react';
 import { JOB_STATUSES } from '@/lib/mock-data';
 import { jobStats } from '@/lib/job-stats';
+import { payrollConfig } from '@/lib/payroll';
 import { cn } from '@/lib/utils';
 
 // Filter values: a synthetic 'coming-up' group, or a literal JobStatus.
@@ -230,7 +231,13 @@ function jobComparatorForFilter(
 }
 
 export default function JobsPage() {
-  const { jobs, entries, materials, scheduleItems, addJob, businessId, shiftPhotos } = useStore();
+  const { jobs, entries, materials, scheduleItems, addJob, businessId, shiftPhotos, settings, teamMembers } = useStore();
+  // Same labour-costing options the job sheet uses — the card and the sheet
+  // must never disagree about what a job made.
+  const statsOpts = {
+    wageRate: payrollConfig(settings).wageRate,
+    ownerUserId: teamMembers.find((m) => m.role === 'owner')?.userId,
+  };
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [showAddJob, setShowAddJob] = useState(false);
   const [search, setSearch] = useState('');
@@ -348,7 +355,7 @@ export default function JobsPage() {
         ) : (
           <div className="space-y-2.5 pb-6">
             {filteredJobs.map((job) => {
-              const stats = jobStats(job, entries, materials);
+              const stats = jobStats(job, entries, materials, statsOpts);
               const coverPath = jobCoverPath(job, shiftPhotos);
               return (
                 <JobCard

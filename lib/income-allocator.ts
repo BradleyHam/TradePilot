@@ -25,6 +25,7 @@
  */
 
 import type { Job, Entry } from './types';
+import { unbilledLabourInWindow } from './labour-accrual';
 
 const EARNED_STATUSES: ReadonlyArray<Job['status']> = [
   'completed', 'invoiced', 'paid',
@@ -174,6 +175,58 @@ export function expensesInWindow(
     }
   }
   return total;
+}
+
+/**
+ * The costs a window INCURRED, ex-GST — the expense side of the earned
+ * basis. Same rule the earned revenue already follows: a cost belongs to
+ * the period the work happened, not the period the money moved.
+ *
+ *   - `expense` entries by `entryDate` (already cash-out on that date).
+ *   - `bill` entries by `entryDate` — the bill date — PAID OR NOT. The
+ *     paint was delivered in August; the cost is August's, even if the
+ *     supplier gets paid in September.
+ *   - unbilled sub / helper labour by the day it was worked (see
+ *     `lib/labour-accrual.ts`). Owed the moment the hours are logged.
+ *
+ * Drafts stay out, same as everywhere else — an LLM-parsed bill Brad
+ * hasn't confirmed isn't a cost yet.
+ *
+ * MANAGEMENT FIGURE ONLY. `expensesInWindow` above stays the payments-
+ * basis truth and is what the Cash view, GST and the income-tax estimate
+ * keep using. Don't wire this into `lib/tax-estimator.ts`.
+ */
+export function incurredExpenseBreakdown(
+  entries: Entry[],
+  startISO: string,
+  endISO: string,
+): { spent: number; billedUnpaid: number; unbilledLabour: number; total: number } {
+  let spent = 0;
+  let billedUnpaid = 0;
+  for (const e of entries) {
+    if (e.isDraft) continue;
+    if (e.type === 'expense') {
+      if (e.entryDate < startISO || e.entryDate > endISO) continue;
+      spent += entryExGstLocal(e);
+    } else if (e.type === 'bill') {
+      if (e.entryDate < startISO || e.entryDate > endISO) continue;
+      // Split so the UI can say how much of the total isn't out the door
+      // yet — the number that makes a big Earned-basis month explainable.
+      if (e.paid) spent += entryExGstLocal(e);
+      else billedUnpaid += entryExGstLocal(e);
+    }
+  }
+  const unbilledLabour = unbilledLabourInWindow(entries, startISO, endISO);
+  return { spent, billedUnpaid, unbilledLabour, total: spent + billedUnpaid + unbilledLabour };
+}
+
+/** Convenience wrapper — just the incurred total. */
+export function incurredExpensesInWindow(
+  entries: Entry[],
+  startISO: string,
+  endISO: string,
+): number {
+  return incurredExpenseBreakdown(entries, startISO, endISO).total;
 }
 
 /**

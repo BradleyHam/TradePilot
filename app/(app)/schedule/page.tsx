@@ -16,6 +16,8 @@ import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-
 import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { VisitActionChooser } from '@/components/schedule/visit-action-chooser';
 import { downloadIcs } from '@/lib/ics';
+import { makeUpDate, renumberedTitles } from '@/lib/schedule-blocks';
+import { hoursByWorker, hoursWorkerLabel } from '@/lib/hours-attribution';
 import {
   Select,
   SelectContent,
@@ -27,12 +29,12 @@ import { Textarea } from '@/components/ui/textarea';
 import {
   CalendarDays, Plus, Briefcase, FileText, Bell, AlertCircle, Receipt, CheckCircle2,
   ChevronLeft, ChevronRight, List as ListIcon, Calendar as CalendarIcon, LayoutGrid,
-  Clock, CloudRain, Stethoscope, UserX, MoreHorizontal, Users,
+  Clock, CloudRain, Stethoscope, UserX, MoreHorizontal, User, Users, Trash2, Pencil,
 } from 'lucide-react';
 import {
   format, parseISO, isToday, isTomorrow, isPast, isThisWeek,
   startOfMonth, endOfMonth, startOfWeek, endOfWeek, addMonths, addWeeks,
-  isSameMonth, eachDayOfInterval,
+  isSameMonth, eachDayOfInterval, differenceInCalendarDays,
 } from 'date-fns';
 import { cn } from '@/lib/utils';
 
@@ -325,6 +327,19 @@ function makeRun(items: ScheduleItem[]): ItemRun {
 }
 
 // ── Date group label for List view ───────────────────────────────────────────
+/**
+ * "Today" / "Yesterday" / "6 days ago" for a day the user is looking at.
+ * The sheet's title gives the date; this says where that sits relative to
+ * now, so logging hours against last Tuesday never feels like today.
+ */
+function relativeDayLabel(iso: string): string {
+  const diff = differenceInCalendarDays(parseISODate(iso), new Date());
+  if (diff === 0) return 'Today';
+  if (diff === -1) return 'Yesterday';
+  if (diff === 1) return 'Tomorrow';
+  return diff < 0 ? `${-diff} days ago` : `In ${diff} days`;
+}
+
 function dateGroup(dateStr: string): string {
   const date = parseISO(dateStr);
   if (isToday(date)) return 'Today';
@@ -342,6 +357,7 @@ export default function SchedulePage() {
     scheduleItems, jobs, entries,
     addScheduleItem, updateScheduleItem, deleteScheduleItem,
     addEntry, updateEntry, deleteEntry,
+    scheduleAssignments, setBookingAssignees,
     businessId,
   } = useStore();
 
@@ -404,15 +420,114 @@ export default function SchedulePage() {
     });
   }
 
+  /**
+   * The day just marked "didn't work", while we offer to make it up. A
+   * skipped day drops off the calendar grid (nothing was worked, so
+   * nothing should be planned there) but the row survives with its
+   * reason — so the offer below is about the WORK, not the record.
+   */
+  const [makeUpItemId, setMakeUpItemId] = useState<string | null>(null);
+  const makeUpItem = useMemo(
+    () => makeUpItemId ? scheduleItems.find((s) => s.id === makeUpItemId) ?? null : null,
+    [makeUpItemId, scheduleItems],
+  );
+
   function commitSkip(kind: ScheduleSkipReasonKind, note: string) {
     if (!skippingItemId) return;
+    const item = scheduleItems.find((s) => s.id === skippingItemId);
     updateScheduleItem(skippingItemId, {
       skipReasonKind: kind,
       // Persist note only when there's something there. For 'other' the
       // form requires a note; for other kinds it's optional context.
       skipReason: note.trim() || undefined,
+      // The day label is now a lie — it's not "Day 3 of 6" if it never
+      // happened. Renumbering below rebuilds the sequence without it.
+      title: stripDayLabel(item?.title ?? ''),
     });
     setSkippingItemId(null);
+    // A booked day that didn't happen is a day the job still needs.
+    // Offer to put it back on the end rather than assuming either way.
+    if (item?.type === 'job_booking' && item.jobId) {
+      renumberBookingDays(item.jobId, stripDayLabel(item.title), { skippedId: item.id });
+      setMakeUpItemId(item.id);
+    }
+  }
+
+  /**
+   * Rewrite the "(Day N/M)" suffixes for one job's booking block so they
+   * count only the days still standing. Skipped days lose the suffix
+   * entirely — they're not part of the sequence any more.
+   */
+  function renumberBookingDays(
+    jobId: string,
+    titleBase: string,
+    opts?: { skippedId?: string; extra?: { id: string; date: string } },
+  ) {
+    const block = scheduleItems
+      .filter((s) => s.type === 'job_booking'
+        && s.jobId === jobId
+        && stripDayLabel(s.title) === titleBase
+        && s.id !== opts?.extra?.id)
+      .map((s) => ({
+        id: s.id,
+        date: s.date,
+        title: s.title,
+        skipped: !!s.skipReasonKind || s.id === opts?.skippedId,
+      }));
+    if (opts?.extra) {
+      block.push({ id: opts.extra.id, date: opts.extra.date, title: titleBase, skipped: false });
+    }
+    for (const change of renumberedTitles(block, titleBase)) {
+      updateScheduleItem(change.id, { title: change.title });
+    }
+  }
+
+  /**
+   * Where a make-up day lands: the next date after the block's last day
+   * that matches the weekdays the block already works. Inferred from the
+   * block itself rather than a stored pattern — a Mon–Sat run never
+   * offers you a Sunday.
+   */
+  function makeUpDateFor(item: ScheduleItem): string {
+    const base = stripDayLabel(item.title);
+    const block = scheduleItems.filter((s) => s.type === 'job_booking'
+      && s.jobId === item.jobId
+      && stripDayLabel(s.title) === base);
+    return makeUpDate(
+      block.map((s) => ({ date: s.date, skipped: !!s.skipReasonKind })),
+      item.date,
+    );
+  }
+
+  /** Add the make-up day and renumber the block around it. */
+  function addMakeUpDay(item: ScheduleItem) {
+    if (!businessId) return;
+    const base = stripDayLabel(item.title);
+    const date = makeUpDateFor(item);
+    const newId = crypto.randomUUID();
+    addScheduleItem({
+      id: newId,
+      businessId,
+      createdAt: new Date().toISOString(),
+      type: 'job_booking',
+      title: base,
+      date,
+      startTime: item.startTime,
+      endTime: item.endTime,
+      jobId: item.jobId,
+      notes: item.notes,
+      // Same crew as the day that fell over — most likely the same people.
+      crewNames: item.crewNames && item.crewNames.length > 0 ? item.crewNames : undefined,
+      completed: false,
+    });
+    // Carry any per-day login override across too, so the make-up day is
+    // visible to the same staff as the day it replaces.
+    const override = scheduleAssignments
+      .filter((a) => a.scheduleItemId === item.id)
+      .map((a) => a.userId);
+    if (override.length > 0) void setBookingAssignees(newId, override);
+    renumberBookingDays(item.jobId!, base, { skippedId: item.id, extra: { id: newId, date } });
+    setMakeUpItemId(null);
   }
 
   function openEdit(items: ScheduleItem[]) {
@@ -1004,6 +1119,24 @@ export default function SchedulePage() {
         item={skippingItem ?? null}
         onCancel={() => setSkippingItemId(null)}
         onConfirm={commitSkip}
+        onRemove={() => {
+          // "No work happened and it shouldn't count at all" — delete the
+          // day's schedule row entirely rather than keeping a faded
+          // skipped card. Confirm first: unlike skip, this is not undoable.
+          if (!skippingItemId) return;
+          if (!confirm('Remove this day from the schedule? This can\'t be undone.')) return;
+          deleteScheduleItem(skippingItemId);
+          setSkippingItemId(null);
+        }}
+      />
+
+      {/* Offered right after a booked day is marked "didn't work" — the
+          day is off the calendar, but the work still has to happen. */}
+      <MakeUpDaySheet
+        item={makeUpItem}
+        date={makeUpItem ? makeUpDateFor(makeUpItem) : null}
+        onConfirm={() => makeUpItem && addMakeUpDay(makeUpItem)}
+        onDismiss={() => setMakeUpItemId(null)}
       />
 
       <SiteVisitWrapUpSheet
@@ -1049,11 +1182,19 @@ export default function SchedulePage() {
           </SheetHeader>
           {editingHours && (
             <EntryForm
+              // The sheet is titled "Edit hours entry" — no reason to offer
+              // switching it to an Expense / Quote / etc. from here.
+              lockType
               defaultValues={editingHours}
               onSave={(data) => {
                 updateEntry(editingHours.id, data);
                 setEditingHoursId(null);
               }}
+              // Tagging a second person on an existing shift: the row above
+              // stays the first person's, and everyone else lands as their
+              // own hours row (same day, job and hours). Without this the
+              // Who pills would be a swap, not a crew.
+              onSaveAdditional={handleAddEntry}
               onCancel={() => setEditingHoursId(null)}
               onDelete={() => {
                 if (!confirm('Delete this hours entry? This can\'t be undone.')) return;
@@ -1169,6 +1310,7 @@ function RunCard({
   onWrapUp,
   onSkip,
   onUnskip,
+  onLogHours,
 }: {
   run: ItemRun;
   job?: { name: string } | undefined;
@@ -1199,18 +1341,27 @@ function RunCard({
   onSkip?: () => void;
   /** Reverts a skipped day back to scheduled-but-not-completed. */
   onUnskip?: () => void;
+  /**
+   * Log hours against THIS job, on the day the card is showing. Provided
+   * by the day-detail sheet, where "which job was that?" is already
+   * answered by the card you're looking at — so the form opens with the
+   * job filled in instead of making Brad pick it again from a list.
+   * Omitted elsewhere, which also hides the action row.
+   */
+  onLogHours?: () => void;
 }) {
   const config = TYPE_CONFIG[run.head.type];
   const Icon = config.icon;
 
-  // Who's on this booking — override rows on any day of the run win,
-  // otherwise the job-level team (matches migration 035 semantics).
-  // Owner-only + employees-only so a solo business renders nothing extra.
+  // Who's on this booking. Two sources, because two kinds of people:
+  //   - logins (Brad + staff): override rows on any day of the run win,
+  //     otherwise the job-level team — migration 035 semantics.
+  //   - named crew (subbies, one-off helpers): plain names on the
+  //     booking row itself (migration 048). No login, so no assignment.
+  // Owner-only; an employee's own screens don't need telling who they are.
   const { role, teamMembers, jobAssignments, scheduleAssignments } = useStore();
   const crewNames = useMemo(() => {
     if (run.head.type !== 'job_booking' || role !== 'owner') return [];
-    const employees = teamMembers.filter((m) => m.role === 'employee');
-    if (employees.length === 0) return [];
     const itemIds = new Set(run.items.map((i) => i.id));
     const overrideUids = new Set(
       scheduleAssignments.filter((a) => itemIds.has(a.scheduleItemId)).map((a) => a.userId),
@@ -1218,7 +1369,11 @@ function RunCard({
     const uids = overrideUids.size > 0
       ? overrideUids
       : new Set(jobAssignments.filter((a) => a.jobId === run.head.jobId).map((a) => a.userId));
-    return employees.filter((m) => uids.has(m.userId)).map((m) => m.displayName || 'Employee');
+    const logins = teamMembers
+      .filter((m) => uids.has(m.userId))
+      .map((m) => (m.role === 'owner' ? 'Me' : (m.displayName || 'Employee')));
+    const named = [...new Set(run.items.flatMap((i) => i.crewNames ?? []))];
+    return [...logins, ...named];
   }, [run, role, teamMembers, jobAssignments, scheduleAssignments]);
 
   const startDate = parseISO(run.startDate);
@@ -1407,6 +1562,33 @@ function RunCard({
 
         {run.head.notes && (
           <p className="text-xs text-muted-foreground mt-1 line-clamp-2">{run.head.notes}</p>
+        )}
+
+        {/* Actions — only where the parent asked for them (the day-detail
+            sheet). Tapping the card already opens the editor, but that's
+            invisible until you try it; these say it out loud and put the
+            common action (log the hours you just worked) first. */}
+        {onLogHours && (
+          <div className="mt-2.5 flex flex-wrap gap-2">
+            <button
+              type="button"
+              onClick={(e) => { e.stopPropagation(); onLogHours(); }}
+              className="min-h-[44px] px-3.5 rounded-xl border border-emerald-200 bg-emerald-50 text-emerald-800 text-xs font-semibold inline-flex items-center gap-1.5 hover:bg-emerald-100 transition-colors"
+            >
+              <Clock size={14} strokeWidth={2.2} />
+              Log hours
+            </button>
+            {onEdit && (
+              <button
+                type="button"
+                onClick={(e) => { e.stopPropagation(); onEdit(); }}
+                className="min-h-[44px] px-3.5 rounded-xl border border-border bg-card text-muted-foreground text-xs font-semibold inline-flex items-center gap-1.5 hover:text-foreground hover:border-primary/40 transition-colors"
+              >
+                <Pencil size={14} strokeWidth={2.2} />
+                Edit schedule
+              </button>
+            )}
+          </div>
         )}
       </div>
 
@@ -1679,6 +1861,11 @@ function HoursLogCard({
   job?: { name: string } | undefined;
   onClick: () => void;
 }) {
+  const { teamMembers, membership } = useStore();
+  // Whose hours these are. Two people on the same day log two entries with
+  // the same hours, activity and description — the name is the only thing
+  // that tells them apart, so it leads the row.
+  const who = hoursWorkerLabel(entry, teamMembers, membership?.userId);
   // Strip the [OH] tag from display so the description reads cleanly. The
   // edit sheet handles the prefix separately via the Overhead toggle.
   const description = entry.description.startsWith('[OH] ')
@@ -1694,8 +1881,12 @@ function HoursLogCard({
         <Clock size={17} className="text-emerald-700" strokeWidth={1.8} />
       </div>
       <div className="flex-1 min-w-0">
-        <p className="text-sm font-medium leading-snug">
-          {entry.hours ?? 0}h{entry.activity ? ` · ${entry.activity}` : ''}
+        <p className="text-sm font-medium leading-snug flex flex-wrap items-center gap-x-1.5 gap-y-1">
+          <span className="inline-flex items-center gap-1 rounded-full bg-emerald-100 text-emerald-800 px-2 py-0.5 text-[11px] font-semibold uppercase tracking-wide">
+            <User size={10} strokeWidth={2.5} />
+            {who}
+          </span>
+          <span>{entry.hours ?? 0}h{entry.activity ? ` · ${entry.activity}` : ''}</span>
         </p>
         <div className="flex flex-wrap items-center gap-x-2 gap-y-0.5 mt-1">
           <span className="text-xs text-emerald-700 font-medium">Hours</span>
@@ -1726,6 +1917,8 @@ function HoursChip({
   job?: { name: string } | undefined;
   onClick: () => void;
 }) {
+  const { teamMembers, membership } = useStore();
+  const who = hoursWorkerLabel(entry, teamMembers, membership?.userId);
   return (
     <button
       type="button"
@@ -1739,6 +1932,8 @@ function HoursChip({
           {entry.hours ?? 0}h{entry.activity ? ` · ${entry.activity}` : ''}
         </div>
         <div className="flex items-center gap-1 text-[10px] text-emerald-700/80">
+          <span className="font-semibold shrink-0">{who}</span>
+          <span className="shrink-0 text-emerald-700/40">·</span>
           {job ? (
             <span className="truncate">{job.name}</span>
           ) : (
@@ -1790,6 +1985,9 @@ function MonthView({
   /** Revert a previously-skipped day back to scheduled. */
   onUnskip?: (item: ScheduleItem) => void;
 }) {
+  // Team + signed-in membership: used to say whose hours each logged entry
+  // is in the day-detail sheet.
+  const { teamMembers, membership } = useStore();
   // Same item→run lookup as WeekView: when the user taps an item in the
   // day-detail sheet we open the *whole run* in the editor, not just the
   // single day they tapped.
@@ -1804,6 +2002,9 @@ function MonthView({
   // Which inline action panel is open in the day-detail sheet. Reset whenever
   // the sheet opens on a different day so each day starts collapsed.
   const [inlineAction, setInlineAction] = useState<'log' | 'schedule' | 'visit' | null>(null);
+  // Job to pre-fill when the hours form opens. Set by a card's "Log
+  // hours" button, cleared by the generic one at the top of the sheet.
+  const [logSeedJobId, setLogSeedJobId] = useState<string | undefined>(undefined);
   useEffect(() => { setInlineAction(null); }, [selectedDay]);
 
   const monthStart = startOfMonth(anchor);
@@ -1847,6 +2048,9 @@ function MonthView({
   // enough for showing a list of "what I did that day".
   const dayHours = selectedDay ? (hoursByDate.get(selectedDay) ?? []) : [];
   const dayHoursTotal = dayHours.reduce((sum, e) => sum + (e.hours ?? 0), 0);
+  // "Me 6h · Suzie 6h" — only worth a line when more than one person was on
+  // site; a solo day already says everything in the total.
+  const dayHoursByWorker = hoursByWorker(dayHours, teamMembers, membership?.userId);
 
   const weekdayLabels = ['Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat', 'Sun'];
 
@@ -1895,7 +2099,20 @@ function MonthView({
           const iso = formatISODate(d);
           const inMonth = isSameMonth(d, anchor);
           const today = isToday(d);
-          const cellRuns = dayToRuns.get(iso) ?? [];
+          // The day whose detail sheet is open. Without this the grid
+          // keeps shouting about TODAY while you're logging hours against
+          // last Tuesday — the calendar and the sheet disagree about
+          // which day you're working on.
+          const selected = selectedDay === iso;
+          // Days marked "didn't work" drop off the grid: nothing was
+          // worked, so nothing should look planned there. Per-DAY, not
+          // per-run — the rest of the block still shows. The row itself
+          // survives (reason and all) and is still in the day's sheet,
+          // where it can be un-skipped.
+          const cellRuns = (dayToRuns.get(iso) ?? []).filter((r) => {
+            const dayItem = r.items.find((i) => i.date === iso);
+            return !dayItem?.skipReasonKind;
+          });
           const cellHours = hoursByDate.get(iso) ?? [];
           const cellHoursTotal = cellHours.reduce((sum, e) => sum + (e.hours ?? 0), 0);
 
@@ -1936,17 +2153,26 @@ function MonthView({
             <button
               key={iso}
               onClick={() => setSelectedDay(iso)}
+              aria-pressed={selected}
+              aria-current={today ? 'date' : undefined}
               className={cn(
                 'relative aspect-square sm:aspect-[4/5] md:aspect-[5/6] rounded-md border p-1 text-left flex flex-col gap-0.5 transition-colors',
                 inMonth ? 'bg-card' : 'bg-muted/30',
-                today ? 'border-primary ring-1 ring-primary/30' : 'border-border',
+                // Open day wins the emphasis — a heavier ring plus a tinted
+                // cell. Today keeps its lighter ring so you can still find
+                // it, and the filled number badge below says which is which.
+                selected
+                  ? 'border-primary ring-2 ring-primary bg-primary/10'
+                  : today ? 'border-primary ring-1 ring-primary/30' : 'border-border',
                 'hover:border-primary/40'
               )}
             >
               <div className="flex items-center justify-between leading-none">
                 <span className={cn(
                   'text-[11px] font-semibold',
-                  today ? 'text-primary' : inMonth ? 'text-foreground' : 'text-muted-foreground/60'
+                  selected
+                    ? 'bg-primary text-primary-foreground rounded px-1 py-0.5 -ml-0.5'
+                    : today ? 'text-primary' : inMonth ? 'text-foreground' : 'text-muted-foreground/60'
                 )}>
                   {format(d, 'd')}
                 </span>
@@ -2006,8 +2232,21 @@ function MonthView({
       <Sheet open={!!selectedDay} onOpenChange={(open) => !open && setSelectedDay(null)}>
         <SheetContent side="bottom" className="h-[80vh] overflow-y-auto rounded-t-2xl pb-10">
           <SheetHeader className="pb-4">
-            <SheetTitle>
+            <SheetTitle className="flex flex-wrap items-center gap-2">
               {selectedDay && format(parseISODate(selectedDay), 'EEEE, d MMMM yyyy')}
+              {selectedDay && (
+                // Anything that isn't today gets an amber chip: you're
+                // about to log or schedule against a different day, and
+                // that should be impossible to miss.
+                <span className={cn(
+                  'px-1.5 py-0.5 rounded-md text-[10px] font-semibold uppercase tracking-wide',
+                  isToday(parseISODate(selectedDay))
+                    ? 'bg-muted text-muted-foreground'
+                    : 'bg-amber-100 text-amber-800',
+                )}>
+                  {relativeDayLabel(selectedDay)}
+                </span>
+              )}
             </SheetTitle>
           </SheetHeader>
           {(() => {
@@ -2031,7 +2270,7 @@ function MonthView({
                       <Button
                         size="sm"
                         variant="outline"
-                        onClick={() => setInlineAction('log')}
+                        onClick={() => { setLogSeedJobId(undefined); setInlineAction('log'); }}
                         className="h-9"
                       >
                         <Clock size={14} className="mr-1.5" />
@@ -2067,15 +2306,27 @@ function MonthView({
                   <div className="bg-muted/30 border border-border rounded-2xl p-3">
                     <div className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2">
                       Log hours
+                      {logSeedJobId && (
+                        <span className="text-primary normal-case tracking-normal font-medium">
+                          {' · '}{jobs.find((j) => j.id === logSeedJobId)?.name ?? 'this job'}
+                        </span>
+                      )}
                     </div>
                     <EntryForm
                       defaultType="hours"
-                      defaultValues={{ entryDate: selectedDay }}
+                      // The button said "Log hours" — offering Expense /
+                      // Income / Quote pills inside it was just noise.
+                      lockType
+                      // Remount when the seeded job changes so the form
+                      // re-reads defaultValues (it seeds state on mount).
+                      key={logSeedJobId ?? 'no-job'}
+                      defaultValues={{ entryDate: selectedDay, jobId: logSeedJobId }}
                       onSave={(data) => {
                         onLogHours(data);
                         setInlineAction(null);
+                        setLogSeedJobId(undefined);
                       }}
-                      onCancel={() => setInlineAction(null)}
+                      onCancel={() => { setInlineAction(null); setLogSeedJobId(undefined); }}
                     />
                   </div>
                 )}
@@ -2170,6 +2421,17 @@ function MonthView({
                               onSkip(it);
                             } : undefined}
                             onUnskip={onUnskip ? () => onUnskip(it) : undefined}
+                            // Only on rows where hours make sense — a
+                            // bill due date isn't something you work on.
+                            onLogHours={(it.type === 'job_booking' || it.type === 'quote_visit')
+                              ? () => {
+                                // Seed the job, open the form, and leave
+                                // the sheet open — the form renders above
+                                // this list on the same day.
+                                setLogSeedJobId(it.jobId);
+                                setInlineAction('log');
+                              }
+                              : undefined}
                           />
                         );
                       })}
@@ -2182,6 +2444,11 @@ function MonthView({
                       <Clock size={12} className="text-emerald-600" strokeWidth={2.5} />
                       Hours logged · {dayHoursTotal}h total
                     </h4>
+                    {dayHoursByWorker.length > 1 && (
+                      <p className="-mt-1 mb-2 text-[11px] text-muted-foreground">
+                        {dayHoursByWorker.map((w) => `${w.label} ${w.hours}h`).join(' · ')}
+                      </p>
+                    )}
                     <div className="space-y-2">
                       {dayHours.map((e) => {
                         const job = e.jobId ? jobs.find((j) => j.id === e.jobId) : undefined;
@@ -2219,11 +2486,18 @@ function SkipPickerSheet({
   item,
   onCancel,
   onConfirm,
+  onRemove,
 }: {
   open: boolean;
   item: ScheduleItem | null;
   onCancel: () => void;
   onConfirm: (kind: ScheduleSkipReasonKind, note: string) => void;
+  /**
+   * Delete the day from the schedule entirely — for when no work happened
+   * AND the day shouldn't stay on the calendar as a skipped record (e.g.
+   * it was never really a work day). Caller confirms before deleting.
+   */
+  onRemove?: () => void;
 }) {
   const [kind, setKind] = useState<ScheduleSkipReasonKind | null>(null);
   const [note, setNote] = useState('');
@@ -2321,6 +2595,91 @@ function SkipPickerSheet({
                 Mark as didn't work
               </Button>
             </div>
+
+            {/* Escape hatch: the day shouldn't be on the schedule at all
+                (booked by mistake, plans changed before it ever mattered).
+                Marking it skipped keeps a faded card on the calendar —
+                removing deletes the row so the day reads as never planned. */}
+            {onRemove && (
+              <Button
+                variant="ghost"
+                className="w-full h-11 text-red-600 hover:text-red-700 hover:bg-red-50"
+                onClick={onRemove}
+              >
+                <Trash2 size={16} className="mr-2" />
+                Remove this day from the schedule
+              </Button>
+            )}
+          </div>
+        )}
+      </SheetContent>
+    </Sheet>
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// MAKE-UP DAY — offered after a booked day is marked "didn't work"
+// ─────────────────────────────────────────────────────────────────────────────
+/**
+ * Rained off on Wednesday? The Wednesday is gone from the calendar, but
+ * the job didn't get any smaller. One tap puts the day back on the end of
+ * the block, on the next day of the week that block already works.
+ *
+ * Deliberately an offer, not automatic: sometimes the lost day gets
+ * squeezed in somewhere else entirely, and quietly moving work around
+ * behind Brad's back is worse than asking.
+ */
+function MakeUpDaySheet({
+  item,
+  date,
+  onConfirm,
+  onDismiss,
+}: {
+  item: ScheduleItem | null;
+  /** Where the make-up day would land. Null when there's nothing to offer. */
+  date: string | null;
+  onConfirm: () => void;
+  onDismiss: () => void;
+}) {
+  return (
+    <Sheet open={!!item && !!date} onOpenChange={(o) => !o && onDismiss()}>
+      <SheetContent side="bottom" className="h-auto max-h-[85vh] overflow-y-auto rounded-t-2xl px-4 pb-10">
+        <SheetHeader className="pb-3">
+          <SheetTitle>Put that day back?</SheetTitle>
+        </SheetHeader>
+        {item && date && (
+          <div className="space-y-4">
+            <p className="text-sm text-muted-foreground">
+              <span className="text-foreground font-medium">{stripDayLabel(item.title)}</span>
+              <br />
+              {format(parseISODate(item.date), 'EEEE d MMMM')} is off the calendar now — the
+              reason stays on the day. The job still needs that day&apos;s work.
+            </p>
+
+            <div className="rounded-xl border border-border bg-muted/30 p-3">
+              <p className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground mb-1">
+                Add to the end of the block
+              </p>
+              <p className="text-sm font-semibold text-foreground">
+                {format(parseISODate(date), 'EEEE d MMMM')}
+              </p>
+              <p className="text-[11px] text-muted-foreground mt-1">
+                Next day of the week this block already works. Same times, same crew.
+              </p>
+            </div>
+
+            <div className="flex gap-2 pt-1">
+              <Button variant="outline" className="flex-1 h-11" onClick={onDismiss}>
+                Not now
+              </Button>
+              <Button className="flex-1 h-11" onClick={onConfirm}>
+                <Plus size={16} className="mr-1.5" />
+                Add {format(parseISODate(date), 'EEE d MMM')}
+              </Button>
+            </div>
+            <p className="text-[11px] text-muted-foreground">
+              The block&apos;s days get renumbered so they still count up in order.
+            </p>
           </div>
         )}
       </SheetContent>

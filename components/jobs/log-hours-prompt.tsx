@@ -77,6 +77,12 @@ function PromptForm({ jobId, onClose }: { jobId: string; onClose: () => void }) 
 
   const [hoursStr, setHoursStr] = useState('');
   const [workerKind, setWorkerKind] = useState<WorkerKind>('owner');
+  // Who the non-owner worker actually was. Optional, and only sent when
+  // filled in — same field as the entry form's "Someone else" path.
+  const [workerName, setWorkerName] = useState('');
+  // What they cost per hour, ex-GST. Optional — blank means the hours cost
+  // the job nothing, which beats guessing. See lib/labour-accrual.ts.
+  const [costRate, setCostRate] = useState('');
   const [entryDate, setEntryDate] = useState(() => new Date().toISOString().slice(0, 10));
 
   const hoursNum = parseFloat(hoursStr);
@@ -91,6 +97,8 @@ function PromptForm({ jobId, onClose }: { jobId: string; onClose: () => void }) 
       type: 'hours',
       hours: hoursNum,
       workerKind,
+      workerName: (workerKind !== 'owner' && workerName.trim()) ? workerName.trim() : undefined,
+      workerCostRate: (workerKind !== 'owner' && parseFloat(costRate) > 0) ? parseFloat(costRate) : undefined,
       description: `Hours on ${job.name}`,
       entryDate,
       gstApplies: false,
@@ -147,6 +155,41 @@ function PromptForm({ jobId, onClose }: { jobId: string; onClose: () => void }) 
               </select>
             </div>
           </div>
+
+          {/* Name for a non-owner tier — a subbie or one-off helper. Optional,
+              but it's what stops the row reading "Subcontractor · 8h" with no
+              way to remember which sub. */}
+          {workerKind !== 'owner' && (
+            <div>
+              <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
+                {workerKind === 'subcontractor' ? 'Subcontractor' : 'Their name'} (optional)
+              </label>
+              <div className="flex items-center gap-2">
+                <input
+                  type="text"
+                  value={workerName}
+                  onChange={(e) => setWorkerName(e.target.value)}
+                  placeholder={workerKind === 'subcontractor' ? "e.g. Dave, or Dave's Plastering" : 'e.g. Dave'}
+                  className="flex-1 min-w-0 h-11 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.5"
+                  min={0}
+                  value={costRate}
+                  onChange={(e) => setCostRate(e.target.value)}
+                  placeholder="$/h"
+                  className="w-20 shrink-0 h-11 px-3 rounded-lg border border-input bg-background text-sm tabular-nums focus:outline-none focus:ring-2 focus:ring-ring"
+                  aria-label="Their rate, $ per hour ex-GST"
+                />
+              </div>
+              <p className="mt-1 text-[11px] text-muted-foreground leading-snug">
+                Rate is ex-GST, and optional — with one, these hours count as a
+                cost on the job from the day they were worked.
+              </p>
+            </div>
+          )}
 
           <div>
             <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">

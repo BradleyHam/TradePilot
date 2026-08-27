@@ -11,10 +11,12 @@
  * them paid. Settings overrides (all optional, stored in `settings`):
  *
  *   payroll_anchor     — ISO date of the FIRST period start.
- *                        Default 2026-07-13 (the Monday covering Suzie's
- *                        15 July start date).
+ *                        Default 2026-06-15 (Suzie's confirmed employee
+ *                        start date).
  *   payroll_cycle_days — period length. Default 14.
  *   payroll_wage_rate  — $/hr gross. Default 35.
+ *   payroll_payday_anchor — one real payday in the fortnightly cycle.
+ *                        Default 2026-08-19 (Suzie's latest confirmed pay).
  *
  * IRD obligations encoded here (small employer, < $500k PAYE/yr):
  *   - Employment information (payday filing): due within 2 WORKING DAYS
@@ -27,15 +29,17 @@
 import type { Entry, PayRun, Setting } from './types';
 
 export const PAYROLL_DEFAULTS = {
-  anchorISO: '2026-07-13',
+  anchorISO: '2026-06-15',
   cycleDays: 14,
   wageRate: 35,
+  paydayAnchorISO: '2026-08-19',
 } as const;
 
 export interface PayrollConfig {
   anchorISO: string;
   cycleDays: number;
   wageRate: number;
+  paydayAnchorISO: string;
 }
 
 export interface PayPeriod {
@@ -88,10 +92,14 @@ export function payrollConfig(settings: Setting[]): PayrollConfig {
     return Number.isFinite(n) && n > 0 ? n : fallback;
   };
   const anchor = get('payroll_anchor');
+  const paydayAnchor = get('payroll_payday_anchor');
   return {
     anchorISO: anchor && /^\d{4}-\d{2}-\d{2}$/.test(anchor) ? anchor : PAYROLL_DEFAULTS.anchorISO,
     cycleDays: num(get('payroll_cycle_days'), PAYROLL_DEFAULTS.cycleDays),
     wageRate: num(get('payroll_wage_rate'), PAYROLL_DEFAULTS.wageRate),
+    paydayAnchorISO: paydayAnchor && /^\d{4}-\d{2}-\d{2}$/.test(paydayAnchor)
+      ? paydayAnchor
+      : PAYROLL_DEFAULTS.paydayAnchorISO,
   };
 }
 
@@ -126,6 +134,24 @@ export function currentPeriod(cfg: PayrollConfig, todayISO: string): PayPeriod |
     start = addDays(start, cfg.cycleDays);
   }
   return null;
+}
+
+/**
+ * The first scheduled fortnightly payday after a period ends. The anchor is
+ * one payday Brad actually used; stepping in whole cycles keeps the reminder
+ * stable even when a previous transfer happened a day early or late.
+ */
+export function scheduledPaydayForPeriod(cfg: PayrollConfig, period: PayPeriod): string {
+  let payday = cfg.paydayAnchorISO;
+  for (let i = 0; i < 500; i++) {
+    const previous = addDays(payday, -cfg.cycleDays);
+    if (previous <= period.end) break;
+    payday = previous;
+  }
+  for (let i = 0; i < 500 && payday <= period.end; i++) {
+    payday = addDays(payday, cfg.cycleDays);
+  }
+  return payday;
 }
 
 /** Has this period already been covered by a pay run for this member? */
@@ -170,7 +196,11 @@ export function employeeHoursInPeriod(
 /** PAYE for a pay day in month M is due the 20th of month M+1. */
 export function payeDueDate(paidDateISO: string): string {
   const d = parseISO(paidDateISO);
-  return toISO(new Date(d.getFullYear(), d.getMonth() + 1, 20));
+  let due = toISO(new Date(d.getFullYear(), d.getMonth() + 1, 20));
+  // IRD rolls a weekend due date to the next working day. This is why the
+  // August 2026 PAYE assessment is due Monday 21 September, not Sunday 20th.
+  while ([0, 6].includes(parseISO(due).getDay())) due = addDays(due, 1);
+  return due;
 }
 
 /** Payday employment information is due 2 working days after the pay day. */

@@ -41,7 +41,7 @@ const TYPE_FILTERS: { value: TypeFilter; label: string }[] = [
 ];
 
 export default function EntriesPage() {
-  const { entries, jobs, updateEntry, deleteEntry } = useStore();
+  const { entries, jobs, updateEntry, deleteEntry, addEntry, businessId } = useStore();
   const [search, setSearch] = useState('');
   const [typeFilter, setTypeFilter] = useState<TypeFilter>('all');
   const [editingId, setEditingId] = useState<string | null>(null);
@@ -84,6 +84,17 @@ export default function EntriesPage() {
     if (!editingId) return;
     updateEntry(editingId, data);
     setEditingId(null);
+  }
+
+  /** A second (third, …) person tagged on the hours row being edited.
+   *  Same shape as the create flows: a brand-new entry with a real UUID. */
+  function handleSaveAdditional(data: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) {
+    addEntry({
+      id: `ent_${crypto.randomUUID()}`,
+      businessId: businessId ?? '',
+      createdAt: new Date().toISOString(),
+      ...data,
+    });
   }
 
   function handleDelete() {
@@ -179,6 +190,9 @@ export default function EntriesPage() {
             <EntryForm
               defaultValues={editing}
               onSave={handleSave}
+              // Multi-person hours: extra people tagged on an hours row get
+              // rows of their own rather than overwriting this one.
+              onSaveAdditional={handleSaveAdditional}
               onCancel={() => setEditingId(null)}
               onDelete={handleDelete}
             />

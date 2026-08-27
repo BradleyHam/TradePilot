@@ -271,14 +271,15 @@ export function JobPicker({
           </div>
 
           <div className="max-h-72 overflow-y-auto py-1">
-            {/* Fixed rows: No job / Overhead / Create new */}
-            <Row selected={!value && !overhead} onClick={() => choose('')}>
-              <span className="text-muted-foreground">{noJobLabel}</span>
-            </Row>
-            {/* Caller-supplied rows (Overhead / Skip / …). Hidden while
-                searching — the query is a job name, and leaving these at
-                the top of a filtered list just pushes the actual matches
-                down. */}
+            {/* Fixed rows: No job / Overhead / caller extras. ALL hidden
+                while searching — the query is a job name, and leaving
+                toggles at the top of a filtered list just pushes the
+                actual matches down. Clearing the search brings them back. */}
+            {!q && (
+              <Row selected={!value && !overhead} onClick={() => choose('')}>
+                <span className="text-muted-foreground">{noJobLabel}</span>
+              </Row>
+            )}
             {!q && extraOptions?.map((opt) => (
               <Row key={opt.value} selected={value === opt.value} onClick={() => choose(opt.value)}>
                 <span className="text-foreground">{opt.label}</span>
@@ -287,7 +288,7 @@ export function JobPicker({
                 )}
               </Row>
             ))}
-            {onOverhead && (
+            {!q && onOverhead && (
               <Row
                 selected={overhead}
                 onClick={() => {

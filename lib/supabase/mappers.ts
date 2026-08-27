@@ -217,6 +217,10 @@ export function rowToEntry(r: Row): Entry {
     hours: asNumber(r.hours),
     activity: (asString(r.activity) as ActivityType | undefined),
     workerKind: asString(r.worker_kind) as Entry['workerKind'],
+    workerName: asString(r.worker_name),
+    workerCostRate: asNumber(r.worker_cost_rate),
+    labourBilled: asBool(r.labour_billed, false),
+    labourBillEntryId: asString(r.labour_bill_entry_id),
     helperHours: asNumber(r.helper_hours),
     loggedByUserId: asString(r.logged_by_user_id),
     supplier: asString(r.supplier),
@@ -255,6 +259,10 @@ export function entryToRow(e: Partial<Entry>): Row {
   if (e.hours !== undefined) out.hours = e.hours ?? null;
   if (e.activity !== undefined) out.activity = e.activity || null;
   if (e.workerKind !== undefined) out.worker_kind = e.workerKind || null;
+  if (e.workerName !== undefined) out.worker_name = e.workerName || null;
+  if (e.workerCostRate !== undefined) out.worker_cost_rate = e.workerCostRate ?? null;
+  if (e.labourBilled !== undefined) out.labour_billed = e.labourBilled;
+  if (e.labourBillEntryId !== undefined) out.labour_bill_entry_id = e.labourBillEntryId || null;
   if (e.helperHours !== undefined) out.helper_hours = e.helperHours ?? null;
   if (e.loggedByUserId !== undefined) out.logged_by_user_id = e.loggedByUserId || null;
   if (e.supplier !== undefined) out.supplier = e.supplier || null;
@@ -298,6 +306,7 @@ export function rowToScheduleItem(r: Row): ScheduleItem {
     clientName: asString(r.client_name),
     clientEmail: asString(r.client_email),
     clientPhone: asString(r.client_phone),
+    crewNames: Array.isArray(r.crew_names) ? (r.crew_names as string[]) : undefined,
     completed: asBool(r.completed, false),
     skipReasonKind: asString(r.skip_reason_kind) as ScheduleSkipReasonKind | undefined,
     skipReason: asString(r.skip_reason),
@@ -320,6 +329,9 @@ export function scheduleItemToRow(s: Partial<ScheduleItem>): Row {
   if (s.clientName !== undefined) out.client_name = s.clientName || null;
   if (s.clientEmail !== undefined) out.client_email = s.clientEmail || null;
   if (s.clientPhone !== undefined) out.client_phone = s.clientPhone || null;
+  // Empty list clears the column — null reads back as "nobody named",
+  // same as an empty array, and keeps the row tidy.
+  if (s.crewNames !== undefined) out.crew_names = s.crewNames.length > 0 ? s.crewNames : null;
   if (s.completed !== undefined) out.completed = s.completed;
   // Skip-reason columns added in migration 020. `|| null` so passing
   // an empty string OR undefined both clear the row (used by the

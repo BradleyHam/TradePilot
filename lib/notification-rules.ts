@@ -240,6 +240,54 @@ function payeRules(payRuns: PayRun[], todayISO: string): BusinessNotification[] 
 }
 
 /**
+ * Wage payday — the latest real pay date anchors the next fortnight. This
+ * complements the Home payroll row so Brad gets one lock-screen nudge the
+ * day before, one on the day, and one escalation if it is missed.
+ */
+function paydayRules(payRuns: PayRun[], todayISO: string): BusinessNotification[] {
+  const latestByEmployee = new Map<string, PayRun>();
+  for (const run of payRuns) {
+    if (!run.paid || !run.paidDate) continue;
+    const key = run.memberId ?? run.employeeName.trim().toLowerCase();
+    const current = latestByEmployee.get(key);
+    if (!current?.paidDate || run.paidDate > current.paidDate) latestByEmployee.set(key, run);
+  }
+
+  const out: BusinessNotification[] = [];
+  for (const [employeeKey, run] of latestByEmployee) {
+    const due = addDaysISO(run.paidDate!, 14);
+    const dayBefore = addDaysISO(due, -1);
+    const base = `${employeeKey}:${due}`;
+    if (todayISO === dayBefore) {
+      out.push({
+        ruleKey: 'payday',
+        dedupeKey: `${base}:t1`,
+        title: `${run.employeeName}'s payday is tomorrow`,
+        body: 'TradePilot has the finished fortnight ready to check and pay.',
+        url: '/home',
+      });
+    } else if (todayISO === due) {
+      out.push({
+        ruleKey: 'payday',
+        dedupeKey: `${base}:t0`,
+        title: `Pay ${run.employeeName} today`,
+        body: 'Check the hours, transfer the net wage, then mark the pay run paid.',
+        url: '/home',
+      });
+    } else if (todayISO > due) {
+      out.push({
+        ruleKey: 'payday',
+        dedupeKey: `${base}:late`,
+        title: `${run.employeeName}'s pay is overdue`,
+        body: `The fortnightly pay was due ${friendlyDate(due)}. Open TradePilot to finish it.`,
+        url: '/home',
+      });
+    }
+  }
+  return out;
+}
+
+/**
  * GST returns — pure date math, no data needed. Two-monthly cycle
  * ending ODD months (Brad's assumed standard cycle — see AGENTS.md
  * "Brad's tax structure"; fix here if myIR says otherwise). Return +
@@ -364,6 +412,7 @@ function morningDigest(inp: RuleInputs): BusinessNotification[] {
  */
 export function evaluateNotificationRules(inp: RuleInputs): BusinessNotification[] {
   return [
+    ...paydayRules(inp.payRuns, inp.todayISO),
     ...eiFilingRules(inp.payRuns, inp.todayISO),
     ...payeRules(inp.payRuns, inp.todayISO),
     ...gstRules(inp.todayISO),

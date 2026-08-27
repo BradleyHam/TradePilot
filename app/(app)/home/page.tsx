@@ -22,6 +22,7 @@ import { supabase } from '@/lib/supabase/client';
 import { PageHeader } from '@/components/shared/page-header';
 import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
+import { unbilledLabourByWorker } from '@/lib/labour-accrual';
 import { rankJobs } from '@/lib/job-match';
 import { JobPicker } from '@/components/shared/job-picker';
 import type { ScheduleItem, ScheduleItemType, Invoice, Entry, Job, ActivityType, Material, JobImport, LostReason, DepositNotYetReason } from '@/lib/types';
@@ -549,35 +550,43 @@ export default function HomePage() {
             setWrapUpScheduleItemId(item.id);
           }}
           onLogHours={(item, fields) => {
-            // Build a hours-type Entry attached to the schedule item's job.
+            // Build hours-type Entries attached to the schedule item's job.
             // Mirrors the shape used in app/(app)/entry/page.tsx — hours
             // entries don't have GST (gstApplies=false) and the description
             // falls back to the schedule item's title so a bare "" doesn't
             // turn into a useless row in the entries list later.
-            addEntry({
-              id: `ent_${Date.now()}`,
-              businessId: businessId ?? '',
-              jobId: item.jobId,
-              type: 'hours',
-              hours: fields.hours,
-              activity: fields.activity,
-              // Brad's own login ticking his own row — same 'owner'
-              // default as the full EntryForm. Without this, Home-logged
-              // hours landed with workerKind undefined: a third unlabelled
-              // bucket in every by-worker rollup, and job costing couldn't
-              // rate them. (Suzie's hours come via /my/hours, not here.)
-              workerKind: 'owner',
-              description: fields.description.trim() || item.title,
-              // Ticking an overdue row usually means the work happened on
-              // the day the row was scheduled — put the hours on THAT day
-              // so the hours-by-day allocation is right. Future-dated rows
-              // (ticked early) still log as today: work can't happen on a
-              // date that hasn't arrived. String compare is safe on
-              // YYYY-MM-DD.
-              entryDate: item.date && item.date < todayISO ? item.date : todayISO,
-              gstApplies: false,
-              createdAt: new Date().toISOString(),
-            });
+            //
+            // One entry PER ACTIVITY (a single activity is one entry) so the
+            // hours-by-activity chart stays truthful when a day was split
+            // between, say, prep and painting.
+            for (const slice of fields.slices) {
+              addEntry({
+                // UUID, not Date.now() — a multi-activity split saves several
+                // entries in the same millisecond, and timestamp ids collide.
+                id: `ent_${crypto.randomUUID()}`,
+                businessId: businessId ?? '',
+                jobId: item.jobId,
+                type: 'hours',
+                hours: slice.hours,
+                activity: slice.activity,
+                // Brad's own login ticking his own row — same 'owner'
+                // default as the full EntryForm. Without this, Home-logged
+                // hours landed with workerKind undefined: a third unlabelled
+                // bucket in every by-worker rollup, and job costing couldn't
+                // rate them. (Suzie's hours come via /my/hours, not here.)
+                workerKind: 'owner',
+                description: fields.description.trim() || item.title,
+                // Ticking an overdue row usually means the work happened on
+                // the day the row was scheduled — put the hours on THAT day
+                // so the hours-by-day allocation is right. Future-dated rows
+                // (ticked early) still log as today: work can't happen on a
+                // date that hasn't arrived. String compare is safe on
+                // YYYY-MM-DD.
+                entryDate: item.date && item.date < todayISO ? item.date : todayISO,
+                gstApplies: false,
+                createdAt: new Date().toISOString(),
+              });
+            }
           }}
         />
 
@@ -941,9 +950,12 @@ function SiteVisitPromptSheet({
 // Fields collected by the inline hours form that appears after a job_booking
 // is ticked. Description is optional — the section's handler falls back to
 // the schedule item's title if it's empty.
+//
+// `slices` carries one row per activity worked: a plain "8h painting" day is
+// a one-element list; a split day ("5h painting, 3h prep") is one row each,
+// and the handler saves one Entry per row so hours-by-activity stays honest.
 export interface LoggedHoursFields {
-  hours: number;
-  activity: ActivityType;
+  slices: { activity: ActivityType; hours: number }[];
   description: string;
 }
 
@@ -1179,11 +1191,18 @@ function TodayRow({
 
 // ── Inline hours form (shown when a job-linked Today row is ticked) ────────
 //
-// Three fields: hours, activity, description. Date and job are implicit
-// (today + the schedule item's jobId). Save and Cancel both dismiss the form
-// and let the parent collapse the row by marking the schedule item complete.
+// Three fields: hours, activity (multi-select), description. Date and job
+// are implicit (today + the schedule item's jobId). Save and Cancel both
+// dismiss the form and let the parent collapse the row by marking the
+// schedule item complete.
 //
-// Enter in the hours input saves. Save disabled until hours > 0.
+// Activities are TAP-ALL-THAT-APPLY: one selected keeps the old one-entry
+// flow; picking 2+ reveals a per-activity hours split (prefilled evenly)
+// and each activity saves as its own entry — mirrors /my/hours and the
+// full EntryForm so a split day reads the same everywhere.
+//
+// Enter in the hours input saves. Save disabled until hours > 0 (and, when
+// split, until the per-activity rows add up to the total).
 
 const ACTIVITY_OPTIONS: { value: ActivityType; label: string }[] = [
   { value: 'painting',     label: 'Painting' },
@@ -1199,6 +1218,16 @@ const ACTIVITY_OPTIONS: { value: ActivityType; label: string }[] = [
   { value: 'admin',        label: 'Admin' },
 ];
 
+// Split `total` hours across `n` activities in half-hour steps, spreading
+// any remainder half-hours across the first rows (same maths as EntryForm).
+function evenHoursSplit(total: number, n: number): number[] {
+  if (n <= 0 || !isFinite(total) || total <= 0) return Array(Math.max(n, 0)).fill(0);
+  const halves = Math.round(total * 2);
+  const base = Math.floor(halves / n);
+  const rem = halves - base * n;
+  return Array.from({ length: n }, (_, i) => (base + (i < rem ? 1 : 0)) / 2);
+}
+
 function TickedHoursForm({
   itemTitle, onSave, onCancel,
 }: {
@@ -1207,15 +1236,58 @@ function TickedHoursForm({
   onCancel: () => void;
 }) {
   const [hoursStr, setHoursStr] = useState('');
-  const [activity, setActivity] = useState<ActivityType>('painting');
+  // Multi-select, in tap order. 'painting' pre-selected so the common
+  // "8h painting, done" day is still two taps (hours + Save).
+  const [activities, setActivities] = useState<ActivityType[]>(['painting']);
+  /** activity → hours string; only meaningful when 2+ activities picked. */
+  const [splitHours, setSplitHours] = useState<Record<string, string>>({});
   const [description, setDescription] = useState('');
 
   const hoursNum = parseFloat(hoursStr);
-  const canSave = !Number.isNaN(hoursNum) && hoursNum > 0;
+  const multi = activities.length > 1;
+
+  function toggleActivity(a: ActivityType) {
+    const next = activities.includes(a)
+      ? activities.filter((x) => x !== a)
+      : [...activities, a];
+    setActivities(next);
+    if (next.length > 1) {
+      const parts = evenHoursSplit(parseFloat(hoursStr), next.length);
+      setSplitHours(Object.fromEntries(
+        next.map((x, i) => [x, parts[i] ? String(parts[i]) : '']),
+      ));
+    } else {
+      setSplitHours({});
+    }
+  }
+
+  function setTotalAndResplit(v: string) {
+    setHoursStr(v);
+    if (activities.length > 1) {
+      const parts = evenHoursSplit(parseFloat(v), activities.length);
+      setSplitHours(Object.fromEntries(
+        activities.map((x, i) => [x, parts[i] ? String(parts[i]) : '']),
+      ));
+    }
+  }
+
+  const allocated = multi
+    ? activities.reduce((s, a) => s + (parseFloat(splitHours[a] ?? '') || 0), 0)
+    : hoursNum;
+  // A cent of float slop so 8h/3-way splits don't block Save.
+  const splitBalances = !multi || Math.abs(allocated - hoursNum) < 0.01;
+
+  const canSave =
+    !Number.isNaN(hoursNum) && hoursNum > 0 && activities.length > 0 && splitBalances;
 
   function submit() {
     if (!canSave) return;
-    onSave({ hours: hoursNum, activity, description });
+    const slices = multi
+      ? activities
+          .map((a) => ({ activity: a, hours: parseFloat(splitHours[a] ?? '') || 0 }))
+          .filter((s) => s.hours > 0)
+      : [{ activity: activities[0], hours: hoursNum }];
+    onSave({ slices, description });
   }
 
   return (
@@ -1232,7 +1304,7 @@ function TickedHoursForm({
             min={0}
             autoFocus
             value={hoursStr}
-            onChange={(e) => setHoursStr(e.target.value)}
+            onChange={(e) => setTotalAndResplit(e.target.value)}
             onKeyDown={(e) => {
               if (e.key === 'Enter') {
                 e.preventDefault();
@@ -1249,17 +1321,62 @@ function TickedHoursForm({
 
       <div>
         <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
-          Activity
+          Activity <span className="normal-case font-normal">(tap all that apply)</span>
         </label>
-        <select
-          value={activity}
-          onChange={(e) => setActivity(e.target.value as ActivityType)}
-          className="w-full h-11 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
-        >
-          {ACTIVITY_OPTIONS.map((opt) => (
-            <option key={opt.value} value={opt.value}>{opt.label}</option>
-          ))}
-        </select>
+        <div className="flex flex-wrap gap-1.5">
+          {ACTIVITY_OPTIONS.map((opt) => {
+            const on = activities.includes(opt.value);
+            return (
+              <button
+                key={opt.value}
+                type="button"
+                onClick={() => toggleActivity(opt.value)}
+                aria-pressed={on}
+                className={cn(
+                  'min-h-[40px] px-3 rounded-full border text-sm transition-colors',
+                  on
+                    ? 'bg-primary text-primary-foreground border-primary'
+                    : 'bg-background text-muted-foreground border-border hover:border-primary/40 hover:text-foreground',
+                )}
+              >
+                {opt.label}
+              </button>
+            );
+          })}
+        </div>
+
+        {/* Per-activity split — only once 2+ activities are picked. Prefilled
+            evenly; each row saves as its own entry. */}
+        {multi && (
+          <div className="mt-2 rounded-xl border border-border bg-background p-3 space-y-1.5">
+            <p className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide">
+              How many hours on each?
+            </p>
+            {activities.map((a) => (
+              <div key={a} className="flex items-center gap-2">
+                <span className="flex-1 text-sm capitalize">{a}</span>
+                <input
+                  type="number"
+                  inputMode="decimal"
+                  step="0.25"
+                  min="0"
+                  value={splitHours[a] ?? ''}
+                  onChange={(e) => setSplitHours((prev) => ({ ...prev, [a]: e.target.value }))}
+                  className="w-24 h-11 px-3 rounded-lg border border-input bg-background text-sm text-right focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+                <span className="text-sm text-muted-foreground w-4">h</span>
+              </div>
+            ))}
+            <p className={cn(
+              'text-[11px]',
+              splitBalances ? 'text-muted-foreground' : 'text-red-600 font-medium',
+            )}>
+              {splitBalances
+                ? `Adds up to ${hoursNum || 0}h ✓ — saves as ${activities.length} entries`
+                : `These add up to ${Math.round(allocated * 100) / 100}h — your total says ${hoursNum || 0}h.`}
+            </p>
+          </div>
+        )}
       </div>
 
       <div>
@@ -2274,6 +2391,19 @@ function DraftBillRow({
   // confirming — '' represents "Overhead / no job".
   const [pickedJobId, setPickedJobId] = useState<string>(draft.jobId ?? '');
   const [opening, setOpening] = useState(false);
+  // Does this bill cover sub / helper hours already logged on the picked
+  // job? If so, confirming it must retire their accrual — otherwise the
+  // hours and the invoice both count and the job looks twice as expensive
+  // as it was. Read the store directly rather than threading a callback
+  // through three layers of props.
+  const { entries: allEntries, markLabourBilled } = useStore();
+  const [coversLabour, setCoversLabour] = useState(false);
+  // Sub / helper hours on the picked job that nobody has invoiced yet,
+  // grouped per person so the prompt can name them.
+  const unbilledOnJob = useMemo(
+    () => (pickedJobId ? unbilledLabourByWorker(allEntries, pickedJobId) : []),
+    [allEntries, pickedJobId],
+  );
 
   // Pre-rank the jobs against the parser's jobHint so the best matches
   // float to the top of the dropdown. The hint may be undefined; rankJobs
@@ -2489,6 +2619,10 @@ function DraftBillRow({
     } else {
       onConfirm(draft.id, { jobId: billJobId, materials });
     }
+    // Stop those hours counting as owed — this bill is what's owed now.
+    if (coversLabour && unbilledOnJob.length > 0) {
+      markLabourBilled(unbilledOnJob.flatMap((w) => w.entryIds), draft.id);
+    }
   }
 
   // ── Failure draft branch ─────────────────────────────────────────────
@@ -2606,7 +2740,12 @@ function DraftBillRow({
         <JobPicker
           jobs={jobs}
           value={pickedJobId}
-          onChange={setPickedJobId}
+          onChange={(id) => {
+            setPickedJobId(id);
+            // Different job, different unbilled hours — a tick left over
+            // from the last pick would retire the wrong ones.
+            setCoversLabour(false);
+          }}
           // Same jobHint the old dropdown ranked by — the PO reference the
           // parser pulled off the bill — so the likely job still floats to
           // the top before Brad types anything.
@@ -2701,6 +2840,29 @@ function DraftBillRow({
             </div>
           ))}
         </div>
+      )}
+
+      {/* Does this bill cover labour already logged on the job? Only asked
+          when the whole bill lands on one job — a split across jobs can't
+          say which slice is whose hours, and guessing would silently wipe
+          an accrual on the wrong job. */}
+      {!splitSlices && unbilledOnJob.length > 0 && (
+        <label className="flex items-start gap-2 rounded-lg bg-amber-50 dark:bg-amber-950/30 border border-amber-200 dark:border-amber-900 p-2 cursor-pointer">
+          <input
+            type="checkbox"
+            checked={coversLabour}
+            onChange={(e) => setCoversLabour(e.target.checked)}
+            className="mt-0.5 h-4 w-4 rounded border-amber-300 accent-amber-600 shrink-0"
+          />
+          <span className="text-[11px] text-amber-800 dark:text-amber-300 leading-snug">
+            This bill covers{' '}
+            {unbilledOnJob.map((w) => `${w.name}'s ${w.hours}h (${fmtMoney(w.cost)})`).join(' and ')}
+            {' '}logged on this job.
+            <span className="block text-amber-700/80 dark:text-amber-400/80">
+              Tick and those hours stop counting as owed — this bill takes over.
+            </span>
+          </span>
+        </label>
       )}
 
       {/* Actions: View PDF + Confirm */}

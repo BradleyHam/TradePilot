@@ -3,253 +3,213 @@
 /**
  * Per-job visualisations for the JobDetailSheet.
  *
- * Three components, one file:
- *   - HourlyRateGauge:   are we hitting the target $/h?
- *   - IncomeVsExpenses:  how much of expected income is left as profit?
+ * Four components, one file:
+ *   - OwnerRateMeter:    did an hour of MY time on this pay?
+ *   - MoneySplitBar:     where did the job's money actually go?
  *   - HoursByActivity:   where is the time going?
+ *   - HoursByPerson:     whose hours were they, and what did they earn?
+ *
+ * ## The rate these charts talk about
+ *
+ * They used to lead with revenue ÷ everyone's hours — $4,000 over 64h of
+ * owner + employee + subbie time = "$63/h". That number belongs to nobody:
+ * it isn't Brad's rate, it isn't the crew's, and it moves the wrong way when
+ * he puts more people on a job. A blended target had to be invented just to
+ * judge it against something.
+ *
+ * Now that `jobStats` charges wages and sub labour to the job, the honest
+ * question has a one-line answer: what's left over, divided by the owner's
+ * own hours, judged against the owner's own target rate. No blend needed.
  *
  * All hide gracefully when there's no data. Pure SVG + Tailwind — no chart lib.
+ *
+ * ## Colour
+ *
+ * One money palette across both charts, so a colour means the same thing
+ * wherever it appears: rose = materials, amber = subbies and helpers,
+ * blue = wages, green = the owner's share. Validated for colour-blind
+ * separation in both light and dark surfaces (adjacent-pair ΔE ≥ 8 OKLab),
+ * which is why the segments and rows are ordered the way they are — rose
+ * next to amber, or amber next to green, is the pairing that fails. Every
+ * mark carries a text label as well, so identity never rests on hue.
  */
 
-import type { Entry } from '@/lib/types';
+import type { BusinessMember, Entry } from '@/lib/types';
 import type { JobStats } from '@/lib/job-stats';
+import type { PayBasis } from '@/lib/job-people';
+import { jobPeopleBreakdown } from '@/lib/job-people';
 import { cn } from '@/lib/utils';
 
-// ─── Hourly rate gauge ───────────────────────────────────────────────────────
-// Brad's target: $85–100/hr combined. Below $70 = red, $70–85 = amber,
-// $85+ = green. We render a 180° arc with three coloured zones and a needle
-// pointing at the actual rate.
+const money = (n: number) => `$${Math.round(n).toLocaleString('en-NZ')}`;
+const hrs = (n: number) => `${Math.round(n * 10) / 10}h`;
 
-const DEFAULT_TARGET_LOW = 85;
-const DEFAULT_TARGET_HIGH = 100;
-const DEFAULT_ZONE_RED = 70;
-const GAUGE_MIN = 0;
+/** Tailwind fills for the shared money palette, light + dark steps. */
+const FILL: Record<'materials' | 'contractors' | 'wages' | 'owner', string> = {
+  materials:   'bg-rose-500 dark:bg-rose-600',
+  contractors: 'bg-amber-500 dark:bg-amber-600',
+  wages:       'bg-blue-500',
+  owner:       'bg-green-500 dark:bg-green-600',
+};
 
-interface HourlyRateGaugeProps {
-  hourlyRate: number | null;
-  /** When true, label says "Expected $/h" instead of "Hourly rate". */
+// ─── Owner rate meter ────────────────────────────────────────────────────────
+// A single ratio against a limit, which wants a meter rather than a dial:
+// one bar, one target marker, and the number itself as the hero. Replaces
+// the 200px gauge and the blended-target machinery behind it.
+
+interface OwnerRateMeterProps {
+  /** `stats.ownerRate` — profit ÷ the owner's own hours. */
+  ownerRate: number | null;
+  ownerHours: number;
+  /** `stats.expectedProfit`. */
+  profit: number;
+  /** The owner's target $/hr — `workerRate('owner', settings)`. */
+  target: number;
+  /** True while the income is still expected rather than banked. */
   isExpected?: boolean;
-  /**
-   * Per-job BLENDED target $/hr — computed from the actual worker mix
-   * on this job (owner + helper + etc, weighted by each tier's target
-   * rate). When supplied, the gauge's zones shift around this number
-   * instead of the static $85–100 default, so a two-person day is
-   * judged against the right benchmark for the labour deployed.
-   * Null/undefined = use defaults.
-   */
-  blendedTarget?: number | null;
-  /**
-   * Plain-English description of the labour mix to show in the subtitle
-   * (e.g. "8h you + 6h helper"). Only meaningful when blendedTarget is set.
-   */
-  mixDescription?: string;
+  /** Someone else was on this job, so it's worth saying they're paid first. */
+  hasCrew?: boolean;
 }
 
-export function HourlyRateGauge({
-  hourlyRate, isExpected = false, blendedTarget, mixDescription,
-}: HourlyRateGaugeProps) {
-  if (hourlyRate == null) return null;
+export function OwnerRateMeter({
+  ownerRate, ownerHours, profit, target, isExpected = false, hasCrew = false,
+}: OwnerRateMeterProps) {
+  // No owner hours = no owner rate. The profit tile already says what the
+  // job made; inventing a rate from someone else's time would be a lie.
+  if (ownerRate == null || ownerHours <= 0) return null;
 
-  // Zone thresholds: when a blendedTarget is supplied, centre the
-  // amber→green boundary on it (-/+ 8% for the amber band) so the
-  // gauge tells the right story for the actual labour mix on this
-  // job. Otherwise fall back to the static $85–100 defaults.
-  const TARGET_LOW  = blendedTarget != null ? Math.round(blendedTarget * 0.92) : DEFAULT_TARGET_LOW;
-  const TARGET_HIGH = blendedTarget != null ? Math.round(blendedTarget * 1.08) : DEFAULT_TARGET_HIGH;
-  const ZONE_RED    = blendedTarget != null ? Math.round(blendedTarget * 0.75) : DEFAULT_ZONE_RED;
-  // Cap the gauge max at the higher of $150 or 1.6× the target so very
-  // high rates still appear on the dial without pinning the needle.
-  const GAUGE_MAX   = blendedTarget != null
-    ? Math.max(150, Math.round(blendedTarget * 1.6))
-    : 150;
-
-  // Gauge geometry: a 180° arc from (10,80) to (190,80) with radius 80, centred at (100,80).
-  const W = 200;
-  const H = 110;
-  const CX = 100;
-  const CY = 80;
-  const R = 70;
-
-  // Map a $/h value to an angle on the arc. 0° = left (180°), 180° = right (0°).
-  // Math: angle = π * (1 - (value-min)/(max-min))
-  const toRad = (value: number) => {
-    const clamped = Math.max(GAUGE_MIN, Math.min(GAUGE_MAX, value));
-    const t = (clamped - GAUGE_MIN) / (GAUGE_MAX - GAUGE_MIN);
-    return Math.PI * (1 - t);
-  };
-
-  const polar = (value: number, radius = R) => {
-    const a = toRad(value);
-    return { x: CX + radius * Math.cos(a), y: CY - radius * Math.sin(a) };
-  };
-
-  // Build a path for an arc segment between two values.
-  function arcPath(from: number, to: number) {
-    const start = polar(from);
-    const end = polar(to);
-    // 180° gauge so largeArc is always 0
-    return `M ${start.x.toFixed(2)} ${start.y.toFixed(2)} A ${R} ${R} 0 0 1 ${end.x.toFixed(2)} ${end.y.toFixed(2)}`;
-  }
-
-  // Needle endpoint
-  const needle = polar(hourlyRate, R - 6);
-
-  // Status text + colour
   let status: string;
-  let statusColor: string;
-  if (hourlyRate >= TARGET_LOW) {
-    status = 'On target';
-    statusColor = 'text-green-600';
-  } else if (hourlyRate >= ZONE_RED) {
-    status = 'Below target';
-    statusColor = 'text-amber-600';
+  let statusText: string;
+  let fill: string;
+  if (ownerRate >= target) {
+    status = 'On target'; statusText = 'text-green-600'; fill = 'bg-green-500 dark:bg-green-600';
+  } else if (ownerRate >= target * 0.8) {
+    status = 'Below target'; statusText = 'text-amber-600'; fill = 'bg-amber-500 dark:bg-amber-600';
+  } else if (ownerRate > 0) {
+    status = 'Off the pace'; statusText = 'text-red-500'; fill = 'bg-red-500';
   } else {
-    status = 'Off the pace';
-    statusColor = 'text-red-500';
+    status = 'Lost money'; statusText = 'text-red-500'; fill = 'bg-red-500';
   }
+
+  // Scale so the target marker always sits comfortably inside the track and
+  // a big result still fits without pinning.
+  const max = Math.max(target * 1.4, ownerRate * 1.15, 1);
+  const pct = (v: number) => `${Math.max(0, Math.min(100, (v / max) * 100))}%`;
+
+  // What would have closed the gap. Two levers, both true at once: charge
+  // more, or spend less of your own time on it.
+  const shortfall = target - ownerRate;
+  const extraRevenue = target * ownerHours - profit;
+  const hoursToSave = ownerHours - profit / target;
 
   return (
     <div className="bg-card border border-border rounded-2xl p-4">
-      <div className="flex items-center justify-between mb-2">
+      <div className="flex items-center justify-between mb-1">
         <p className="text-sm font-semibold text-foreground">
-          {isExpected ? 'Expected hourly rate' : 'Hourly rate'}
+          {isExpected ? 'Your expected rate' : 'Your rate on this job'}
         </p>
-        <p className={cn('text-xs font-medium', statusColor)}>{status}</p>
+        <p className={cn('text-xs font-medium', statusText)}>{status}</p>
       </div>
 
-      {/*
-        Cap the gauge width on desktop. Without this, the SVG's `w-full h-auto`
-        + 200×110 aspect ratio means a 1400px container yields a 770px-tall
-        gauge — it ate the entire viewport on desktop. 360px fits a phone
-        screen edge-to-edge while keeping the gauge a sensible size on a
-        laptop or external display.
-      */}
-      <div className="relative mx-auto w-full max-w-[360px]">
-        <svg viewBox={`0 0 ${W} ${H}`} className="w-full h-auto" aria-hidden>
-          {/* Zones */}
-          <path d={arcPath(GAUGE_MIN, ZONE_RED)} stroke="#ef4444" strokeWidth="14" fill="none" strokeLinecap="butt" />
-          <path d={arcPath(ZONE_RED, TARGET_LOW)} stroke="#f59e0b" strokeWidth="14" fill="none" strokeLinecap="butt" />
-          <path d={arcPath(TARGET_LOW, GAUGE_MAX)} stroke="#22c55e" strokeWidth="14" fill="none" strokeLinecap="butt" />
+      <p className="text-3xl font-bold text-foreground leading-none">
+        {money(ownerRate)}<span className="text-base font-medium text-muted-foreground">/h</span>
+      </p>
+      <p className="mt-1 text-[11px] text-muted-foreground">
+        {hrs(ownerHours)} of your time{hasCrew ? ', once everyone else is paid' : ''}
+      </p>
 
-          {/* Tick marks for the boundaries */}
-          {[ZONE_RED, TARGET_LOW, TARGET_HIGH].map((v) => {
-            const inner = polar(v, R - 14);
-            const outer = polar(v, R + 2);
-            return (
-              <line
-                key={v}
-                x1={inner.x}
-                y1={inner.y}
-                x2={outer.x}
-                y2={outer.y}
-                stroke="currentColor"
-                strokeWidth="1"
-                className="text-card"
-              />
-            );
-          })}
-
-          {/* Needle */}
-          <line
-            x1={CX}
-            y1={CY}
-            x2={needle.x}
-            y2={needle.y}
-            stroke="currentColor"
-            strokeWidth="2.5"
-            strokeLinecap="round"
-            className="text-foreground"
-          />
-          <circle cx={CX} cy={CY} r={4} className="fill-foreground" />
-        </svg>
-
-        {/* Reading */}
-        <div className="absolute inset-x-0 bottom-0 text-center">
-          <p className="text-2xl font-bold text-foreground">${hourlyRate.toFixed(0)}<span className="text-sm font-medium text-muted-foreground">/h</span></p>
-        </div>
+      <div className="relative mt-3 h-3 w-full rounded-full bg-muted overflow-hidden">
+        <div className={cn('h-full rounded-full transition-all', fill)} style={{ width: pct(Math.max(0, ownerRate)) }} />
+      </div>
+      {/* Target marker rides outside the clipped track so its label can sit
+          under the tick without being cut off. */}
+      <div className="relative h-4">
+        <div className="absolute -top-3 w-px h-3 bg-foreground/70" style={{ left: pct(target) }} />
+        <span className="absolute top-0 text-[10px] text-muted-foreground -translate-x-1/2 whitespace-nowrap" style={{ left: pct(target) }}>
+          target {money(target)}
+        </span>
       </div>
 
-      <p className="mt-2 text-[11px] text-muted-foreground text-center">
-        {blendedTarget != null ? (
+      <p className="mt-2 text-[11px] leading-snug text-muted-foreground">
+        {shortfall > 0 ? (
           <>
-            Target ${TARGET_LOW}–{TARGET_HIGH}/h
-            {mixDescription ? ` · ${mixDescription}` : null}
+            <span className="font-medium text-foreground">{money(extraRevenue)} more on the price</span>
+            {hoursToSave > 0.2 ? <> — or {hrs(hoursToSave)} less of your own time — </> : <> </>}
+            would have made this a {money(target)}/h job.
           </>
         ) : (
-          <>Target $85–100/h · zones $0 – $70 – $85 – $150</>
+          <>Clear of your {money(target)}/h target by {money(-shortfall)} an hour.</>
         )}
       </p>
     </div>
   );
 }
 
-// ─── Income vs Expenses bar ──────────────────────────────────────────────────
-// Horizontal bar showing expenses-so-far + projected profit, stacked, scaled
-// to expected income. If expenses already exceed expected income we show the
-// overrun in red.
+// ─── Money split ─────────────────────────────────────────────────────────────
+// Part-to-whole, four named parts: a horizontal stacked bar with a labelled
+// legend. Answers "who got what" in one line — the old Job budget bar showed
+// expenses vs profit, which hid every person inside the word "expenses".
 
-interface IncomeVsExpensesProps {
+interface MoneySplitBarProps {
   stats: JobStats;
 }
 
-export function IncomeVsExpenses({ stats }: IncomeVsExpensesProps) {
-  const { totalExpenses, expectedIncome, expectedProfit } = stats;
-  // Don't show on jobs with literally nothing yet
-  if (totalExpenses === 0 && expectedIncome === 0) return null;
+export function MoneySplitBar({ stats }: MoneySplitBarProps) {
+  const { expectedIncome, materialsCost, contractorLabourCost, payrollLabourCost, expectedProfit } = stats;
+  if (expectedIncome <= 0 && stats.totalExpenses <= 0) return null;
 
-  const denominator = Math.max(expectedIncome, totalExpenses);
-  if (denominator <= 0) return null;
+  const overrun = expectedProfit < 0;
+  // When the job lost money there's no owner slice to draw — scale the
+  // costs to themselves and say by how much they overshot.
+  const denominator = overrun ? stats.totalExpenses : Math.max(expectedIncome, 1);
 
-  const expensePct = Math.min(100, (totalExpenses / denominator) * 100);
-  const profitPct = expectedProfit > 0 ? (expectedProfit / denominator) * 100 : 0;
-  const overruns = expectedProfit < 0;
+  const segments = [
+    { key: 'materials'   as const, label: 'Materials',  value: materialsCost },
+    { key: 'contractors' as const, label: 'Subbies',    value: contractorLabourCost },
+    { key: 'wages'       as const, label: 'Wages',      value: payrollLabourCost },
+    { key: 'owner'       as const, label: 'You',        value: overrun ? 0 : expectedProfit },
+  ].filter((seg) => seg.value > 0.5);
 
-  const fmt = (n: number) => `$${n.toLocaleString('en-NZ', { maximumFractionDigits: 0 })}`;
+  if (segments.length === 0) return null;
 
   return (
     <div className="bg-card border border-border rounded-2xl p-4">
       <div className="flex items-baseline justify-between mb-3">
-        <p className="text-sm font-semibold text-foreground">Job budget</p>
-        <p className="text-xs text-muted-foreground">
-          {fmt(totalExpenses)} of {fmt(expectedIncome)}
+        <p className="text-sm font-semibold text-foreground">
+          {/* Naming the figure makes the bar self-explanatory — but only
+              when there IS one. A job with costs and no price yet gets the
+              generic title rather than "Where the $0 went". */}
+          {expectedIncome > 0 ? <>Where the {money(expectedIncome)} went</> : 'Where the money went'}
         </p>
-      </div>
-
-      <div className="h-7 w-full rounded-full overflow-hidden flex bg-muted">
-        <div
-          className={cn('h-full transition-all', overruns ? 'bg-red-500' : 'bg-red-400')}
-          style={{ width: `${expensePct}%` }}
-          title={`Expenses: ${fmt(totalExpenses)}`}
-        />
-        {!overruns && (
-          <div
-            className="h-full bg-green-500 transition-all"
-            style={{ width: `${profitPct}%` }}
-            title={`Expected profit: ${fmt(expectedProfit)}`}
-          />
+        {overrun && (
+          <p className="text-xs font-medium text-red-500">Over by {money(-expectedProfit)}</p>
         )}
       </div>
 
-      <div className="flex items-center justify-between mt-2 text-xs">
-        <div className="flex items-center gap-1.5">
-          <span className="w-2 h-2 rounded-full bg-red-400" />
-          <span className="text-muted-foreground">Expenses</span>
-          <span className="font-medium text-foreground">{fmt(totalExpenses)}</span>
-        </div>
-        <div className="flex items-center gap-1.5">
-          {overruns ? (
-            <>
-              <span className="w-2 h-2 rounded-full bg-red-600" />
-              <span className="font-medium text-red-600">Over by {fmt(Math.abs(expectedProfit))}</span>
-            </>
-          ) : (
-            <>
-              <span className="w-2 h-2 rounded-full bg-green-500" />
-              <span className="text-muted-foreground">Profit</span>
-              <span className="font-medium text-foreground">{fmt(expectedProfit)}</span>
-            </>
-          )}
-        </div>
+      <div className="flex gap-[2px] h-7 w-full rounded-full overflow-hidden bg-muted">
+        {segments.map((seg) => (
+          <div
+            key={seg.key}
+            className={cn('h-full transition-all', FILL[seg.key])}
+            style={{ width: `${(seg.value / denominator) * 100}%` }}
+            title={`${seg.label}: ${money(seg.value)}`}
+          />
+        ))}
+      </div>
+
+      {/* Legend doubles as the value table — every segment is named and
+          priced, which is what lets the lighter fills carry their weight. */}
+      <div className="mt-3 grid grid-cols-2 gap-x-4 gap-y-1.5">
+        {segments.map((seg) => (
+          <div key={seg.key} className="flex items-center gap-1.5 text-xs min-w-0">
+            <span className={cn('w-2 h-2 rounded-full shrink-0', FILL[seg.key])} />
+            <span className="text-muted-foreground truncate">{seg.label}</span>
+            <span className="flex-1" />
+            <span className="font-medium text-foreground tabular-nums shrink-0">{money(seg.value)}</span>
+            <span className="text-muted-foreground tabular-nums shrink-0 w-8 text-right">
+              {Math.round((seg.value / denominator) * 100)}%
+            </span>
+          </div>
+        ))}
       </div>
     </div>
   );
@@ -323,6 +283,149 @@ export function HoursByActivity({ entries }: HoursByActivityProps) {
           );
         })}
       </div>
+    </div>
+  );
+}
+
+// ─── Hours by person ─────────────────────────────────────────────────────────
+// Who was actually on this job, and what they took off it. Sits under
+// "Hours by activity": that one says what the time went into, this one says
+// whose time it was. Bars are hours (magnitude); the $ beside each is the
+// money that person's hours turned into, which is a different number for
+// each of the three ways someone gets paid — see lib/job-people.ts.
+//
+// Owner bar is amber, crew blue. Every row is directly labelled with a name,
+// so identity never rests on colour alone.
+
+interface HoursByPersonProps {
+  /** All the job's entries — hours rows are filtered out here. */
+  entries: Entry[];
+  teamMembers: BusinessMember[];
+  viewerUserId?: string | null;
+  /** Payroll gross $/hr — `payrollConfig(settings).wageRate`. */
+  wageRate: number;
+  /** `stats.expectedProfit`, or null when the job has no income figure. */
+  expectedProfit: number | null;
+}
+
+const BASIS_NOTE: Record<PayBasis, string> = {
+  owner:   'your share',
+  wages:   'wages',
+  invoice: 'invoiced',
+  unknown: 'rate not set',
+};
+
+/** Same hues as the money split, so "blue" means wages on both charts. */
+const BASIS_FILL: Record<PayBasis, string> = {
+  owner:   FILL.owner,
+  wages:   FILL.wages,
+  invoice: FILL.contractors,
+  unknown: 'bg-muted-foreground/40',
+};
+
+export function HoursByPerson({
+  entries, teamMembers, viewerUserId, wageRate, expectedProfit,
+}: HoursByPersonProps) {
+  const hoursEntries = entries.filter((e) => e.type === 'hours');
+  const { rows, totalHours, crewCost, legacyHelperHours } = jobPeopleBreakdown({
+    hoursEntries, teamMembers, viewerUserId, wageRate, expectedProfit,
+  });
+
+  // Nothing to show on a solo job — "Me 64h, 100%" is a bar chart of one
+  // fact the Hours tile already states.
+  if (totalHours <= 0 || rows.length < 2) return null;
+
+  const ownerRow = rows.find((r) => r.isOwner);
+  const unpriced = rows.reduce((s, r) => s + r.unpricedHours, 0);
+
+  return (
+    <div className="bg-card border border-border rounded-2xl p-4">
+      <div className="flex items-baseline justify-between mb-3">
+        <p className="text-sm font-semibold text-foreground">Hours by person</p>
+        <p className="text-xs text-muted-foreground">
+          {rows.length} on site · {hrs(totalHours)}
+        </p>
+      </div>
+
+      <div className="space-y-3">
+        {rows.map((r) => {
+          const pct = (r.hours / totalHours) * 100;
+          const negative = r.earned != null && r.earned < 0;
+          return (
+            <div key={r.key} className="space-y-1">
+              <div className="flex items-baseline gap-2">
+                <span className="text-xs font-medium text-foreground truncate">{r.label}</span>
+                <span className="text-[10px] text-muted-foreground uppercase tracking-wide shrink-0">
+                  {BASIS_NOTE[r.basis]}
+                </span>
+                <span className="flex-1" />
+                <span
+                  className={cn(
+                    'text-xs font-semibold tabular-nums shrink-0',
+                    r.earned == null
+                      ? 'text-muted-foreground'
+                      : negative
+                        ? 'text-red-500'
+                        : r.isOwner
+                          ? 'text-green-600'
+                          : 'text-foreground',
+                  )}
+                >
+                  {r.earned == null ? '—' : money(r.earned)}
+                </span>
+              </div>
+
+              <div className="flex items-center gap-2.5">
+                <div className="flex-1 h-5 bg-muted rounded-full overflow-hidden">
+                  <div
+                    className={cn('h-full rounded-full transition-all', BASIS_FILL[r.basis])}
+                    style={{ width: `${pct}%` }}
+                    title={`${r.label}: ${hrs(r.hours)}${r.earned != null ? ` · ${money(r.earned)}` : ''}`}
+                  />
+                </div>
+                <span className="text-xs font-medium text-foreground w-12 text-right shrink-0 tabular-nums">
+                  {hrs(r.hours)}
+                </span>
+              </div>
+
+              {/* Second line only where there's something honest to add. */}
+              {r.isOwner && r.effectiveRate != null && (
+                <p className="text-[11px] text-muted-foreground">
+                  ${Math.round(r.effectiveRate)}/h for your time, after everyone else is paid
+                </p>
+              )}
+              {r.unpricedHours > 0 && (
+                <p className="text-[11px] text-amber-600">
+                  {hrs(r.unpricedHours)} with no cost rate — add one on the entry to price it
+                </p>
+              )}
+            </div>
+          );
+        })}
+      </div>
+
+      <div className="mt-3 pt-3 border-t border-border flex items-center justify-between text-xs">
+        <span className="text-muted-foreground">
+          Crew cost <span className="font-medium text-foreground">{money(crewCost)}</span>
+        </span>
+        {ownerRow?.earned != null && (
+          <span className="text-muted-foreground">
+            Left for you{' '}
+            <span className={cn('font-medium', ownerRow.earned < 0 ? 'text-red-500' : 'text-green-600')}>
+              {money(ownerRow.earned)}
+            </span>
+          </span>
+        )}
+      </div>
+
+      {(unpriced > 0 || legacyHelperHours > 0) && (
+        <p className="mt-2 text-[11px] text-muted-foreground">
+          {legacyHelperHours > 0 && (
+            <>Plus {hrs(legacyHelperHours)} of older helper hours logged on your own entries — not counted above. </>
+          )}
+          {unpriced > 0 && <>Crew cost excludes {hrs(unpriced)} of unpriced labour.</>}
+        </p>
+      )}
     </div>
   );
 }

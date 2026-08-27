@@ -3,6 +3,7 @@
 import { useMemo, useState } from 'react';
 import { Job, ScheduleItem, ScheduleItemType } from '@/lib/types';
 import { useStore } from '@/lib/store';
+import { knownCrewNames } from '@/lib/hours-attribution';
 import {
   Sheet,
   SheetContent,
@@ -18,7 +19,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Trash2, CheckCircle2, Scissors } from 'lucide-react';
+import { Trash2, CheckCircle2, Scissors, Plus, X } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import { cn } from '@/lib/utils';
 
@@ -217,7 +218,7 @@ function EditForm({
 }) {
   const {
     addScheduleItem, deleteScheduleItem, updateScheduleItem, businessId,
-    role, teamMembers, jobAssignments, scheduleAssignments, setBookingAssignees,
+    role, teamMembers, jobAssignments, scheduleAssignments, setBookingAssignees, entries, scheduleItems,
   } = useStore();
 
   // Sort once so the first item is the run's start and the last is its end.
@@ -268,8 +269,22 @@ function EditForm({
     () => teamMembers.filter((m) => m.role === 'employee'),
     [teamMembers],
   );
-  const showAssignees =
-    role === 'owner' && first.type === 'job_booking' && employees.length > 0;
+  /**
+   * Everyone with a login who can be put on a day: Brad first (he's on
+   * most of them), then staff. He was previously excluded, which left a
+   * one-man-plus-Suzie business with "Job team" or "suzie" and no way to
+   * say "just me".
+   */
+  const loginPeople = useMemo(() => {
+    const owner = teamMembers.find((m) => m.role === 'owner');
+    return [
+      ...(owner ? [{ userId: owner.userId, label: 'Me' }] : []),
+      ...employees.map((m) => ({ userId: m.userId, label: m.displayName || 'Employee' })),
+    ];
+  }, [teamMembers, employees]);
+  // Shown for any job booking now, not just businesses with staff — a
+  // solo painter still puts subbies on days.
+  const showAssignees = role === 'owner' && first.type === 'job_booking';
   const initialOverride = useMemo(
     () =>
       scheduleAssignments
@@ -284,6 +299,43 @@ function EditForm({
     initialOverride.length > 0 ? 'custom' : 'inherit',
   );
   const [overrideIds, setOverrideIds] = useState<string[]>(initialOverride);
+
+  // People with no login on this booking — subbies, one-off helpers. Kept
+  // separate from the login override on purpose: these names can't gate
+  // what anyone SEES (there's no account to gate), they just record who
+  // was on the day. Union across the run so editing a 6-day block as one
+  // thing shows everyone who's on any of it.
+  const [crew, setCrew] = useState<string[]>(() => {
+    const seen = new Map<string, string>();
+    for (const it of sorted) {
+      for (const raw of it.crewNames ?? []) {
+        const n = raw.trim();
+        if (n && !seen.has(n.toLowerCase())) seen.set(n.toLowerCase(), n);
+      }
+    }
+    return [...seen.values()];
+  });
+  const [crewDraft, setCrewDraft] = useState('');
+  /** Did this booking already carry names? Then a save must be able to
+   *  clear them; otherwise leave the column alone entirely. */
+  const hadCrew = sorted.some((it) => (it.crewNames ?? []).length > 0);
+
+  // Names Brad has used before (logged hours + other bookings) minus the
+  // ones already on this booking — one tap instead of typing.
+  const crewSuggestions = useMemo(() => {
+    const on = new Set(crew.map((c) => c.toLowerCase()));
+    return knownCrewNames(entries, scheduleItems).filter((n) => !on.has(n.toLowerCase())).slice(0, 6);
+  }, [entries, scheduleItems, crew]);
+
+  function addCrew(name: string) {
+    const n = name.trim();
+    if (!n) return;
+    setCrew((prev) => (prev.some((c) => c.toLowerCase() === n.toLowerCase()) ? prev : [...prev, n]));
+    setCrewDraft('');
+  }
+  function removeCrew(name: string) {
+    setCrew((prev) => prev.filter((c) => c !== name));
+  }
 
   function toggleOverride(userId: string) {
     setAssignMode('custom');
@@ -363,6 +415,9 @@ function EditForm({
         endTime: endTime || undefined,
         jobId: jobId || undefined,
         notes: notes || undefined,
+        // Only write the column when names are actually in play — an
+        // untouched booking shouldn't depend on migration 048 having run.
+        crewNames: showAssignees && (crew.length > 0 || hadCrew) ? crew : undefined,
         completed,
       });
       if (showAssignees) void setBookingAssignees(first.id, effectiveOverride);
@@ -400,6 +455,10 @@ function EditForm({
         endTime: endTime || undefined,
         jobId: jobId || undefined,
         notes: notes || undefined,
+        // Named crew rides on the booking row itself, so unlike the login
+        // override it survives the delete-and-recreate without a second
+        // round trip.
+        crewNames: showAssignees && crew.length > 0 ? crew : undefined,
         completed,
       });
       // Re-apply the per-day override to the recreated booking. The old
@@ -642,13 +701,13 @@ function EditForm({
             >
               Job team
             </button>
-            {employees.map((m) => {
-              const on = assignMode === 'custom' && overrideIds.includes(m.userId);
+            {loginPeople.map((p) => {
+              const on = assignMode === 'custom' && overrideIds.includes(p.userId);
               return (
                 <button
-                  key={m.userId}
+                  key={p.userId}
                   type="button"
-                  onClick={() => toggleOverride(m.userId)}
+                  onClick={() => toggleOverride(p.userId)}
                   aria-pressed={on}
                   className={cn(
                     'min-h-[44px] px-4 rounded-full border text-sm font-medium transition-colors',
@@ -657,17 +716,68 @@ function EditForm({
                       : 'bg-card text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
                   )}
                 >
-                  {m.displayName || 'Employee'}
+                  {p.label}
                 </button>
               );
             })}
+          </div>
+
+          {/* Subbies + one-off helpers — no login, so they're names on the
+              booking rather than assignments. Tap a remembered name or
+              type a new one. */}
+          <div className="mt-2 flex flex-wrap gap-2">
+            {crew.map((name) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => removeCrew(name)}
+                aria-label={`Remove ${name}`}
+                className="min-h-[44px] px-4 rounded-full border text-sm font-medium transition-colors bg-emerald-600 text-white border-emerald-600 hover:bg-emerald-700 flex items-center gap-1.5"
+              >
+                {name}
+                <X size={14} strokeWidth={2.5} />
+              </button>
+            ))}
+            {crewSuggestions.map((name) => (
+              <button
+                key={name}
+                type="button"
+                onClick={() => addCrew(name)}
+                className="min-h-[44px] px-4 rounded-full border border-dashed text-sm font-medium transition-colors bg-card text-muted-foreground border-border hover:text-foreground hover:border-emerald-400 flex items-center gap-1.5"
+              >
+                <Plus size={14} strokeWidth={2.5} />
+                {name}
+              </button>
+            ))}
+          </div>
+          <div className="mt-2 flex items-center gap-2">
+            <input
+              type="text"
+              value={crewDraft}
+              onChange={(e) => setCrewDraft(e.target.value)}
+              onKeyDown={(e) => {
+                if (e.key === 'Enter') { e.preventDefault(); addCrew(crewDraft); }
+              }}
+              placeholder="Add a subbie or helper by name"
+              className="flex-1 min-w-0 h-11 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+            />
+            <Button
+              type="button"
+              variant="outline"
+              className="h-11 shrink-0"
+              disabled={!crewDraft.trim()}
+              onClick={() => addCrew(crewDraft)}
+            >
+              Add
+            </Button>
           </div>
           <p className="text-[11px] text-muted-foreground mt-1.5">
             {assignMode === 'inherit' || overrideIds.length === 0
               ? jobTeamNames.length > 0
                 ? `Job team: ${jobTeamNames.join(', ')}. Pick names to override just ${sorted.length > 1 ? 'these days' : 'this day'}.`
-                : 'Nobody is on this job yet — assign people on the job page, or pick names here for just this booking.'
-              : `Only the picked ${overrideIds.length === 1 ? 'person' : 'people'} will see ${sorted.length > 1 ? 'these days' : 'this day'}.`}
+                : 'Nobody with a login is on this job yet — assign staff on the job page, or pick names here for just this booking.'
+              : `Only the picked ${overrideIds.length === 1 ? 'person' : 'people'} will see ${sorted.length > 1 ? 'these days' : 'this day'} on their phone.`}
+            {crew.length > 0 && ` ${crew.join(' and ')} ${crew.length === 1 ? 'is' : 'are'} on the day for your records — no login, so nothing changes for them.`}
           </p>
         </div>
       )}

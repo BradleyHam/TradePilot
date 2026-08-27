@@ -27,14 +27,14 @@ import { useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import {
   payrollConfig, completedPeriods, periodIsPaid, employeeHoursInPeriod,
-  eiFilingDueDate, payeMonthsDue,
+  eiFilingDueDate, payeMonthsDue, currentPeriod, scheduledPaydayForPeriod,
   type PayPeriod,
 } from '@/lib/payroll';
 import type { BusinessMember } from '@/lib/types';
 import { formatEntryDate } from '@/lib/format-date';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import { Banknote, Landmark, FileCheck2, ChevronDown } from 'lucide-react';
+import { Banknote, Landmark, FileCheck2, ChevronDown, CalendarClock } from 'lucide-react';
 
 function todayISOLocal(): string {
   const d = new Date();
@@ -68,6 +68,7 @@ export function PayrollFlags() {
   );
 
   const cfg = useMemo(() => payrollConfig(settings), [settings]);
+  const activePeriod = useMemo(() => currentPeriod(cfg, todayISO), [cfg, todayISO]);
 
   // Fortnights that have ended with no pay run recorded, per employee.
   const duePeriods = useMemo(() => {
@@ -96,7 +97,6 @@ export function PayrollFlags() {
   );
 
   if (employees.length === 0) return null;
-  if (duePeriods.length === 0 && eiDue.length === 0 && payeDue.length === 0) return null;
 
   return (
     <section>
@@ -104,6 +104,24 @@ export function PayrollFlags() {
         Payroll
       </h2>
       <div className="bg-card border border-border rounded-2xl divide-y divide-border overflow-hidden">
+        {duePeriods.length === 0 && activePeriod && employees.map((member) => {
+          const payday = scheduledPaydayForPeriod(cfg, activePeriod);
+          return (
+            <div key={`next:${member.id}`} className="flex items-center gap-3 px-4 py-3 min-h-[56px]">
+              <div className="w-8 h-8 rounded-xl bg-violet-50 flex items-center justify-center shrink-0">
+                <CalendarClock size={16} className="text-violet-600" strokeWidth={1.8} />
+              </div>
+              <div className="min-w-0">
+                <p className="text-sm font-medium text-foreground">
+                  Next payday — {formatEntryDate(payday)}
+                </p>
+                <p className="text-xs text-muted-foreground">
+                  {member.displayName ?? 'Employee'} · current period {fmtPeriod(activePeriod)}
+                </p>
+              </div>
+            </div>
+          );
+        })}
         {duePeriods.map(({ member, period }) => (
           <PayEmployeeFlag
             key={`${member.id}:${period.start}`}
@@ -111,6 +129,7 @@ export function PayrollFlags() {
             period={period}
             rate={cfg.wageRate}
             todayISO={todayISO}
+            scheduledPayday={scheduledPaydayForPeriod(cfg, period)}
             onSave={addPayRun}
           />
         ))}
@@ -178,12 +197,13 @@ export function PayrollFlags() {
 // ── One "Pay {name}" row with an inline mark-paid form ─────────────────────
 
 function PayEmployeeFlag({
-  member, period, rate, todayISO, onSave,
+  member, period, rate, todayISO, scheduledPayday, onSave,
 }: {
   member: BusinessMember;
   period: PayPeriod;
   rate: number;
   todayISO: string;
+  scheduledPayday: string;
   onSave: (input: {
     memberId?: string;
     employeeName: string;
@@ -205,6 +225,8 @@ function PayEmployeeFlag({
     [entries, member.userId, period],
   );
   const suggestedGross = Math.round(hours.total * rate * 100) / 100;
+  const overdue = todayISO > scheduledPayday;
+  const dueToday = todayISO === scheduledPayday;
 
   const [open, setOpen] = useState(false);
   const [paidDate, setPaidDate] = useState(todayISO);
@@ -304,14 +326,19 @@ function PayEmployeeFlag({
         aria-expanded={open}
         className="w-full flex items-center gap-3 px-4 py-3 min-h-[56px] hover:bg-accent transition-colors text-left"
       >
-        <div className="w-8 h-8 rounded-xl bg-emerald-50 flex items-center justify-center shrink-0">
-          <Banknote size={16} className="text-emerald-600" strokeWidth={1.8} />
+        <div className={cn(
+          'w-8 h-8 rounded-xl flex items-center justify-center shrink-0',
+          overdue ? 'bg-red-50' : 'bg-emerald-50',
+        )}>
+          <Banknote size={16} className={overdue ? 'text-red-600' : 'text-emerald-600'} strokeWidth={1.8} />
         </div>
         <div className="flex-1 min-w-0">
           <p className="text-sm font-medium text-foreground">
-            Pay {name} — {fmtPeriod(period)}
+            {overdue ? 'OVERDUE — pay' : 'Pay'} {name}
+            {' '}· {dueToday ? 'today' : `${overdue ? 'was due' : 'due'} ${formatEntryDate(scheduledPayday)}`}
           </p>
           <p className="text-xs text-muted-foreground">
+            {fmtPeriod(period)} ·{' '}
             {hours.total > 0
               ? `${hours.total} hrs × $${rate} = ${fmtMoney(suggestedGross)} gross`
               : `No hours logged by ${name} this fortnight`}

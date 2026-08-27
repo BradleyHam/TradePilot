@@ -17,13 +17,15 @@ import {
   Download, FileWarning, Archive, RotateCcw,
 } from 'lucide-react';
 import { downloadJobPhotos, isPhotoAttachment } from '@/lib/download-job-photos';
+import { extractPdfText } from '@/lib/pdf/extract-text';
 import { cn } from '@/lib/utils';
 import { formatEntryDate } from '@/lib/format-date';
 import { JOB_STATUSES } from '@/lib/mock-data';
 import { JobStatus, LostReason, WonReason, DepositNotYetReason } from '@/lib/types';
 import { jobStats, entryExGst } from '@/lib/job-stats';
-import { hoursByWorker, blendedTargetRate, allWorkerRates, describeMix } from '@/lib/worker-rates';
-import { HourlyRateGauge, IncomeVsExpenses, HoursByActivity } from './job-charts';
+import { workerRate } from '@/lib/worker-rates';
+import { OwnerRateMeter, MoneySplitBar, HoursByActivity, HoursByPerson } from './job-charts';
+import { payrollConfig } from '@/lib/payroll';
 import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
 import { ShiftPhotosPanel } from './shift-photos-panel';
@@ -119,7 +121,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const {
     jobs, entries, invoices, scheduleItems, materials, quotes, quoteAttachments,
     businessId, updateJob, reconcileJobSchedule, deleteJob, addEntry,
-    settings,
+    settings, teamMembers, membership,
   } = useStore();
   const [reconciling, setReconciling] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
@@ -189,8 +191,19 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   // Pass materials so jobStats can include source='overhead' rows in
   // per-job expenses. Bill-sourced material rows are NOT added here —
   // they're already represented by the bill entries jobStats already sums.
-  const stats = jobStats(liveJob, entries, materials);
-  const { totalHours, totalExpenses, totalIncome, expectedIncome, expectedProfit, expectedIsConfident, expectedHourlyRate } = stats;
+  // Employee hours are costed at the payroll wage rate, and the owner's uid
+  // keeps his own logged time out of that bucket. Without both, a job worked
+  // by two people reads as if the second one was free.
+  const ownerUserId = teamMembers.find((m) => m.role === 'owner')?.userId;
+  const wageRate = payrollConfig(settings).wageRate;
+  const stats = jobStats(liveJob, entries, materials, { wageRate, ownerUserId });
+  const {
+    totalHours, totalExpenses, materialsCost, contractorLabourCost, payrollLabourCost,
+    totalIncome, expectedIncome, expectedProfit, expectedIsConfident,
+    ownerHours, crewHours, ownerRate,
+  } = stats;
+  /** The owner's target $/hr — what the rate meter is judged against. */
+  const ownerTarget = workerRate('owner', settings);
 
   // Does this job already have a real record of the quote behind it?
   // Three places the evidence can live, any one of which counts:
@@ -937,13 +950,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                       ? 'Profit'
                       : 'Expected profit';
 
+                // The rate tile is the OWNER's rate now — profit ÷ his own
+                // hours. Revenue ÷ everyone's hours was nobody's number.
                 const hourlyLabel = isFullyPaid
-                  ? 'Hourly rate'
+                  ? 'Your rate'
                   : isFinalised
-                    ? 'Hourly rate (when paid)'
+                    ? 'Your rate (when paid)'
                     : totalIncome > 0
-                      ? 'Hourly rate'
-                      : 'Expected $/h';
+                      ? 'Your rate'
+                      : 'Your expected $/h';
 
                 return (
                   <>
@@ -977,6 +992,14 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                       label="Expenses"
                       value={totalExpenses > 0 ? `$${totalExpenses.toLocaleString('en-NZ')}` : '—'}
                       valueClass="text-red-500"
+                      subvalue={(() => {
+                        // Labour is the half of a job's cost that used to be
+                        // invisible, so name it rather than burying it in one
+                        // total.
+                        const labour = contractorLabourCost + payrollLabourCost;
+                        if (labour <= 0) return undefined;
+                        return `Incl. $${Math.round(labour).toLocaleString('en-NZ')} labour · $${Math.round(materialsCost).toLocaleString('en-NZ')} materials`;
+                      })()}
                     />
                     <StatCard
                       label={profitLabel}
@@ -987,10 +1010,16 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                       }
                       valueClass={expectedProfit >= 0 ? 'text-green-600' : 'text-red-500'}
                     />
-                    <StatCard label="Hours" value={totalHours > 0 ? `${totalHours}h` : '—'} valueClass="text-blue-600" />
+                    <StatCard
+                      label="Hours"
+                      value={totalHours > 0 ? `${totalHours}h` : '—'}
+                      valueClass="text-blue-600"
+                      subvalue={crewHours > 0 ? `${Math.round(ownerHours * 10) / 10}h yours` : undefined}
+                    />
                     <StatCard
                       label={hourlyLabel}
-                      value={expectedHourlyRate != null ? `$${expectedHourlyRate.toFixed(0)}/h` : '—'}
+                      value={ownerRate != null ? `$${ownerRate.toFixed(0)}/h` : '—'}
+                      valueClass={ownerRate != null && ownerRate < 0 ? 'text-red-500' : undefined}
                     />
                   </>
                 );
@@ -999,38 +1028,40 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
           </div>
 
           {/* Visualisations — only render the ones that have data */}
-          {(expectedHourlyRate != null || stats.totalExpenses > 0 || stats.totalHours > 0) && (
+          {(ownerRate != null || stats.totalExpenses > 0 || stats.totalHours > 0) && (
             <>
               <Separator />
               <div className="space-y-3">
-                {(() => {
-                  // Blended-target gauge: weight the per-tier rates by
-                  // the actual hours mix on this job. Falls back to the
-                  // static $85–100 default when no hours have been
-                  // logged yet (gauge keeps the global target).
-                  const hoursEntries = jobEntries.filter((e) => e.type === 'hours');
-                  const mix = hoursByWorker(hoursEntries);
-                  const rates = allWorkerRates(settings);
-                  const blendedTarget = blendedTargetRate(mix, rates);
-                  const mixDesc = describeMix(mix);
-                  return (
-                    <HourlyRateGauge
-                      hourlyRate={expectedHourlyRate}
-                      // "Expected" means the income hasn't fully landed yet —
-                      // either no income at all, or the job is invoiced but
-                      // payments are partial (e.g. deposit only).
-                      isExpected={
-                        totalIncome === 0
-                        || ((liveJob.status === 'invoiced' || liveJob.status === 'completed')
-                            && expectedIncome > totalIncome + 0.01)
-                      }
-                      blendedTarget={blendedTarget}
-                      mixDescription={mix.totalLabourHours > 0 ? mixDesc : undefined}
-                    />
-                  );
-                })()}
-                <IncomeVsExpenses stats={stats} />
+                {/* Did an hour of Brad's own time pay? Everyone else is
+                    already paid inside expectedProfit, so this is a single
+                    ratio against a single target — a meter, not a dial. */}
+                <OwnerRateMeter
+                  ownerRate={ownerRate}
+                  ownerHours={ownerHours}
+                  profit={expectedProfit}
+                  target={ownerTarget}
+                  // "Expected" means the income hasn't fully landed yet —
+                  // either no income at all, or the job is invoiced but
+                  // payments are partial (e.g. deposit only).
+                  isExpected={
+                    totalIncome === 0
+                    || ((liveJob.status === 'invoiced' || liveJob.status === 'completed')
+                        && expectedIncome > totalIncome + 0.01)
+                  }
+                  hasCrew={crewHours > 0}
+                />
+                <MoneySplitBar stats={stats} />
                 <HoursByActivity entries={jobEntries} />
+                {/* Whose hours were they, and what did each person take off
+                    the job. Hidden on solo jobs — see the component. */}
+                <HoursByPerson
+                  entries={jobEntries}
+                  teamMembers={teamMembers}
+                  viewerUserId={membership?.userId}
+                  wageRate={wageRate}
+                  /* No income figure yet = no residual to hand the owner. */
+                  expectedProfit={expectedIncome > 0 ? expectedProfit : null}
+                />
               </div>
             </>
           )}
@@ -1884,6 +1915,18 @@ function MoneyTileEditor({
  * settled. Calling it Quote on a booked job invites the reasonable
  * conclusion that there's nowhere to put a handshake price.
  */
+/** A quote PDF waiting on the Save tap, plus whatever the parser found in it. */
+interface StagedQuotePdf {
+  file: File;
+  /** Ex-GST total, when the parser found one. */
+  exGst?: number;
+  inclGst?: number;
+  dateSent?: string;
+  clientName?: string;
+  scopeSummary?: string;
+  confidence?: 'high' | 'medium' | 'low';
+}
+
 function AgreedPriceCard({
   job, onSave,
 }: {
@@ -1892,20 +1935,226 @@ function AgreedPriceCard({
   onSave: (amount: number | undefined) => void;
 }) {
   const [editing, setEditing] = useState(false);
+  const { quotes, ensureJobHasQuote, addQuoteAttachments, updateQuote } = useStore();
+
+  /**
+   * A quote PDF dropped on the open editor. The price it carries fills
+   * the box (Brad still taps Save — the PDF is a suggestion, not an
+   * authority); the file itself is kept so it can be filed against the
+   * job when he does.
+   */
+  const [staged, setStaged] = useState<StagedQuotePdf | null>(null);
+  const [parsing, setParsing] = useState(false);
+  const [dropError, setDropError] = useState<string | null>(null);
+  const [isDragOver, setIsDragOver] = useState(false);
+  const dragDepth = useRef(0);
+  const pdfInputRef = useRef<HTMLInputElement>(null);
 
   // Past acceptance the number is settled, not outstanding — see the
   // component doc for why the wording matters.
   const AGREED: JobStatus[] = ['accepted', 'booked', 'in-progress', 'completed', 'invoiced', 'paid'];
   const label = AGREED.includes(job.status) ? 'Agreed price' : 'Quote';
 
+  function resetDrop() {
+    setStaged(null);
+    setParsing(false);
+    setDropError(null);
+    dragDepth.current = 0;
+    setIsDragOver(false);
+  }
+
+  /** Read the dropped PDF and pull the price out of it. */
+  async function stageQuotePdf(file: File) {
+    if (file.type !== 'application/pdf' && !/\.pdf$/i.test(file.name)) {
+      setDropError('Quotes come as PDFs — drop one of those.');
+      return;
+    }
+    setDropError(null);
+    setStaged(null);
+    setParsing(true);
+    try {
+      const { text } = await extractPdfText(file);
+      if (!text || !text.trim()) {
+        // A scanned quote is an image, and the quote parser is text-only.
+        setDropError('No text in that PDF — it looks scanned. Type the price and it\'ll still get filed.');
+        setStaged({ file });
+        return;
+      }
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      const res = await fetch('/api/parse-quote', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json', ...(token ? { Authorization: `Bearer ${token}` } : {}) },
+        body: JSON.stringify({ text }),
+      });
+      const json = (await res.json().catch(() => null)) as {
+        ok?: boolean;
+        parsed?: {
+          baseAmountExGst?: number; totalAmountInclGst?: number; dateSent?: string;
+          clientName?: string; jobAddress?: string; scopeSummary?: string;
+          confidence?: 'high' | 'medium' | 'low';
+        };
+      } | null;
+      if (!res.ok || !json?.ok || !json.parsed) {
+        setDropError('Couldn\'t read that one. Type the price — the PDF still gets filed.');
+        setStaged({ file });
+        return;
+      }
+      const p = json.parsed;
+      // Trust the server's ex-GST figure (it recomputes it rather than
+      // trusting the model's arithmetic); derive it only as a fallback.
+      const exGst = typeof p.baseAmountExGst === 'number' && p.baseAmountExGst > 0
+        ? p.baseAmountExGst
+        : (typeof p.totalAmountInclGst === 'number' && p.totalAmountInclGst > 0
+          ? Math.round((p.totalAmountInclGst / 1.15) * 100) / 100
+          : undefined);
+      setStaged({
+        file,
+        exGst,
+        inclGst: p.totalAmountInclGst,
+        dateSent: p.dateSent,
+        clientName: p.clientName,
+        scopeSummary: p.scopeSummary,
+        confidence: p.confidence,
+      });
+      if (exGst == null) setDropError('Found the quote but not a total — type the price.');
+    } catch (err) {
+      console.warn('[agreed-price] quote PDF parse failed:', err);
+      setDropError('Couldn\'t read that one. Type the price — the PDF still gets filed.');
+      setStaged({ file });
+    } finally {
+      setParsing(false);
+    }
+  }
+
+  /**
+   * Save the price, then file the PDF against the job: attached as
+   * `quote_pdf`, and any blanks on the job's quote row filled in from it.
+   * Only blanks — a parsed PDF never overwrites something already there.
+   */
+  async function commit(amount: number | undefined) {
+    onSave(amount);
+    setEditing(false);
+    const pdf = staged;
+    resetDrop();
+    if (!pdf) return;
+    try {
+      const quoteId = await ensureJobHasQuote(job.id);
+      if (!quoteId) {
+        alert('Price saved, but the PDF couldn\'t be filed — try adding it under Documents.');
+        return;
+      }
+      const { failed } = await addQuoteAttachments(
+        quoteId,
+        [{ file: pdf.file, kind: 'quote_pdf', skipCompression: true }],
+      );
+      const q = quotes.find((x) => x.id === quoteId);
+      const patch: Partial<Quote> = {};
+      if (amount != null && q?.baseAmountExGst == null) patch.baseAmountExGst = amount;
+      if (pdf.inclGst != null && q?.totalAmountInclGst == null) patch.totalAmountInclGst = pdf.inclGst;
+      if (pdf.dateSent && !q?.dateSent) patch.dateSent = pdf.dateSent;
+      if (pdf.scopeSummary && !q?.scopeSummary) patch.scopeSummary = pdf.scopeSummary;
+      if (pdf.clientName && !q?.clientName) patch.clientName = pdf.clientName;
+      if (Object.keys(patch).length > 0) await updateQuote(quoteId, patch);
+      if (failed > 0) {
+        alert('Price saved, but the PDF didn\'t upload — try adding it under Documents.');
+      }
+    } catch (err) {
+      console.warn('[agreed-price] filing the quote PDF failed:', err);
+    }
+  }
+
   if (editing) {
     return (
-      <MoneyTileEditor
-        label={label}
-        initial={job.quoteAmount ?? undefined}
-        onCommit={(amount) => { onSave(amount); setEditing(false); }}
-        onCancel={() => setEditing(false)}
-      />
+      <div
+        className={cn('rounded-xl transition-shadow', isDragOver && 'ring-2 ring-primary')}
+        onDragEnter={(e) => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          e.preventDefault();
+          dragDepth.current += 1;
+          setIsDragOver(true);
+        }}
+        onDragOver={(e) => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          e.preventDefault();
+          e.dataTransfer.dropEffect = 'copy';
+        }}
+        onDragLeave={(e) => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          dragDepth.current = Math.max(0, dragDepth.current - 1);
+          if (dragDepth.current === 0) setIsDragOver(false);
+        }}
+        onDrop={(e) => {
+          if (!e.dataTransfer.types.includes('Files')) return;
+          e.preventDefault();
+          dragDepth.current = 0;
+          setIsDragOver(false);
+          const file = e.dataTransfer.files?.[0];
+          if (file) void stageQuotePdf(file);
+        }}
+      >
+        <MoneyTileEditor
+          // Remount when a PDF lands so the box re-seeds from it. Dropping
+          // a quote is a deliberate act — it should win over whatever was
+          // in the field.
+          key={staged?.exGst != null ? `pdf-${staged.exGst}` : 'manual'}
+          label={label}
+          initial={staged?.exGst ?? job.quoteAmount ?? undefined}
+          onCommit={(amount) => { void commit(amount); }}
+          onCancel={() => { resetDrop(); setEditing(false); }}
+        />
+
+        {/* Quote PDF drop zone — the price on the paperwork, without
+            reading it off the screen and retyping it. */}
+        <div className="mt-1.5">
+          {parsing ? (
+            <p className="text-[10px] text-muted-foreground italic px-1">Reading the quote…</p>
+          ) : staged ? (
+            <div className="rounded-lg border border-primary/30 bg-primary/5 px-2 py-1.5">
+              <p className="text-[10px] font-medium text-foreground truncate" title={staged.file.name}>
+                {staged.file.name}
+              </p>
+              {staged.inclGst != null && (
+                <p className="text-[10px] text-muted-foreground">
+                  ${staged.inclGst.toLocaleString('en-NZ')} incl GST on the quote
+                  {staged.confidence === 'low' && ' · worth a double-check'}
+                </p>
+              )}
+              <p className="text-[10px] text-muted-foreground">Files against the job when you save.</p>
+              <button
+                type="button"
+                onClick={resetDrop}
+                className="text-[10px] font-medium text-muted-foreground hover:text-foreground underline underline-offset-2 mt-0.5"
+              >
+                Remove
+              </button>
+            </div>
+          ) : (
+            <button
+              type="button"
+              onClick={() => pdfInputRef.current?.click()}
+              className="w-full rounded-lg border border-dashed border-border hover:border-primary/40 px-2 py-1.5 text-[10px] text-muted-foreground hover:text-foreground transition-colors"
+            >
+              Drop the quote PDF here to fill this in
+            </button>
+          )}
+          {dropError && (
+            <p className="text-[10px] text-amber-600 dark:text-amber-500 mt-1 px-1 leading-snug">{dropError}</p>
+          )}
+        </div>
+
+        <input
+          ref={pdfInputRef}
+          type="file"
+          accept="application/pdf,.pdf"
+          className="hidden"
+          onChange={(e) => {
+            const file = e.target.files?.[0];
+            if (pdfInputRef.current) pdfInputRef.current.value = '';
+            if (file) void stageQuotePdf(file);
+          }}
+        />
+      </div>
     );
   }
 

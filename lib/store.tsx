@@ -185,6 +185,15 @@ interface StoreState {
   updateEntry: (id: string, updates: Partial<Entry>) => void;
   deleteEntry: (id: string) => void;
   /**
+   * Retire an unbilled-labour accrual: mark these hours entries as
+   * invoiced by the worker, optionally linking the bill that covered
+   * them. Once flagged they stop counting as money owed (see
+   * `lib/labour-accrual.ts`) so the real bill is the only cost left —
+   * without this the sub's hours and his invoice would both land on the
+   * job. Set `billed = false` to undo.
+   */
+  markLabourBilled: (entryIds: string[], billEntryId: string | null, billed?: boolean) => void;
+  /**
    * Employee-facing helper: log the signed-in user's OWN hours against a
    * job. Fills in businessId, workerKind (from the membership), and the
    * required `loggedByUserId = my auth uid` so the row satisfies the
@@ -1560,6 +1569,42 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (prevEntry) {
           setEntries((prev) => prev.map((e) => (e.id === id ? prevEntry! : e)));
         }
+      }
+    })();
+  }, []);
+
+  /**
+   * Flag hours entries as invoiced by the worker, so their accrued cost
+   * stops counting (the incoming bill takes over). One round trip for the
+   * whole set — bills usually cover several shifts at once. Optimistic +
+   * rollback like every other mutator.
+   */
+  const markLabourBilled = useCallback((
+    entryIds: string[],
+    billEntryId: string | null,
+    billed: boolean = true,
+  ) => {
+    if (entryIds.length === 0) return;
+    const ids = new Set(entryIds);
+    let prevEntries: Entry[] = [];
+    setEntries((prev) => {
+      prevEntries = prev.filter((e) => ids.has(e.id));
+      return prev.map((e) => (ids.has(e.id)
+        ? { ...e, labourBilled: billed, labourBillEntryId: billed ? (billEntryId ?? undefined) : undefined }
+        : e));
+    });
+
+    (async () => {
+      const { error: updErr } = await supabase
+        .from('entries')
+        .update({ labour_billed: billed, labour_bill_entry_id: billed ? billEntryId : null })
+        .in('id', entryIds);
+      if (updErr) {
+        console.error('[store] markLabourBilled failed:', updErr);
+        setError(updErr.message);
+        // Roll the whole set back — a half-applied flag would leave some
+        // hours accruing and some not, with nothing on screen saying so.
+        setEntries((prev) => prev.map((e) => prevEntries.find((p) => p.id === e.id) ?? e));
       }
     })();
   }, []);
@@ -3995,7 +4040,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         jobImports, quoteAttachments,
         businessId, role, membership, teamMembers, payRuns, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
-        addEntry, updateEntry, deleteEntry, logMyHours,
+        addEntry, updateEntry, deleteEntry, markLabourBilled, logMyHours,
         shiftPhotos, uploadShiftPhotos, deleteShiftPhoto, setJobCoverPhoto,
         jobContacts, logContact,
         jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
