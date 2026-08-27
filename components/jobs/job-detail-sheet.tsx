@@ -12,9 +12,9 @@ import { Separator } from '@/components/ui/separator';
 import { Textarea } from '@/components/ui/textarea';
 import {
   Phone, Mail, MapPin, Clock, DollarSign, Receipt, FileText, MessageSquare,
-  AlertCircle, StickyNote, TrendingUp, Edit3, Plus, Package, ExternalLink, X,
+  AlertCircle, StickyNote, Edit3, Plus, Package, ExternalLink, X,
   Camera, Trash2, Loader2, CalendarDays, CalendarPlus, Sparkles, Send,
-  Download, FileWarning, Archive, RotateCcw,
+  Download, FileWarning, Archive, RotateCcw, Briefcase,
 } from 'lucide-react';
 import { downloadJobPhotos, isPhotoAttachment } from '@/lib/download-job-photos';
 import { extractPdfText } from '@/lib/pdf/extract-text';
@@ -48,6 +48,8 @@ interface JobDetailSheetProps {
   open: boolean;
   onClose: () => void;
 }
+
+type JobDetailView = 'overview' | 'money' | 'details';
 
 const TYPE_ICON: Record<string, React.ElementType> = {
   expense: Receipt, income: DollarSign, hours: Clock, enquiry: MessageSquare,
@@ -169,9 +171,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   // effect, which would trigger a cascading render.
   const [renaming, setRenaming] = useState(false);
   const [renameJobId, setRenameJobId] = useState(job?.id);
+  const [detailView, setDetailView] = useState<JobDetailView>('overview');
+  const [detailViewJobId, setDetailViewJobId] = useState(job?.id);
   if (job?.id !== renameJobId) {
     setRenameJobId(job?.id);
     setRenaming(false);
+  }
+  if (job?.id !== detailViewJobId) {
+    setDetailViewJobId(job?.id);
+    setDetailView('overview');
   }
 
   if (!job) return null;
@@ -460,6 +468,10 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               is wider than any phone viewport). */}
           <div className="flex-1 min-h-0 overflow-y-auto overflow-x-hidden">
             <div className="mx-auto w-full max-w-2xl px-4 md:px-6 pt-4 pb-10 space-y-5">
+          <JobDetailViewTabs value={detailView} onChange={setDetailView} />
+
+          {detailView === 'overview' && (
+            <>
           {/* Client info — read-only block + inline editor toggle.
               The wrap-up auto-creates jobs with clientName='New lead'
               as a placeholder; before the quote PDF can go out, Brad
@@ -901,8 +913,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               </div>
             )}
 
-          <Separator />
+            </>
+          )}
 
+          {detailView === 'money' && (
+            <>
           {/* Financial summary */}
           <div className="space-y-2">
             <div className="flex items-baseline justify-between">
@@ -1080,6 +1095,11 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             </>
           )}
 
+            </>
+          )}
+
+          {detailView === 'details' && (
+            <>
           {/* Materials used on this job — paint, primer, sundries etc.
               Populated automatically when bills are confirmed with line
               items on the Home "Bills to confirm" flag. Hidden when empty
@@ -1245,6 +1265,8 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               Delete this job
             </button>
           </div>
+            </>
+          )}
             </div>
           </div>
 
@@ -1409,6 +1431,50 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         onClose={() => setReviewInvoiceOpen(false)}
       />
     </Sheet>
+  );
+}
+
+const JOB_DETAIL_VIEWS: {
+  value: JobDetailView;
+  label: string;
+  icon: React.ElementType;
+}[] = [
+  { value: 'overview', label: 'Overview', icon: Briefcase },
+  { value: 'money', label: 'Money', icon: DollarSign },
+  { value: 'details', label: 'Details', icon: FileText },
+];
+
+function JobDetailViewTabs({
+  value, onChange,
+}: {
+  value: JobDetailView;
+  onChange: (value: JobDetailView) => void;
+}) {
+  return (
+    <div className="sticky -top-4 z-10 -mx-4 -mt-4 bg-background/95 px-4 pb-3 pt-3 backdrop-blur-sm md:-mx-6 md:px-6">
+      <div className="grid grid-cols-3 rounded-xl border border-border bg-card p-1 shadow-card">
+        {JOB_DETAIL_VIEWS.map(({ value: option, label, icon: Icon }) => {
+          const active = value === option;
+          return (
+            <button
+              key={option}
+              type="button"
+              onClick={() => onChange(option)}
+              aria-pressed={active}
+              className={cn(
+                'flex min-h-[42px] items-center justify-center gap-1.5 rounded-lg px-2 text-xs font-semibold transition-colors',
+                active
+                  ? 'bg-primary text-primary-foreground shadow-btn'
+                  : 'text-muted-foreground hover:bg-muted hover:text-foreground',
+              )}
+            >
+              <Icon size={15} strokeWidth={active ? 2.2 : 1.8} />
+              {label}
+            </button>
+          );
+        })}
+      </div>
+    </div>
   );
 }
 

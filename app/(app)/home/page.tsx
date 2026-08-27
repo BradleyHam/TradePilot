@@ -20,7 +20,6 @@ import Link from 'next/link';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { PageHeader } from '@/components/shared/page-header';
-import { StatCard } from '@/components/money/stat-card';
 import { cashIncomeExGstInWindow, expensesInWindow } from '@/lib/income-allocator';
 import { unbilledLabourByWorker } from '@/lib/labour-accrual';
 import { rankJobs } from '@/lib/job-match';
@@ -57,10 +56,10 @@ type ImportOutcome = {
  */
 type MaterialInit = Omit<Material, 'id' | 'businessId' | 'createdAt' | 'entryId'>;
 import {
-  Clock, DollarSign, TrendingUp, AlertCircle, Receipt, ChevronRight, ChevronDown,
+  AlertCircle, Receipt, ChevronRight, ChevronDown,
   Check, Briefcase, FileText, Bell, FilePlus, ExternalLink, X,
   Phone, Mail, MessageCircle, UserPlus, CalendarPlus, CalendarCheck, Split, Send,
-  Paintbrush, History, Settings,
+  Paintbrush, History, Settings, MoreHorizontal, Megaphone, ListChecks,
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
@@ -226,6 +225,9 @@ export default function HomePage() {
   // flag's Mark paid when the invoice's job has zero hours logged, so the
   // hourly-rate maths can exist before the job is closed out. Null = closed.
   const [hoursPromptJobId, setHoursPromptJobId] = useState<string | null>(null);
+  // Secondary destinations stay reachable without competing for a permanent
+  // bottom-nav slot. This is navigation only; it never changes business data.
+  const [moreOpen, setMoreOpen] = useState(false);
 
   // Reschedule sheet — opened by tapping any Today row. Stores item ids
   // (not the items themselves) so we re-resolve from the live store on
@@ -499,36 +501,35 @@ export default function HomePage() {
   const subtitle = parseISODate(todayISO).toLocaleDateString('en-NZ', {
     weekday: 'long', day: 'numeric', month: 'long',
   });
+  const hour = new Date().getHours();
+  const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
+  const attentionCount = leadsToContact.length
+    + toQuoteJobs.length
+    + overdueInvoices.length
+    + billsDueSoon.length
+    + billDrafts.length
+    + depositsToSend.length
+    + quoteFollowUps.length
+    + jobImports.length;
 
   return (
     <div className="flex flex-col min-h-full">
       <PageHeader
-        title="This week"
+        title={greeting}
         subtitle={subtitle}
-        // Settings has no home on the phone — the bottom nav is full at
-        // seven tabs and the sidebar link is desktop-only, which left
-        // /settings (notifications toggle, Team, GST, quote template)
-        // unreachable on mobile. A gear on the Home header is the
-        // standard phone pattern; hidden on md+ where the sidebar link
-        // already covers it. 44px tap target per the golden rule.
         action={
-          <Link
-            href="/settings"
-            aria-label="Settings"
+          <button
+            type="button"
+            onClick={() => setMoreOpen(true)}
+            aria-label="More tools"
             className="md:hidden flex items-center justify-center w-11 h-11 -mr-2 rounded-xl text-muted-foreground hover:bg-muted active:bg-muted transition-colors"
           >
-            <Settings size={20} strokeWidth={1.8} />
-          </Link>
+            <MoreHorizontal size={22} strokeWidth={1.9} />
+          </button>
         }
       />
 
       <div className="px-4 md:px-6 pb-6 space-y-4 w-full max-w-2xl mx-auto">
-        {/* Quick add lives at the top: opening the app at 7am or 5:30pm,
-            the first thing Brad does is log something. Dashboard sections
-            below answer "how am I tracking" — important but never the
-            reason for opening the app. */}
-        <QuickAddSection />
-
         <TodaySection
           items={todayItems}
           todayISO={todayISO}
@@ -590,30 +591,99 @@ export default function HomePage() {
           }}
         />
 
-        {/* Leads to contact — raw enquiries Brad hasn't replied to yet.
-            One-tap "Mark contacted" stamps lastContactedDate and the
-            row disappears, so the list empties as he works through it.
-            Hides when empty per the "no empty visualisations" rule. */}
-        {leadsToContact.length > 0 && (
-          <LeadsToContactSection
-            items={leadsToContact}
-            todayISO={todayISO}
-            // Fired by the Email shortcut in this section, so the channel is
-            // known rather than guessed.
-            onMarkContacted={(jobId) =>
-              logContact({ jobId, direction: 'out', channel: 'email' })
-            }
-            onArrangeVisit={(job) => setVisitPromptJob(job)}
-            onSentQuote={(job) => setMarkQuotedJobId(job.id)}
-          />
+        {attentionCount > 0 ? (
+          <section>
+            <div className="mb-2 flex items-center justify-between">
+              <h2 className="text-sm font-semibold text-foreground">Needs attention</h2>
+              <span className="inline-flex min-w-6 h-6 items-center justify-center rounded-full bg-primary/10 px-2 text-xs font-bold text-primary tabular-nums">
+                {attentionCount}
+              </span>
+            </div>
+            <div className="space-y-4">
+              {leadsToContact.length > 0 && (
+                <LeadsToContactSection
+                  items={leadsToContact}
+                  todayISO={todayISO}
+                  compactHeading
+                  onMarkContacted={(jobId) =>
+                    logContact({ jobId, direction: 'out', channel: 'email' })
+                  }
+                  onArrangeVisit={(job) => setVisitPromptJob(job)}
+                  onSentQuote={(job) => setMarkQuotedJobId(job.id)}
+                />
+              )}
+
+              {toQuoteJobs.length > 0 && (
+                <QuotesToPrepSection items={toQuoteJobs} compactHeading />
+              )}
+
+              {showMoneyFlags && (
+                <MoneyFlagsCard
+                  compactHeading
+                  overdueInvoices={overdueInvoices}
+                  billsDueSoon={billsDueSoon}
+                  billDrafts={billDrafts}
+                  depositsToSend={depositsToSend}
+                  quoteFollowUps={quoteFollowUps}
+                  jobImports={jobImports}
+                  jobs={jobs}
+                  todayISO={todayISO}
+                  onIssueDeposit={(job) => setDepositForJob(job)}
+                  onDepositNotYet={(job, reason) =>
+                    updateJob(job.id, {
+                      depositNotYetReason: reason,
+                      depositSnoozeUntil: reason === 'no_deposit'
+                        ? ''
+                        : formatISODate(addDays(parseISODate(todayISO), reason === 'in_person' ? 7 : 14)),
+                    })
+                  }
+                  onFollowedUp={(jobId) =>
+                    logContact({ jobId, direction: 'out', channel: 'other' })
+                  }
+                  onMarkLost={(jobId) =>
+                    updateJob(jobId, { status: 'lost', lostReason: 'no-reply' })
+                  }
+                  onSnoozeFollowUp={(jobId, untilISO) =>
+                    updateJob(jobId, { snoozeUntil: untilISO })
+                  }
+                  onMarkInvoicePaid={(id, paidDate) => {
+                    markInvoicePaid(id, paidDate);
+                    const inv = invoices.find((i) => i.id === id);
+                    if (inv?.jobId && shouldPromptForHours(inv, entries)) {
+                      setHoursPromptJobId(inv.jobId);
+                    }
+                  }}
+                  onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
+                  onConfirmDraft={(id, { jobId, materials }) =>
+                    void confirmBillDraftWithMaterials(id, { jobId, materials })
+                  }
+                  onConfirmDraftSplit={(id, slices, materials) =>
+                    void confirmBillDraftAsSplit(id, slices, materials)
+                  }
+                  onDeleteDraft={(id) => deleteEntry(id)}
+                  onCommitImportAsLink={(id, jobId, outcome) => void commitImportAsLink(id, jobId, outcome)}
+                  onCommitImportAsCreate={(id) => void commitImportAsCreate(id)}
+                  onCommitImportAsSkip={(id) => void commitImportAsSkip(id)}
+                />
+              )}
+            </div>
+          </section>
+        ) : (
+          <div className="flex items-center gap-3 rounded-2xl border border-green-200/70 bg-green-50/70 px-4 py-3 text-green-800">
+            <div className="flex h-8 w-8 shrink-0 items-center justify-center rounded-xl bg-green-100">
+              <Check size={17} strokeWidth={2.2} />
+            </div>
+            <div>
+              <p className="text-sm font-semibold">You&apos;re clear for now</p>
+              <p className="text-xs text-green-700/80">Nothing needs chasing tonight.</p>
+            </div>
+          </div>
         )}
 
-        {/* Quotes-to-prep — surfaces jobs where the site visit's
-            done but the quote hasn't been sent yet. Hides when
-            empty per the "no empty visualisations" rule. */}
-        {toQuoteJobs.length > 0 && (
-          <QuotesToPrepSection items={toQuoteJobs} />
-        )}
+        {/* Payroll — pay Suzie + the IRD follow-ups. Self-contained:
+            reads the store itself and renders nothing when no employees
+            exist or nothing is due. */}
+        <PayrollFlags />
 
         <WeekStatsSection
           hours={hoursThisWeek}
@@ -623,77 +693,12 @@ export default function HomePage() {
           fresh={freshWeek}
         />
 
-        {/* Payroll — pay Suzie + the IRD follow-ups. Self-contained:
-            reads the store itself and renders nothing when no employees
-            exist or nothing is due. */}
-        <PayrollFlags />
-
-        {showMoneyFlags && (
-          <MoneyFlagsCard
-            overdueInvoices={overdueInvoices}
-            billsDueSoon={billsDueSoon}
-            billDrafts={billDrafts}
-            depositsToSend={depositsToSend}
-            quoteFollowUps={quoteFollowUps}
-            jobImports={jobImports}
-            jobs={jobs}
-            todayISO={todayISO}
-            onIssueDeposit={(job) => setDepositForJob(job)}
-            // "Not yet" on a deposit card. 'no_deposit' is a decision (no
-            // wake date — the row is gone until the reason is cleared);
-            // "will sort in person" gets a week (you'll see them soon);
-            // the other delays get a fortnight.
-            onDepositNotYet={(job, reason) =>
-              updateJob(job.id, {
-                depositNotYetReason: reason,
-                depositSnoozeUntil: reason === 'no_deposit'
-                  ? ''
-                  : formatISODate(addDays(parseISODate(todayISO), reason === 'in_person' ? 7 : 14)),
-              })
-            }
-            // "Followed up" on a quote flag — Brad chased, but this button
-            // doesn't know how, so 'other' rather than a guess.
-            onFollowedUp={(jobId) =>
-              logContact({ jobId, direction: 'out', channel: 'other' })
-            }
-            onMarkLost={(jobId) =>
-              updateJob(jobId, { status: 'lost', lostReason: 'no-reply' })
-            }
-            // "Give it a week" on a follow-up card. snoozeUntil hides the
-            // job from the ladder (lib/quote-follow-up.ts), the Leads
-            // lists AND the push notifications until the date passes,
-            // then everything resumes by itself — one field, all
-            // surfaces agree.
-            onSnoozeFollowUp={(jobId, untilISO) =>
-              updateJob(jobId, { snoozeUntil: untilISO })
-            }
-            onMarkInvoicePaid={(id, paidDate) => {
-              markInvoicePaid(id, paidDate);
-              // Paid with zero hours on the job → prompt to backfill them
-              // (deposits exempt — paid-before-work is their normal state).
-              const inv = invoices.find((i) => i.id === id);
-              if (inv?.jobId && shouldPromptForHours(inv, entries)) {
-                setHoursPromptJobId(inv.jobId);
-              }
-            }}
-            onMarkBillPaid={(id, paidDate) => updateEntry(id, { paid: true, paidDate })}
-            onConfirmDraft={(id, { jobId, materials }) =>
-              void confirmBillDraftWithMaterials(id, { jobId, materials })
-            }
-            onConfirmDraftSplit={(id, slices, materials) =>
-              void confirmBillDraftAsSplit(id, slices, materials)
-            }
-            onDeleteDraft={(id) => deleteEntry(id)}
-            onCommitImportAsLink={(id, jobId, outcome) => void commitImportAsLink(id, jobId, outcome)}
-            onCommitImportAsCreate={(id) => void commitImportAsCreate(id)}
-            onCommitImportAsSkip={(id) => void commitImportAsSkip(id)}
-          />
-        )}
-
         {comingUp.length > 0 && (
           <ComingUpSection items={comingUp} todayISO={todayISO} />
         )}
       </div>
+
+      <HomeMoreSheet open={moreOpen} onOpenChange={setMoreOpen} />
 
       {/* Site-visit wrap-up — appears when Brad ticks a quote_visit
           with a linked job. Captures photos + scope + structured fields
@@ -1437,49 +1442,64 @@ function WeekStatsSection({
   if (fresh) {
     return (
       <section>
-        <SectionLabel>This week so far</SectionLabel>
-        <div className="bg-card border border-border rounded-2xl px-4 py-5 text-sm text-muted-foreground">
-          Fresh week — log some hours to get started.
+        <div className="flex items-center justify-between rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-card">
+          <div>
+            <p className="text-sm font-semibold text-foreground">This week</p>
+            <p className="text-xs text-muted-foreground mt-0.5">Fresh week — log some hours to get started.</p>
+          </div>
+          <Link href="/entry?type=hours" className="text-xs font-semibold text-primary hover:underline">
+            Log hours
+          </Link>
         </div>
       </section>
     );
   }
 
-  // Hours subvalue: "of 30h" — flat target per spec. Don't bold-shame
-  // a low number; let the value itself do the talking.
-  const hoursSub = `of ${HOURS_TARGET_PER_WEEK}h target`;
-  // Profit accent: green when in the black, red when in the red. Avoid the
-  // common dashboard sin of showing $0 in green.
-  const profitAccent: 'green' | 'red' | 'default' = profit > 0
-    ? 'green' : profit < 0 ? 'red' : 'default';
-
   return (
     <section>
-      <SectionLabel>This week so far</SectionLabel>
-      <div className="grid grid-cols-3 gap-2">
-        <StatCard
-          label="Hours"
-          value={hours % 1 === 0 ? `${hours}h` : `${hours.toFixed(1)}h`}
-          subvalue={hoursSub}
-          icon={Clock}
-          accent="blue"
-        />
-        <StatCard
-          label="Income"
-          value={fmtMoney(income)}
-          subvalue="ex-GST · cash"
-          icon={DollarSign}
-          accent="green"
-        />
-        <StatCard
-          label="Profit"
-          value={fmtMoney(profit)}
-          subvalue={`after ${fmtMoney(expenses)} costs`}
-          icon={TrendingUp}
-          accent={profitAccent}
-        />
+      <div className="rounded-2xl border border-border/70 bg-card px-4 py-3 shadow-card">
+        <div className="mb-3 flex items-baseline justify-between gap-3">
+          <p className="text-sm font-semibold text-foreground">This week</p>
+          <Link href="/money" className="text-xs font-medium text-primary hover:underline">See money</Link>
+        </div>
+        <div className="grid grid-cols-3 divide-x divide-border">
+          <WeekFigure
+            label="Hours"
+            value={hours % 1 === 0 ? `${hours}h` : `${hours.toFixed(1)}h`}
+            note={`of ${HOURS_TARGET_PER_WEEK}h`}
+          />
+          <WeekFigure label="Income" value={fmtMoney(income)} note="cash · ex GST" />
+          <WeekFigure
+            label="Profit"
+            value={fmtMoney(profit)}
+            note={`after ${fmtMoney(expenses)}`}
+            tone={profit > 0 ? 'good' : profit < 0 ? 'bad' : 'default'}
+          />
+        </div>
       </div>
     </section>
+  );
+}
+
+function WeekFigure({
+  label, value, note, tone = 'default',
+}: {
+  label: string;
+  value: string;
+  note: string;
+  tone?: 'good' | 'bad' | 'default';
+}) {
+  return (
+    <div className="min-w-0 px-3 first:pl-0 last:pr-0">
+      <p className="text-xs text-muted-foreground">{label}</p>
+      <p className={cn(
+        'mt-0.5 truncate text-lg font-bold tracking-tight tabular-nums',
+        tone === 'good' ? 'text-green-700' : tone === 'bad' ? 'text-red-600' : 'text-foreground',
+      )}>
+        {value}
+      </p>
+      <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{note}</p>
+    </div>
   );
 }
 
@@ -1499,7 +1519,7 @@ function MoneyFlagsCard({
   overdueInvoices, billsDueSoon, billDrafts, depositsToSend, quoteFollowUps, jobImports, jobs, todayISO,
   onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onConfirmDraftSplit, onDeleteDraft,
   onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip, onIssueDeposit, onDepositNotYet,
-  onFollowedUp, onMarkLost, onSnoozeFollowUp,
+  onFollowedUp, onMarkLost, onSnoozeFollowUp, compactHeading = false,
 }: {
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
@@ -1522,10 +1542,13 @@ function MoneyFlagsCard({
   onCommitImportAsLink: (importId: string, jobId: string, outcome: ImportOutcome) => void;
   onCommitImportAsCreate: (importId: string) => void;
   onCommitImportAsSkip: (importId: string) => void;
+  compactHeading?: boolean;
 }) {
   return (
     <section>
-      <SectionLabel>Flags</SectionLabel>
+      {compactHeading
+        ? <p className="mb-2 text-sm font-semibold text-foreground">Money and admin</p>
+        : <SectionLabel>Flags</SectionLabel>}
       <div className="bg-card border border-border rounded-2xl divide-y divide-border overflow-hidden">
         {/* Drafts first — the freshest pending action; Brad just uploaded
             a PDF and the next tap should be to confirm it. */}
@@ -3327,10 +3350,11 @@ const QUOTES_TO_PREP_MAX_ROWS = 4;
 // "I tapped Mark contacted and nothing happened").
 
 function LeadsToContactSection({
-  items, todayISO, onMarkContacted, onArrangeVisit, onSentQuote,
+  items, todayISO, onMarkContacted, onArrangeVisit, onSentQuote, compactHeading = false,
 }: {
   items: Job[];
   todayISO: string;
+  compactHeading?: boolean;
   onMarkContacted: (jobId: string) => void;
   /** Primary action: opens the "site visit arranged?" prompt for this lead. */
   onArrangeVisit: (job: Job) => void;
@@ -3344,7 +3368,9 @@ function LeadsToContactSection({
   return (
     <section>
       <div className="flex items-baseline justify-between mb-2">
-        <SectionLabel className="mb-0">Leads to contact</SectionLabel>
+        {compactHeading
+          ? <p className="text-sm font-semibold text-foreground">Leads to contact</p>
+          : <SectionLabel className="mb-0">Leads to contact</SectionLabel>}
         <Link href="/leads" className="text-xs font-medium text-primary hover:underline">
           See all
         </Link>
@@ -3482,14 +3508,16 @@ function LeadToContactRow({
   );
 }
 
-function QuotesToPrepSection({ items }: { items: Job[] }) {
+function QuotesToPrepSection({ items, compactHeading = false }: { items: Job[]; compactHeading?: boolean }) {
   const shown = items.slice(0, QUOTES_TO_PREP_MAX_ROWS);
   const overflow = items.length - shown.length;
 
   return (
     <section>
       <div className="flex items-baseline justify-between mb-2">
-        <SectionLabel className="mb-0">Quotes to prep</SectionLabel>
+        {compactHeading
+          ? <p className="text-sm font-semibold text-foreground">Quotes to prepare</p>
+          : <SectionLabel className="mb-0">Quotes to prep</SectionLabel>}
         <Link href="/leads" className="text-xs font-medium text-primary hover:underline">
           See all
         </Link>
@@ -3674,37 +3702,47 @@ function chipDateLabel(iso: string, todayISO: string): string {
   }).toUpperCase();
 }
 
-// ── Section: Quick add ──────────────────────────────────────────────────────
-// href-based (was entry-type-based) so non-entry destinations can live
-// here too. Paint stock rides in this grid because it's NOT in the mobile
-// bottom nav (that's at its 7-item limit per the note in bottom-nav.tsx)
-// — this card is the phone's path to /stock.
-const QUICK_ADD: { href: string; label: string; icon: React.ElementType; accent: string }[] = [
-  { href: '/entry?type=hours',   label: 'Log hours',   icon: Clock,      accent: 'bg-blue-50 text-blue-600' },
-  { href: '/entry?type=expense', label: 'Log expense', icon: Receipt,    accent: 'bg-red-50 text-red-600' },
-  { href: '/entry?type=income',  label: 'Log income',  icon: DollarSign, accent: 'bg-green-50 text-green-600' },
-  { href: '/stock',              label: 'Paint stock', icon: Paintbrush, accent: 'bg-purple-50 text-purple-600' },
+const MORE_LINKS: {
+  href: string;
+  label: string;
+  description: string;
+  icon: React.ElementType;
+  accent: string;
+}[] = [
+  { href: '/leads', label: 'Leads', description: 'Chase, quote and follow up', icon: UserPlus, accent: 'bg-blue-50 text-blue-700' },
+  { href: '/stock', label: 'Paint stock', description: 'What is in the van', icon: Paintbrush, accent: 'bg-violet-50 text-violet-700' },
+  { href: '/marketing', label: 'Marketing', description: 'Turn finished work into proof', icon: Megaphone, accent: 'bg-amber-50 text-amber-700' },
+  { href: '/entries', label: 'All entries', description: 'Search the complete activity history', icon: ListChecks, accent: 'bg-slate-100 text-slate-700' },
+  { href: '/settings', label: 'Settings', description: 'Business, GST, team and notifications', icon: Settings, accent: 'bg-muted text-foreground' },
 ];
 
-function QuickAddSection() {
+function HomeMoreSheet({ open, onOpenChange }: { open: boolean; onOpenChange: (open: boolean) => void }) {
   return (
-    <section>
-      <SectionLabel>Quick add</SectionLabel>
-      <div className="grid grid-cols-4 gap-2">
-        {QUICK_ADD.map(({ href, label, icon: Icon, accent }) => (
-          <Link
-            key={href}
-            href={href}
-            className="flex flex-col items-center justify-center gap-1.5 p-2 rounded-2xl bg-card border border-border hover:border-primary/40 hover:bg-accent transition-colors min-h-[80px] active:scale-95"
-          >
-            <div className={cn('w-9 h-9 rounded-xl flex items-center justify-center', accent)}>
-              <Icon size={18} strokeWidth={1.8} />
-            </div>
-            <span className="text-xs font-medium text-foreground text-center leading-tight">{label}</span>
-          </Link>
-        ))}
-      </div>
-    </section>
+    <Sheet open={open} onOpenChange={onOpenChange}>
+      <SheetContent side="bottom" className="rounded-t-3xl px-4 pb-10">
+        <SheetHeader className="pb-3 text-left">
+          <SheetTitle>More</SheetTitle>
+        </SheetHeader>
+        <div className="overflow-hidden rounded-2xl border border-border bg-card divide-y divide-border">
+          {MORE_LINKS.map(({ href, label, description, icon: Icon, accent }) => (
+            <Link
+              key={href}
+              href={href}
+              className="flex min-h-[64px] items-center gap-3 px-3 py-2.5 transition-colors hover:bg-accent active:bg-accent"
+            >
+              <div className={cn('flex h-10 w-10 shrink-0 items-center justify-center rounded-xl', accent)}>
+                <Icon size={18} strokeWidth={1.9} />
+              </div>
+              <div className="min-w-0 flex-1">
+                <p className="text-sm font-semibold text-foreground">{label}</p>
+                <p className="truncate text-xs text-muted-foreground">{description}</p>
+              </div>
+              <ChevronRight size={16} className="shrink-0 text-muted-foreground" />
+            </Link>
+          ))}
+        </div>
+      </SheetContent>
+    </Sheet>
   );
 }
 

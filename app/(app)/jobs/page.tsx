@@ -12,7 +12,6 @@ import { JobForm } from '@/components/jobs/job-form';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Briefcase, Plus, Search, Filter } from 'lucide-react';
-import { JOB_STATUSES } from '@/lib/mock-data';
 import { jobStats } from '@/lib/job-stats';
 import { payrollConfig } from '@/lib/payroll';
 import { cn } from '@/lib/utils';
@@ -53,6 +52,12 @@ const FILTER_OPTIONS: { label: string; value: FilterValue }[] = [
   // not to take?". Rolling them together hid both.
   { label: 'Lost',        value: 'lost' },
   { label: 'Declined',    value: 'declined' },
+];
+
+// The four buckets worth keeping permanently visible on a phone. Less-used
+// accounting and archive states remain one tap away in the filter sheet.
+const PRIMARY_FILTER_VALUES: FilterValue[] = [
+  'in-progress', 'coming-up', 'lead', 'completed',
 ];
 
 /**
@@ -240,6 +245,7 @@ export default function JobsPage() {
   };
   const [selectedJob, setSelectedJob] = useState<Job | null>(null);
   const [showAddJob, setShowAddJob] = useState(false);
+  const [showFilters, setShowFilters] = useState(false);
   const [search, setSearch] = useState('');
   // Default to In progress — most-useful first-glance view (what am I
   // actively working on right now?). Replaces the old 'All' default
@@ -300,7 +306,7 @@ export default function JobsPage() {
   return (
     <div className="flex flex-col min-h-full">
       <PageHeader
-        title="Jobs"
+        title="Work"
         subtitle={`${jobs.filter((j) => ['in-progress', 'booked'].includes(j.status)).length} active · $${pipelineValue.toLocaleString('en-NZ')} pipeline`}
         action={
           <Button size="sm" className="bg-primary h-9" onClick={() => setShowAddJob(true)}>
@@ -324,7 +330,7 @@ export default function JobsPage() {
 
         {/* Filter tabs */}
         <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide">
-          {FILTER_OPTIONS.map(({ label, value }) => (
+          {FILTER_OPTIONS.filter(({ value }) => PRIMARY_FILTER_VALUES.includes(value)).map(({ label, value }) => (
             <button
               key={value}
               onClick={() => setFilter(value)}
@@ -338,6 +344,21 @@ export default function JobsPage() {
               {label}
             </button>
           ))}
+          <button
+            type="button"
+            onClick={() => setShowFilters(true)}
+            className={cn(
+              'shrink-0 inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm font-medium border transition-colors',
+              PRIMARY_FILTER_VALUES.includes(filter)
+                ? 'bg-card text-muted-foreground border-border hover:text-foreground hover:border-primary/30'
+                : 'bg-primary/10 text-primary border-primary/20',
+            )}
+          >
+            <Filter size={14} strokeWidth={2} />
+            {PRIMARY_FILTER_VALUES.includes(filter)
+              ? 'More'
+              : FILTER_OPTIONS.find((option) => option.value === filter)?.label}
+          </button>
         </div>
 
         {/* Job list */}
@@ -383,6 +404,34 @@ export default function JobsPage() {
       />
 
       {/* Add job sheet */}
+      <Sheet open={showFilters} onOpenChange={setShowFilters}>
+        <SheetContent side="bottom" className="rounded-t-3xl pb-10">
+          <SheetHeader className="pb-4 text-left">
+            <SheetTitle>Show work</SheetTitle>
+          </SheetHeader>
+          <div className="grid grid-cols-2 gap-2">
+            {FILTER_OPTIONS.map(({ label, value }) => (
+              <button
+                key={value}
+                type="button"
+                onClick={() => {
+                  setFilter(value);
+                  setShowFilters(false);
+                }}
+                className={cn(
+                  'min-h-12 rounded-xl border px-3 text-sm font-semibold transition-colors',
+                  filter === value
+                    ? 'border-primary bg-primary text-primary-foreground'
+                    : 'border-border bg-card text-foreground hover:bg-accent',
+                )}
+              >
+                {label}
+              </button>
+            ))}
+          </div>
+        </SheetContent>
+      </Sheet>
+
       <Sheet open={showAddJob} onOpenChange={setShowAddJob}>
         <SheetContent side="bottom" className="h-[92vh] overflow-y-auto rounded-t-2xl pb-10">
           <SheetHeader className="pb-4">
