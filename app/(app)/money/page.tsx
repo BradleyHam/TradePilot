@@ -22,14 +22,14 @@ import { unbilledLabourInWindow } from '@/lib/labour-accrual';
 import { MonthlyData, CategoryData } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import {
-  TrendingUp, TrendingDown, Receipt, Clock, AlertCircle, FileText,
-  Briefcase, DollarSign,
+  TrendingDown, AlertCircle, FileText,
+  Briefcase, ChevronDown,
 } from 'lucide-react';
 import { format, parseISO, addMonths, startOfMonth, endOfMonth, differenceInCalendarMonths } from 'date-fns';
 
 export default function MoneyPage() {
   const { entries, jobs } = useStore();
-  const now = new Date();
+  const now = useMemo(() => new Date(), []);
 
   // Default selection: this month if data exists, else last month.
   const [kind, setKind] = useState<TimeframeKind>(() =>
@@ -41,6 +41,7 @@ export default function MoneyPage() {
   // Cash vs Earned basis — defaults to Earned because that answers "did I
   // actually have a good month" rather than "what hit the bank account".
   const [basis, setBasis] = useState<'cash' | 'earned'>('earned');
+  const [detailsOpen, setDetailsOpen] = useState(false);
 
   // Revenue vs Expenses chart range — independent of the main timeframe
   // filter so the chart can show a wider trend window (12M default)
@@ -222,151 +223,210 @@ export default function MoneyPage() {
         subtitle={frame.label}
       />
 
-      <div className="px-4 md:px-6 pb-6 space-y-3">
-        {/* Sticky controls — Timeframe + Cash/Earned basis. Pinned to the
-            top of the viewport so the user can always see which window
-            the KPIs/charts below are scoped to without scrolling back up.
-            Negative horizontal margins + matching padding restore the
-            page's px-4/px-6 gutter while letting the backdrop span edge-
-            to-edge so it doesn't look like a floating chip. */}
-        <div className="sticky top-0 z-20 -mx-4 md:-mx-6 px-4 md:px-6 pt-3 pb-3 bg-background/95 backdrop-blur-sm border-b border-border space-y-3">
-          {/* Timeframe filter */}
-          <TimeframeSelector
-            kind={kind}
-            custom={customFrame}
-            onChange={(k, c) => { setKind(k); setCustomFrame(c); }}
-          />
+      <div className="px-4 md:px-6 pb-6 space-y-4">
+        <TimeframeSelector
+          kind={kind}
+          custom={customFrame}
+          onChange={(k, c) => { setKind(k); setCustomFrame(c); }}
+        />
 
-          {/* Cash vs Earned basis toggle */}
-          <div className="flex items-center gap-2">
-            <div className="inline-flex bg-muted rounded-lg p-0.5">
-              <button
-                onClick={() => setBasis('earned')}
-                className={cn(
-                  'px-3 h-8 rounded-md text-xs font-medium transition-colors',
-                  basis === 'earned'
-                    ? 'bg-card shadow-sm text-foreground'
-                    : 'text-muted-foreground hover:text-foreground',
-                )}
-              >
-                Earned
-              </button>
-              <button
-                onClick={() => setBasis('cash')}
-                className={cn(
-                  'px-3 h-8 rounded-md text-xs font-medium transition-colors',
-                  basis === 'cash'
-                    ? 'bg-card shadow-sm text-foreground'
-                    : 'text-muted-foreground hover:text-foreground',
-                )}
-              >
-                Cash
-              </button>
-            </div>
-            <p className="text-[10px] text-muted-foreground italic flex-1">
-              {basis === 'earned'
-                ? 'Income split across months by hours worked; costs counted when incurred, paid or not.'
-                : 'Income and costs on the date the money moved.'}
-            </p>
-          </div>
-        </div>
+        <MoneySnapshot
+          periodLabel={periodLabel}
+          basis={basis}
+          revenue={revenue}
+          expenses={expenses}
+          profit={profit}
+          cashRevenue={cashRevenue}
+          earnedRevenue={earnedRevenue}
+          notYetPaid={notYetPaid}
+          totalHours={totalHoursInWindow}
+          avgHourlyReturn={avgHourlyReturn}
+          fmt={fmt}
+        />
 
-        {/* Top stats grid — bound to the selected window */}
-        <div className="grid grid-cols-2 gap-2.5">
-          <StatCard
-            label={`Revenue ${periodLabel}`}
-            value={fmt(revenue)}
-            icon={TrendingUp}
-            accent="green"
-            subvalue={basis === 'earned' && cashRevenue !== earnedRevenue
-              ? `Cash received: ${fmt(cashRevenue)}`
-              : undefined}
-          />
-          <StatCard
-            label={`Expenses ${periodLabel}`}
-            value={fmt(expenses)}
-            icon={Receipt}
-            accent="red"
-            subvalue={basis === 'earned' && notYetPaid > 0
-              ? `Incl. ${fmt(notYetPaid)} not paid yet`
-              : undefined}
-          />
-          <StatCard
-            label="Estimated profit"
-            value={fmt(profit)}
-            icon={DollarSign}
-            accent={profit >= 0 ? 'green' : 'red'}
-            subvalue={totalHoursInWindow > 0 ? `${totalHoursInWindow}h worked` : undefined}
-          />
-          <StatCard
-            label="Avg hourly return"
-            value={avgHourlyReturn > 0 ? `$${avgHourlyReturn.toFixed(0)}/h` : '—'}
-            icon={Clock}
-            accent="blue"
-          />
-        </div>
-
-        {/* Secondary stats — state of the business, NOT period-bound */}
-        <div className="grid grid-cols-2 gap-2.5">
-          <StatCard
-            label="Unpaid invoices"
-            value={unpaidInvoices > 0 ? fmt(unpaidInvoices) : '—'}
-            icon={AlertCircle}
-            accent={unpaidInvoices > 0 ? 'amber' : 'default'}
-            subvalue={unpaidInvoices > 0 ? 'Awaiting payment' : 'All clear'}
-          />
-          <StatCard
-            label="Quotes awaiting"
-            value={awaitingQuotes > 0 ? `${awaitingQuotes} quote${awaitingQuotes > 1 ? 's' : ''}` : '—'}
-            icon={FileText}
-            accent={awaitingQuotes > 0 ? 'violet' : 'default'}
-          />
-          <StatCard
-            label="Upcoming bills"
-            value={upcomingBills > 0 ? fmt(upcomingBills) : '—'}
-            icon={TrendingDown}
-            accent={upcomingBills > 0 ? 'red' : 'default'}
-          />
-          <StatCard
-            label="Pipeline value"
-            value={fmt(pipelineValue)}
-            icon={Briefcase}
-            accent="blue"
-            subvalue={`${jobs.filter((j) => !['paid', 'lost', 'declined'].includes(j.status)).length} active jobs`}
-          />
-        </div>
-
-        {/* Tax exposure — independent annual scope */}
+        {/* Annual tax sits beside the period snapshot, but keeps its own
+            tax-year scope and conservative estimator. */}
         <TaxExposureCard />
 
-        {/* Paid to IRD — tax-year tally of tagged tax payments. Self-hides
-            when nothing's been tagged. Excluded from all profit/GST math. */}
-        <TaxPaidCard />
+        <button
+          type="button"
+          aria-expanded={detailsOpen}
+          aria-controls="money-detail"
+          onClick={() => setDetailsOpen((open) => !open)}
+          className="w-full min-h-12 rounded-2xl border border-border/70 bg-card px-4 py-3 text-left shadow-sm transition-colors hover:bg-muted/30 active:bg-muted/50"
+        >
+          <span className="flex items-center justify-between gap-3">
+            <span>
+              <span className="block text-sm font-semibold text-foreground">More money detail</span>
+              <span className="block text-xs text-muted-foreground mt-0.5">
+                {basis === 'earned' ? 'Earned view' : 'Cash view'} · charts, bills and transactions
+              </span>
+            </span>
+            <ChevronDown
+              size={18}
+              className={cn('shrink-0 text-muted-foreground transition-transform', detailsOpen && 'rotate-180')}
+            />
+          </span>
+        </button>
 
-        {/* Reconcile entry point */}
-        <ReconcileEntryCard />
+        {detailsOpen && (
+          <div id="money-detail" className="space-y-3 animate-in fade-in-0 slide-in-from-top-1 duration-200">
+            <section className="rounded-2xl bg-muted/45 p-3.5">
+              <div className="flex items-center justify-between gap-3">
+                <div>
+                  <p className="text-sm font-semibold text-foreground">How to view the month</p>
+                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
+                    {basis === 'earned'
+                      ? 'Work is counted when it was earned, including costs not paid yet.'
+                      : 'Only money that actually moved in or out is counted.'}
+                  </p>
+                </div>
+                <div className="inline-flex shrink-0 rounded-xl bg-background p-1 ring-1 ring-border/70">
+                  <button
+                    type="button"
+                    onClick={() => setBasis('earned')}
+                    className={cn(
+                      'min-h-11 rounded-lg px-3 text-xs font-semibold transition-colors',
+                      basis === 'earned'
+                        ? 'bg-foreground text-background shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    Earned
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setBasis('cash')}
+                    className={cn(
+                      'min-h-11 rounded-lg px-3 text-xs font-semibold transition-colors',
+                      basis === 'cash'
+                        ? 'bg-foreground text-background shadow-sm'
+                        : 'text-muted-foreground hover:text-foreground',
+                    )}
+                  >
+                    Cash
+                  </button>
+                </div>
+              </div>
+            </section>
 
-        {/* Bills — confirm queue + bills waiting to be matched to a payment */}
-        <BillsEntryCard />
+            {/* State of the business — useful, but not part of the selected
+                month's made / spent / left story. */}
+            <div className="grid grid-cols-2 gap-2.5">
+              <StatCard
+                label="Unpaid invoices"
+                value={unpaidInvoices > 0 ? fmt(unpaidInvoices) : '—'}
+                icon={AlertCircle}
+                accent={unpaidInvoices > 0 ? 'amber' : 'default'}
+                subvalue={unpaidInvoices > 0 ? 'Awaiting payment' : 'All clear'}
+              />
+              <StatCard
+                label="Quotes awaiting"
+                value={awaitingQuotes > 0 ? `${awaitingQuotes} quote${awaitingQuotes > 1 ? 's' : ''}` : '—'}
+                icon={FileText}
+                accent={awaitingQuotes > 0 ? 'violet' : 'default'}
+              />
+              <StatCard
+                label="Upcoming bills"
+                value={upcomingBills > 0 ? fmt(upcomingBills) : '—'}
+                icon={TrendingDown}
+                accent={upcomingBills > 0 ? 'red' : 'default'}
+              />
+              <StatCard
+                label="Pipeline value"
+                value={fmt(pipelineValue)}
+                icon={Briefcase}
+                accent="blue"
+                subvalue={`${jobs.filter((j) => !['paid', 'lost', 'declined'].includes(j.status)).length} active jobs`}
+              />
+            </div>
 
-        {/* Charts — Revenue vs Expenses has its OWN range (independent of
-            the main timeframe) so trends across a year are visible while
-            the KPI cards above stay focused on this month/quarter. */}
-        <RevenueChart
-          data={monthlyData}
-          rangeControl={
-            <ChartRangeToggle value={chartRange} onChange={setChartRange} />
-          }
-        />
-        {expenseByCategory.length > 0 && <ExpenseChart data={expenseByCategory} />}
+            <TaxPaidCard />
+            <ReconcileEntryCard />
+            <BillsEntryCard />
 
-        {/* Pipeline — state of business, not period-bound */}
-        <PipelineBreakdown jobs={jobs} />
-
-        {/* Transactions — has its own internal 30-day window + filters */}
-        <TransactionList />
+            <RevenueChart
+              data={monthlyData}
+              rangeControl={
+                <ChartRangeToggle value={chartRange} onChange={setChartRange} />
+              }
+            />
+            {expenseByCategory.length > 0 && <ExpenseChart data={expenseByCategory} />}
+            {jobs.length > 0 && <PipelineBreakdown jobs={jobs} />}
+            <TransactionList />
+          </div>
+        )}
       </div>
     </div>
+  );
+}
+
+function MoneySnapshot({
+  periodLabel,
+  basis,
+  revenue,
+  expenses,
+  profit,
+  cashRevenue,
+  earnedRevenue,
+  notYetPaid,
+  totalHours,
+  avgHourlyReturn,
+  fmt,
+}: {
+  periodLabel: string;
+  basis: 'cash' | 'earned';
+  revenue: number;
+  expenses: number;
+  profit: number;
+  cashRevenue: number;
+  earnedRevenue: number;
+  notYetPaid: number;
+  totalHours: number;
+  avgHourlyReturn: number;
+  fmt: (value: number) => string;
+}) {
+  return (
+    <section className="overflow-hidden rounded-[1.5rem] bg-slate-950 text-white shadow-sm">
+      <div className="p-5 pb-4">
+        <div className="flex items-center justify-between gap-3">
+          <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/55">
+            Left after costs
+          </p>
+          <span className="rounded-full bg-white/10 px-2.5 py-1 text-[11px] font-medium text-white/75">
+            {basis === 'earned' ? 'Earned view' : 'Cash view'}
+          </span>
+        </div>
+        <p className={cn(
+          'mt-2 text-[2.35rem] font-bold leading-none tracking-[-0.045em] tabular-nums',
+          profit < 0 ? 'text-red-300' : 'text-white',
+        )}>
+          {fmt(profit)}
+        </p>
+        <p className="mt-2 text-sm text-white/60">
+          {totalHours > 0
+            ? `${totalHours.toLocaleString('en-NZ')}h logged · ${avgHourlyReturn > 0 ? `$${avgHourlyReturn.toFixed(0)}/h average return` : 'no hourly return yet'}`
+            : `For ${periodLabel}`}
+        </p>
+      </div>
+
+      <div className="grid grid-cols-2 border-t border-white/10 bg-white/[0.04]">
+        <div className="min-w-0 border-r border-white/10 px-5 py-4">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-white/50">Made {periodLabel}</p>
+          <p className="mt-1 text-xl font-semibold tabular-nums text-white">{fmt(revenue)}</p>
+          {basis === 'earned' && cashRevenue !== earnedRevenue && (
+            <p className="mt-1 truncate text-[11px] text-white/50">{fmt(cashRevenue)} received</p>
+          )}
+        </div>
+        <div className="min-w-0 px-5 py-4">
+          <p className="text-[11px] font-semibold uppercase tracking-wide text-white/50">Costs {periodLabel}</p>
+          <p className="mt-1 text-xl font-semibold tabular-nums text-white">{fmt(expenses)}</p>
+          {basis === 'earned' && notYetPaid > 0 && (
+            <p className="mt-1 truncate text-[11px] text-white/50">{fmt(notYetPaid)} not paid yet</p>
+          )}
+        </div>
+      </div>
+    </section>
   );
 }
 
@@ -395,7 +455,7 @@ function ChartRangeToggle({
           type="button"
           onClick={() => onChange(v)}
           className={cn(
-            'px-2 py-0.5 text-[11px] font-medium rounded-md transition-colors',
+            'min-h-11 px-2 text-[11px] font-medium rounded-md transition-colors',
             value === v
               ? 'bg-card text-foreground shadow-sm'
               : 'text-muted-foreground hover:text-foreground',

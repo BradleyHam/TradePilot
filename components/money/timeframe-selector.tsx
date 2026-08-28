@@ -1,7 +1,7 @@
 'use client';
 
 import { useEffect, useRef, useState } from 'react';
-import { format, parseISO, startOfMonth, endOfMonth, subMonths, isSameMonth } from 'date-fns';
+import { format, startOfMonth, endOfMonth, subMonths, isSameMonth } from 'date-fns';
 import { ChevronDown, X } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
@@ -74,6 +74,29 @@ interface TimeframeSelectorProps {
   onChange: (kind: TimeframeKind, custom: Timeframe | null) => void;
 }
 
+function TimeframeChip({
+  label, active, onClick,
+}: {
+  label: string;
+  active: boolean;
+  onClick: () => void;
+}) {
+  return (
+    <button
+      type="button"
+      onClick={onClick}
+      className={cn(
+        'h-11 shrink-0 rounded-xl border px-3.5 text-sm font-medium transition-colors',
+        active
+          ? 'border-primary bg-primary text-primary-foreground'
+          : 'border-border bg-background text-muted-foreground hover:border-primary/30 hover:text-foreground',
+      )}
+    >
+      {label}
+    </button>
+  );
+}
+
 export function TimeframeSelector({ kind, custom, onChange }: TimeframeSelectorProps) {
   const [showPicker, setShowPicker] = useState(false);
   // Picker draft state — separate from committed value so cancelling doesn't change anything.
@@ -110,31 +133,16 @@ export function TimeframeSelector({ kind, custom, onChange }: TimeframeSelectorP
     setShowPicker(false);
   }
 
-  const Chip = ({
-    label, active, onClick,
-  }: { label: string; active: boolean; onClick: () => void }) => (
-    <button
-      onClick={onClick}
-      className={cn(
-        'shrink-0 px-3 h-9 rounded-lg text-sm font-medium border transition-colors',
-        active
-          ? 'bg-primary text-primary-foreground border-primary'
-          : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
-      )}
-    >
-      {label}
-    </button>
-  );
-
   return (
     <div className="relative">
       <div className="flex gap-2 overflow-x-auto pb-1 scrollbar-hide">
-        <Chip label="This month" active={kind === 'this-month'} onClick={() => pick('this-month')} />
-        <Chip label="Last month" active={kind === 'last-month'} onClick={() => pick('last-month')} />
+        <TimeframeChip label="This month" active={kind === 'this-month'} onClick={() => pick('this-month')} />
+        <TimeframeChip label="Last month" active={kind === 'last-month'} onClick={() => pick('last-month')} />
         <button
+          type="button"
           onClick={() => setShowPicker((v) => !v)}
           className={cn(
-            'shrink-0 px-3 h-9 rounded-lg text-sm font-medium border flex items-center gap-1 transition-colors',
+            'flex h-11 shrink-0 items-center gap-1 rounded-xl border px-3.5 text-sm font-medium transition-colors',
             kind === 'custom'
               ? 'bg-primary text-primary-foreground border-primary'
               : 'bg-background text-muted-foreground border-border hover:text-foreground hover:border-primary/30',
@@ -154,15 +162,16 @@ export function TimeframeSelector({ kind, custom, onChange }: TimeframeSelectorP
           <div className="flex items-center justify-between mb-3">
             <p className="text-sm font-semibold text-foreground">Pick months</p>
             <button
+              type="button"
               onClick={() => setShowPicker(false)}
-              className="p-1 rounded-md hover:bg-muted"
+              className="flex size-11 items-center justify-center rounded-xl hover:bg-muted"
               aria-label="Close"
             >
               <X size={14} className="text-muted-foreground" />
             </button>
           </div>
-          <div className="grid grid-cols-2 gap-3">
-            <div>
+          <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
+            <div className="min-w-0">
               <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1 block">
                 From
               </label>
@@ -170,10 +179,10 @@ export function TimeframeSelector({ kind, custom, onChange }: TimeframeSelectorP
                 type="month"
                 value={fromYm}
                 onChange={(e) => setFromYm(e.target.value)}
-                className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                className="h-11 min-w-0 max-w-full w-full rounded-xl border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               />
             </div>
-            <div>
+            <div className="min-w-0">
               <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1 block">
                 To
               </label>
@@ -181,13 +190,14 @@ export function TimeframeSelector({ kind, custom, onChange }: TimeframeSelectorP
                 type="month"
                 value={toYm}
                 onChange={(e) => setToYm(e.target.value)}
-                className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                className="h-11 min-w-0 max-w-full w-full rounded-xl border border-input bg-background px-3 text-sm focus:outline-none focus:ring-2 focus:ring-ring"
               />
             </div>
           </div>
           <button
+            type="button"
             onClick={applyCustom}
-            className="mt-3 w-full h-10 rounded-lg bg-primary text-primary-foreground text-sm font-semibold"
+            className="mt-3 h-11 w-full rounded-xl bg-primary text-sm font-semibold text-primary-foreground"
           >
             Apply
           </button>

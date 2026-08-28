@@ -78,7 +78,7 @@ export function TaxPaidCard() {
           <button
             onClick={(e) => { e.stopPropagation(); setYearKind('current'); }}
             className={cn(
-              'px-2.5 h-7 rounded-md text-[11px] font-medium tabular-nums transition-colors',
+              'px-2.5 min-h-11 rounded-md text-[11px] font-medium tabular-nums transition-colors',
               yearKind === 'current'
                 ? 'bg-card shadow-sm text-foreground'
                 : 'text-muted-foreground hover:text-foreground',
@@ -89,7 +89,7 @@ export function TaxPaidCard() {
           <button
             onClick={(e) => { e.stopPropagation(); setYearKind('prev'); }}
             className={cn(
-              'px-2.5 h-7 rounded-md text-[11px] font-medium tabular-nums transition-colors',
+              'px-2.5 min-h-11 rounded-md text-[11px] font-medium tabular-nums transition-colors',
               yearKind === 'prev'
                 ? 'bg-card shadow-sm text-foreground'
                 : 'text-muted-foreground hover:text-foreground',
@@ -103,7 +103,7 @@ export function TaxPaidCard() {
       {/* Headline */}
       <button
         onClick={() => setOpen((v) => !v)}
-        className="w-full text-left px-4 pb-3.5 pt-1 hover:bg-muted/30 active:bg-muted/50 transition-colors"
+        className="w-full min-h-11 text-left px-4 pb-3.5 pt-1 hover:bg-muted/30 active:bg-muted/50 transition-colors"
       >
         <div className="flex items-center justify-between gap-2">
           <div className="flex items-center gap-2">
