@@ -67,7 +67,7 @@ interface JobFormProps {
 // blow away input focus. (We hit exactly that bug; do not move them back.)
 function Field({ label, children }: { label: string; children: React.ReactNode }) {
   return (
-    <div>
+    <div className="min-w-0">
       <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
         {label}
       </label>
@@ -80,7 +80,7 @@ function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   return (
     <input
       {...props}
-      className="w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+      className="min-w-0 max-w-full w-full h-9 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
     />
   );
 }
@@ -188,7 +188,7 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
         </div>
       )}
 
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
         <Field label="Phone">
           <Input type="tel" placeholder="021..." value={clientPhone} onChange={(e) => setClientPhone(e.target.value)} />
         </Field>
@@ -204,13 +204,13 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
       {/* Lead provenance — when it came in + where from. Especially useful
           for leads added by hand (phone / walk-in) so they slot into the
           Leads trend on the right week and carry a source. */}
-      <div className="grid grid-cols-2 gap-3">
+      <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
         <Field label="Lead came in">
           <Input type="date" value={leadDate} onChange={(e) => setLeadDate(e.target.value)} />
         </Field>
         <Field label="Source">
           <Select value={source || null} onValueChange={(v) => setSource((v ?? '') as LeadSource | '')}>
-            <SelectTrigger className="h-9 text-sm">
+            <SelectTrigger className="min-w-0 w-full h-9 text-sm">
               <SelectValue placeholder="Pick one">
                 {(value) => {
                   if (!value) return 'Pick one';
