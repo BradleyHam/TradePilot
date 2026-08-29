@@ -10,7 +10,7 @@
 // settings UI) ships, we'll move them to a user-editable table and read them
 // from the store instead.
 
-import type { Entry, Setting } from './types';
+import type { Entry, Invoice, Setting } from './types';
 
 // ── Tax-year helpers ─────────────────────────────────────────────────────────
 export interface TaxYear {
@@ -68,7 +68,11 @@ export interface DeductionAssumptions {
 }
 
 export const DEFAULT_DEDUCTIONS: DeductionAssumptions = {
-  vehicleKmAnnual:           5_350,
+  // A vehicle cannot be claimed through both kilometre rates and separate
+  // depreciation/actual costs. Lakeside owns the work van, so claiming a
+  // hard-coded km allowance here as well as the van costs in the books was
+  // unsafe. Keep this at zero until the asset/depreciation record is wired in.
+  vehicleKmAnnual:           0,
   homeAndShedAnnual:         1_820,
   phoneInternetUpliftAnnual: 1_253,
   laptopDepreciationAnnual:  1_600,
@@ -78,15 +82,15 @@ export function totalAnnualExtraDeductions(d: DeductionAssumptions): number {
   return d.vehicleKmAnnual + d.homeAndShedAnnual + d.phoneInternetUpliftAnnual + d.laptopDepreciationAnnual;
 }
 
-// ── Income tax bands (NZ personal, 2025/26) ──────────────────────────────────
+// ── Income tax bands (NZ personal, from 1 April 2025) ────────────────────────
 // Used because Brad will reclassify drawings as shareholder salary at year-end.
 // Company tax (28%) doesn't apply when all profit becomes salary.
 
 interface Band { upTo: number; rate: number; }
 const PERSONAL_TAX_BANDS: Band[] = [
-  { upTo: 14_000,  rate: 0.105 },
-  { upTo: 48_000,  rate: 0.175 },
-  { upTo: 70_000,  rate: 0.30  },
+  { upTo: 15_600,  rate: 0.105 },
+  { upTo: 53_500,  rate: 0.175 },
+  { upTo: 78_100,  rate: 0.30  },
   { upTo: 180_000, rate: 0.33  },
   { upTo: Infinity, rate: 0.39 },
 ];
@@ -126,6 +130,92 @@ function inRange(date: string, start: string, end: string): boolean {
   return date >= start && date <= end;
 }
 
+// ── GST periods ──────────────────────────────────────────────────────────────
+// Lakeside is registered on invoice basis and files six-monthly, with periods
+// ending 31 January and 31 July. Keeping this separate from the income-tax year
+// stops already-filed GST from reappearing as money still to reserve.
+export interface GstPeriod {
+  start: string;
+  end: string;
+  dueDate: string;
+  label: string;
+}
+
+function isoDate(year: number, month: number, day: number): string {
+  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+}
+
+function rollWeekendForward(iso: string): string {
+  const date = new Date(`${iso}T12:00:00`);
+  while (date.getDay() === 0 || date.getDay() === 6) date.setDate(date.getDate() + 1);
+  return isoDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
+}
+
+/** Six-monthly GST period containing `date` (period ends Jan/Jul). */
+export function gstPeriodOf(date: Date = new Date()): GstPeriod {
+  const year = date.getFullYear();
+  const month = date.getMonth() + 1;
+  if (month <= 1) {
+    const start = isoDate(year - 1, 8, 1);
+    const end = isoDate(year, 1, 31);
+    return { start, end, dueDate: rollWeekendForward(isoDate(year, 2, 28)), label: `Aug ${year - 1} – Jan ${year}` };
+  }
+  if (month <= 7) {
+    const start = isoDate(year, 2, 1);
+    const end = isoDate(year, 7, 31);
+    return { start, end, dueDate: rollWeekendForward(isoDate(year, 8, 28)), label: `Feb – Jul ${year}` };
+  }
+  const start = isoDate(year, 8, 1);
+  const end = isoDate(year + 1, 1, 31);
+  return { start, end, dueDate: rollWeekendForward(isoDate(year + 1, 2, 28)), label: `Aug ${year} – Jan ${year + 1}` };
+}
+
+export interface GstPeriodEstimate {
+  period: GstPeriod;
+  output: number;
+  input: number;
+  net: number;
+}
+
+/**
+ * Invoice-basis GST for Lakeside's open six-monthly period.
+ *
+ * Customer GST comes from first-class invoices by issue date. GST-bearing
+ * no-job income is also included for taxable asset/cash sales (the van sale is
+ * the current example). Job-linked bank receipts are deliberately ignored:
+ * their invoice already owns the tax point, and counting the receipt again was
+ * the source of the Fly Inn duplicate.
+ *
+ * Confirmed supplier bills count by invoice date whether paid or not, because
+ * invoice basis is not payment basis. Draft bills remain excluded.
+ */
+export function estimateInvoiceBasisGst(
+  entries: Entry[],
+  invoices: Invoice[],
+  date: Date = new Date(),
+): GstPeriodEstimate {
+  const period = gstPeriodOf(date);
+  let output = invoices
+    .filter((invoice) => inRange(invoice.invoiceDate, period.start, period.end))
+    .reduce((sum, invoice) => sum + (invoice.gstComponent ?? (
+      invoice.gstApplies ? invoice.amountExGst * NZ_GST_RATE : 0
+    )), 0);
+
+  output += entries
+    .filter((entry) => entry.type === 'income'
+      && !entry.jobId
+      && inRange(entry.entryDate, period.start, period.end))
+    .reduce((sum, entry) => sum + entryGst(entry), 0);
+
+  const input = entries
+    .filter((entry) => !entry.isDraft
+      && inRange(entry.entryDate, period.start, period.end)
+      && (entry.type === 'expense' || entry.type === 'bill'))
+    .reduce((sum, entry) => sum + entryGst(entry), 0);
+
+  return { period, output, input, net: output - input };
+}
+
 // ── Main estimate ────────────────────────────────────────────────────────────
 export interface TaxEstimate {
   taxYear: TaxYear;
@@ -161,6 +251,7 @@ export function estimateTax(
   now: Date = new Date(),
   ty: TaxYear = taxYearOf(now),
   deductions: DeductionAssumptions = DEFAULT_DEDUCTIONS,
+  capitalEntryIds: ReadonlySet<string> = new Set(),
 ): TaxEstimate {
   const yearEntries = entries.filter((e) =>
     e.entryDate && inRange(e.entryDate, ty.start, ty.end),
@@ -171,6 +262,7 @@ export function estimateTax(
   let income = 0;
   for (const e of yearEntries) {
     if (e.type !== 'income') continue;
+    if (capitalEntryIds.has(e.id)) continue;
     income    += entryExGst(e);
     gstOutput += entryGst(e);
   }
@@ -187,6 +279,7 @@ export function estimateTax(
   let expensesLogged = 0;
   for (const e of yearEntries) {
     if (e.isDraft) continue;
+    if (capitalEntryIds.has(e.id)) continue;
     if (e.type === 'expense') {
       expensesLogged += entryExGst(e);
       gstInput       += entryGst(e);
