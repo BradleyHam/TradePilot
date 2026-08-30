@@ -26,9 +26,10 @@ import {
   Briefcase, ChevronDown,
 } from 'lucide-react';
 import { format, parseISO, addMonths, startOfMonth, endOfMonth, differenceInCalendarMonths } from 'date-fns';
+import { invoiceIsOutstanding } from '@/lib/invoice-lifecycle';
 
 export default function MoneyPage() {
-  const { entries, jobs } = useStore();
+  const { entries, jobs, invoices } = useStore();
   const now = useMemo(() => new Date(), []);
 
   // Default selection: this month if data exists, else last month.
@@ -101,9 +102,9 @@ export default function MoneyPage() {
   const avgHourlyReturn = totalHoursInWindow > 0 ? revenue / totalHoursInWindow : 0;
 
   // ── State-of-business stats (NOT timeframe-bound) ─────────────────────────
-  const unpaidInvoices = jobs
-    .filter((j) => j.status === 'invoiced')
-    .reduce((s, j) => s + (j.invoiceAmount ?? j.quoteAmount ?? 0), 0);
+  const unpaidInvoices = invoices
+    .filter(invoiceIsOutstanding)
+    .reduce((sum, invoice) => sum + invoice.amountExGst, 0);
   const awaitingQuotes = jobs.filter((j) => j.status === 'quoted').length;
   const upcomingBills = entries
     // Exclude drafts: they're shown separately on Home as "Bills to confirm"

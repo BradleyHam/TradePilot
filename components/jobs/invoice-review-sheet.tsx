@@ -8,7 +8,7 @@
 //      as the Download button), so Brad can eyeball it looks right.
 //   2. Shows the deposit figures (editable amount/number/date) and an
 //      editable email draft to the client.
-//   3. "Save & open Gmail" records the invoice (job → invoiced), downloads
+//   3. "Save & open Gmail" records the invoice as sent, downloads
 //      the PDF, and opens Gmail pre-filled — Brad attaches the PDF + sends.
 //
 // Why download-then-attach rather than a true in-app send: a Gmail compose
@@ -16,8 +16,9 @@
 // sending was deliberately deferred (needs OAuth setup) — see the chat.
 
 import { useEffect, useMemo, useRef, useState } from 'react';
-import type { Job } from '@/lib/types';
+import type { Invoice, Job } from '@/lib/types';
 import { useStore } from '@/lib/store';
+import { defaultInvoiceDueDate } from '@/lib/invoice-lifecycle';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 import { Download, Mail, FileText, Loader2 } from 'lucide-react';
@@ -34,12 +35,13 @@ interface Props {
 }
 
 export function InvoiceReviewSheet({ job, open, onClose }: Props) {
-  const { invoices, quotes, addInvoice, updateJob, getQuoteTemplate, resolveLogoUrl, businessId } = useStore();
+  const { invoices, quotes, addInvoice, updateInvoice, updateJob, getQuoteTemplate, resolveLogoUrl, businessId } = useStore();
 
   // Editable invoice fields
   const [amountStr, setAmountStr] = useState('');
   const [invoiceNumber, setInvoiceNumber] = useState('');
   const [invoiceDate, setInvoiceDate] = useState(''); // ISO yyyy-mm-dd
+  const [dueDate, setDueDate] = useState('');
   // Editable email draft
   const [emailTo, setEmailTo] = useState('');
   const [emailSubject, setEmailSubject] = useState('');
@@ -51,7 +53,7 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
 
   const blobRef = useRef<Blob | null>(null);
   const urlRef = useRef<string | null>(null);
-  const createdRef = useRef(false); // guard against creating the invoice twice
+  const createdRef = useRef<Invoice | null>(null); // guard against creating the invoice twice
 
   const jobQuote = useMemo(
     () => (job ? quotes.find((q) => q.jobId === job.id) : undefined),
@@ -66,7 +68,8 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
     setAmountStr(d.amountExGst.toFixed(2));
     setInvoiceNumber(d.invoiceNumber);
     setInvoiceDate(d.invoiceDateISO);
-    createdRef.current = false;
+    setDueDate(defaultInvoiceDueDate(d.invoiceDateISO, 'deposit', tpl?.paymentTerms?.depositDueDays ?? 0));
+    createdRef.current = null;
     setError(null);
 
     const biz = tpl?.header.businessName || 'Lakeside Painting';
@@ -112,6 +115,7 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
           kind: 'deposit',
           invoiceNumber: invoiceNumber.trim() || d.invoiceNumber,
           invoiceDateISO: invoiceDate || d.invoiceDateISO,
+          dueDateISO: dueDate,
           amountExGst, gst, inclGst,
           job, quote: jobQuote, balanceInclGst, depositPercent: d.depositPercent,
         });
@@ -135,27 +139,40 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
     }, 450);
     return () => { cancelled = true; clearTimeout(timer); };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [open, job?.id, amountExGst, invoiceNumber, invoiceDate]);
+  }, [open, job?.id, amountExGst, invoiceNumber, invoiceDate, dueDate]);
 
   // Revoke the object URL on unmount.
   useEffect(() => () => { if (urlRef.current) URL.revokeObjectURL(urlRef.current); }, []);
 
   if (!job) return null;
 
-  function ensureInvoiceSaved() {
-    if (createdRef.current || !job || !businessId) return;
-    // Don't create a second deposit if one already exists for this job.
-    if (invoices.some((i) => i.jobId === job.id && i.kind === 'deposit')) {
-      createdRef.current = true;
-      return;
+  async function ensureInvoiceSaved(status: 'draft' | 'sent'): Promise<boolean> {
+    if (!job || !businessId) return false;
+    const existing = createdRef.current
+      ?? invoices.find((i) => i.jobId === job.id && i.kind === 'deposit' && i.status !== 'void');
+    if (existing) {
+      if (status === 'sent' && existing.status === 'draft') {
+        const result = await updateInvoice(existing.id, {
+          status: 'sent', dueDate, sentAt: new Date().toISOString(),
+        });
+        if (!result.ok) {
+          setError(result.error ?? 'Could not mark the invoice sent.');
+          return false;
+        }
+      }
+      createdRef.current = { ...existing, status };
+      return true;
     }
     const now = new Date().toISOString();
-    addInvoice({
+    const created = await addInvoice({
       id: `inv_${Date.now()}`,
       businessId,
       jobId: job.id,
       invoiceNumber: invoiceNumber.trim(),
       invoiceDate,
+      status,
+      dueDate,
+      sentAt: status === 'sent' ? now : undefined,
       kind: 'deposit',
       amountExGst,
       gstApplies: true,
@@ -165,12 +182,16 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
       createdAt: now,
       updatedAt: now,
     });
-    // Issuing a deposit moves the job to 'invoiced' (matches InvoiceAction).
+    if (!created) {
+      setError('The invoice was not saved. Nothing was sent.');
+      return false;
+    }
     // invoiceAmount tracks the FULL work value so the job shows its true
     // expected income, not just the deposit slice.
     const fullValue = Math.max(job.invoiceAmount ?? 0, job.quoteAmount ?? 0, amountExGst);
-    updateJob(job.id, { status: 'invoiced', invoiceAmount: fullValue });
-    createdRef.current = true;
+    updateJob(job.id, { invoiceAmount: fullValue });
+    createdRef.current = created;
+    return true;
   }
 
   function downloadCurrentPdf() {
@@ -187,18 +208,18 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
     setTimeout(() => URL.revokeObjectURL(url), 1000);
   }
 
-  function handleSendViaGmail() {
+  async function handleSendViaGmail() {
     if (!emailTo.trim()) { setError("Add the client's email address to send."); return; }
     if (!blobRef.current) { setError('Hang on — the invoice is still rendering.'); return; }
-    ensureInvoiceSaved();
+    if (!await ensureInvoiceSaved('sent')) return;
     downloadCurrentPdf();
     window.open(gmailComposeUrl(emailTo.trim(), { subject: emailSubject, body: emailBody }), '_blank');
     onClose();
   }
 
-  function handleDownloadOnly() {
+  async function handleDownloadOnly() {
     if (!blobRef.current) return;
-    ensureInvoiceSaved();
+    if (!await ensureInvoiceSaved('draft')) return;
     downloadCurrentPdf();
   }
 
@@ -254,6 +275,15 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
                 />
               </div>
             </div>
+            <div>
+              <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1 block">Payment due</label>
+              <input
+                type="date"
+                value={dueDate}
+                onChange={(e) => setDueDate(e.target.value)}
+                className="w-full h-11 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+              />
+            </div>
 
             {/* Email draft */}
             <div className="space-y-2 border-t border-border pt-3">
@@ -277,15 +307,15 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
 
           {/* Footer */}
           <div className="shrink-0 px-4 py-3 border-t border-border bg-card flex flex-col gap-2">
-            <Button className="w-full bg-primary" onClick={handleSendViaGmail} disabled={previewBusy || !emailTo.trim()}>
+            <Button className="w-full bg-primary" onClick={() => void handleSendViaGmail()} disabled={previewBusy || !emailTo.trim()}>
               <Mail size={15} strokeWidth={1.8} className="mr-1.5" />
               Save &amp; open Gmail
             </Button>
             <div className="flex gap-2">
               <Button variant="outline" className="flex-1" onClick={onClose}>Cancel</Button>
-              <Button variant="outline" className="flex-1" onClick={handleDownloadOnly} disabled={previewBusy || !previewUrl}>
+              <Button variant="outline" className="flex-1" onClick={() => void handleDownloadOnly()} disabled={previewBusy || !previewUrl}>
                 <Download size={15} strokeWidth={1.8} className="mr-1.5" />
-                Save &amp; download
+                Save draft &amp; download
               </Button>
             </div>
           </div>

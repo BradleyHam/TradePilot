@@ -41,6 +41,7 @@ import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
 import { InvoiceReviewSheet } from './invoice-review-sheet';
 import { CostEnginePreview } from './cost-engine-preview';
+import { invoiceCountsAsIssued } from '@/lib/invoice-lifecycle';
 import { PhotoLightbox, PhotoThumb, isImageName, type LightboxImage } from './photo-lightbox';
 
 interface JobDetailSheetProps {
@@ -851,11 +852,12 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               adapts to what's already issued. */}
           {(['accepted','booked','in-progress','completed','invoiced','paid'] as JobStatus[])
             .includes(liveJob.status) && (() => {
-              const jobInvoices = invoices.filter((i) => i.jobId === liveJob.id);
-              const totalInvoiced = jobInvoices.reduce((s, i) => s + i.amountExGst, 0);
+              const jobInvoices = invoices.filter((i) => i.jobId === liveJob.id && i.status !== 'void');
+              const issuedInvoices = jobInvoices.filter(invoiceCountsAsIssued);
+              const totalInvoiced = issuedInvoices.reduce((s, i) => s + i.amountExGst, 0);
               const totalWork = liveJob.invoiceAmount ?? liveJob.quoteAmount ?? 0;
               const allInvoiced = totalWork > 0 && totalInvoiced >= totalWork - 0.01;
-              const allPaid = jobInvoices.length > 0 && jobInvoices.every((i) => i.paid);
+              const allPaid = issuedInvoices.length > 0 && issuedInvoices.every((i) => i.paid);
 
               // Always keep an "issue invoice" affordance available — the
               // "all invoiced" check relies on the job's recorded total, which

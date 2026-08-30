@@ -63,6 +63,7 @@ import {
 } from 'lucide-react';
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
+import { invoiceDisplayStatus } from '@/lib/invoice-lifecycle';
 
 // ── ISO date helpers (local time — UTC drift bites week boundaries) ─────────
 function parseISODate(s: string): Date {
@@ -165,7 +166,6 @@ function daysWaiting(createdAtISO: string, todayISO: string): number {
 
 // ── Constants ───────────────────────────────────────────────────────────────
 const HOURS_TARGET_PER_WEEK = 30; // flat target per Brad's call
-const OVERDUE_INVOICE_DAYS = 14;  // unpaid > 14 days = overdue (no dueDate column)
 const BILLS_DUE_LOOKAHEAD_DAYS = 7;
 const COMING_UP_LOOKAHEAD_DAYS = 7;
 const COMING_UP_MAX_ROWS = 6;
@@ -338,29 +338,11 @@ export default function HomePage() {
   const freshWeek = hoursThisWeek === 0 && incomeExGst === 0 && expensesExGst === 0;
 
   // ── Money flags ─────────────────────────────────────────────────────────
-  // Overdue invoices (unpaid, invoiced > N days ago — no dueDate column).
-  //
-  // Extra guard for `final` invoices: only treat as overdue if the parent job
-  // is in 'invoiced' or 'paid' status. Reason — the backfill in migration
-  // 001_invoices.sql created a "final" stub row for every job with a non-null
-  // invoice_amount, including jobs that hadn't been completed yet. Those
-  // stubs sit unpaid against booked/in-progress jobs and would otherwise be
-  // flagged here forever (until the job actually finishes), even though the
-  // final invoice hasn't been sent. Deposits/progress invoices keep the
-  // simpler rule because they can legitimately be issued at any job stage.
+  // Due dates now belong to the invoice itself. Draft and void invoices can
+  // never surface as overdue, regardless of work status.
   const overdueInvoices = useMemo(() => {
-    const cutoffISO = formatISODate(addDays(parseISODate(todayISO), -OVERDUE_INVOICE_DAYS));
-    return invoices.filter((i) => {
-      if (i.paid) return false;
-      if (i.invoiceDate > cutoffISO) return false;
-      if (i.kind === 'final') {
-        const job = jobs.find((j) => j.id === i.jobId);
-        if (!job) return false;
-        if (job.status !== 'invoiced' && job.status !== 'paid') return false;
-      }
-      return true;
-    });
-  }, [invoices, jobs, todayISO]);
+    return invoices.filter((invoice) => invoiceDisplayStatus(invoice, todayISO) === 'overdue');
+  }, [invoices, todayISO]);
 
   // Bills coming due in the next 7 days, unpaid only.
   // Drafts (unconfirmed parsed bills) are surfaced separately in the
@@ -2043,7 +2025,7 @@ function OverdueInvoicesFlag({
             {invoices.length} overdue invoice{invoices.length === 1 ? '' : 's'}
           </p>
           <p className="text-xs text-muted-foreground">
-            Unpaid &gt; {OVERDUE_INVOICE_DAYS} days · {fmtMoney(total)} ex-GST
+            Past their payment due date · {fmtMoney(total)} ex-GST
           </p>
         </div>
         <ChevronDown
@@ -2060,7 +2042,7 @@ function OverdueInvoicesFlag({
             const job = jobs.find((j) => j.id === inv.jobId);
             const daysOverdue = Math.max(
               0,
-              Math.floor((todayDate.getTime() - parseISODate(inv.invoiceDate).getTime()) / 86400000),
+              Math.floor((todayDate.getTime() - parseISODate(inv.dueDate ?? inv.invoiceDate).getTime()) / 86400000),
             );
             return (
               <li

@@ -294,7 +294,7 @@ interface StoreState {
    * the temporary `inv_…` client id.
    */
   addInvoice: (invoice: Invoice) => Promise<Invoice | null>;
-  updateInvoice: (id: string, updates: Partial<Invoice>) => void;
+  updateInvoice: (id: string, updates: Partial<Invoice>) => Promise<{ ok: boolean; error?: string }>;
 
   // Bank-transaction mutators
   /** Bulk-insert parsed CSV rows. Idempotent on (business_id, fingerprint). */
@@ -347,15 +347,20 @@ interface StoreState {
   ) => Promise<{ updated: number; failed: number; error?: string }>;
   /**
    * Mark an invoice paid AND auto-create a linked income entry on the
-   * payment date. Idempotent: if the invoice is already paid, no-op.
+   * payment date in one database transaction. Idempotent: if already paid,
+   * no-op.
    */
-  markInvoicePaid: (id: string, paidDate: string, paidVia?: string) => void;
+  markInvoicePaid: (id: string, paidDate: string, paidVia?: string) => Promise<{ ok: boolean; error?: string }>;
+  /** Safely reverse a mistaken payment without deleting imported/bank evidence. */
+  unmarkInvoicePaid: (id: string) => Promise<{ ok: boolean; preservedEntry?: boolean; error?: string }>;
+  /** Void an unpaid invoice. Paid invoices must be corrected first. */
+  voidInvoice: (id: string, reason?: string) => Promise<{ ok: boolean; error?: string }>;
 
   /**
    * Record a pay run as PAID and auto-create the linked wages expense
    * entry (category 'labour', no GST — wages are outside the GST net) so
    * the gross lands in the books on the pay date. Mirrors the
-   * markInvoicePaid insert-entry-first / rollback-on-failure pattern.
+   * invoice payment pattern.
    */
   addPayRun: (input: {
     memberId?: string;
@@ -1479,16 +1484,14 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
    * against it. Logging hours IS the act of starting the job, so Brad
    * shouldn't have to also tap the status dropdown.
    *
-   * FORWARD-ONLY and conservative — mirrors `maybeAdvanceJobStatus` (the
-   * invoice-driven one). It only ever promotes from a PRE-START status
+   * FORWARD-ONLY and conservative. It only ever promotes from a PRE-START status
    * (lead / quoted / accepted / booked) up to `in-progress`. It never
    * demotes a job that's already further along (`in-progress`, or the
    * terminal `completed` / `invoiced` / `paid` / `lost`) — so logging a
    * late/backdated hour on a finished job can't drag it back to active.
    *
    * Inline ref-reading helper (same shape as
-   * `maybeCompleteJobBookingForEntry` above) so it can run before
-   * `maybeAdvanceJobStatus` is defined later in the component.
+   * `maybeCompleteJobBookingForEntry` above).
    */
   function maybeAdvanceJobToInProgress(entry: { type?: EntryType; jobId?: string; hours?: number }) {
     if (entry.type !== 'hours') return;
@@ -3189,48 +3192,6 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
 
   // ── Invoice mutators ─────────────────────────────────────────────────────
 
-  /**
-   * Auto-advance job.status based on invoice state. Called after invoice
-   * inserts/updates. Only ever moves the status FORWARD along the chain
-   *   completed → invoiced → paid
-   * — never demotes, never touches earlier statuses (lead/quoted/accepted
-   * /booked/in-progress/lost) because those are user-driven.
-   *
-   * Rules:
-   *  - If the job has any invoices and status is `completed` → bump to
-   *    `invoiced`. (You issued an invoice, so we know it's been invoiced.)
-   *  - If the job has at least one paid `final` invoice AND every invoice on
-   *    the job is paid → bump to `paid`. (Deposit-only paid jobs do NOT
-   *    promote — final invoice is the signal that the job is fully billed.)
-   *
-   * Reads live state via the setter callbacks so it doesn't capture stale
-   * closures from the optimistic-update flow above.
-   */
-  const maybeAdvanceJobStatus = useCallback((jobId: string | null | undefined) => {
-    if (!jobId) return;
-    let job: Job | undefined;
-    setJobs((js) => { job = js.find((j) => j.id === jobId); return js; });
-    if (!job) return;
-    // Only auto-advance from these statuses. Anything earlier (lead/quoted
-    // /accepted/booked/in-progress) or `lost` is user-driven; don't override.
-    if (job.status !== 'completed' && job.status !== 'invoiced') return;
-
-    let jobInvoices: Invoice[] = [];
-    setInvoices((list) => { jobInvoices = list.filter((i) => i.jobId === jobId); return list; });
-    if (jobInvoices.length === 0) return;
-
-    const allPaid = jobInvoices.every((i) => i.paid);
-    const hasPaidFinal = jobInvoices.some((i) => i.paid && i.kind === 'final');
-
-    let nextStatus: JobStatus | null = null;
-    if (allPaid && hasPaidFinal) nextStatus = 'paid';
-    else if (job.status === 'completed') nextStatus = 'invoiced';
-
-    if (nextStatus && nextStatus !== job.status) {
-      updateJob(jobId, { status: nextStatus });
-    }
-  }, [updateJob]);
-
   const addInvoice = useCallback(async (invoice: Invoice): Promise<Invoice | null> => {
     if (!businessId) {
       console.warn('[store] addInvoice called with no businessId; ignoring');
@@ -3257,141 +3218,194 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     // fails with Postgres 22P02.
     const persisted = rowToInvoice(data);
     setInvoices((prev) => prev.map((i) => (i.id === tempId ? persisted : i)));
-    maybeAdvanceJobStatus(invoice.jobId);
     return persisted;
-  }, [businessId, maybeAdvanceJobStatus]);
+  }, [businessId]);
 
-  const updateInvoice = useCallback((id: string, updates: Partial<Invoice>) => {
+  const updateInvoice = useCallback(async (
+    id: string,
+    updates: Partial<Invoice>,
+  ): Promise<{ ok: boolean; error?: string }> => {
     let prev: Invoice | undefined;
     setInvoices((list) => {
       prev = list.find((i) => i.id === id);
       return list.map((i) => (i.id === id ? { ...i, ...updates } : i));
     });
-    (async () => {
-      const row = invoiceToRow(updates);
-      const { error: updErr } = await supabase.from('invoices').update(row).eq('id', id);
-      if (updErr) {
-        console.error('[store] updateInvoice failed:', updErr);
-        setError(updErr.message);
-        if (prev) setInvoices((list) => list.map((i) => (i.id === id ? prev! : i)));
-        return;
-      }
-      // If the edit affects paid status or moved jobs, re-evaluate job status.
-      // (jobId moves are unlikely but cheap to handle.)
-      const jobId = updates.jobId ?? prev?.jobId;
-      if (jobId) maybeAdvanceJobStatus(jobId);
-    })();
-  }, [maybeAdvanceJobStatus]);
+    const row = invoiceToRow(updates);
+    const { error: updErr } = await supabase.from('invoices').update(row).eq('id', id);
+    if (updErr) {
+      console.error('[store] updateInvoice failed:', updErr);
+      setError(updErr.message);
+      if (prev) setInvoices((list) => list.map((i) => (i.id === id ? prev! : i)));
+      return { ok: false, error: updErr.message };
+    }
+    return { ok: true };
+  }, []);
 
   /**
    * Mark an invoice paid AND auto-create a linked income entry on the
-   * payment date. The invoice gets income_entry_id pointing to the new entry.
-   * Idempotent: bails if the invoice is already paid.
+   * payment date in one Postgres transaction. The invoice gets
+   * income_entry_id pointing to the new entry. Idempotent if already paid.
    */
-  const markInvoicePaid = useCallback((id: string, paidDate: string, paidVia?: string) => {
-    if (!businessId) return;
+  const markInvoicePaid = useCallback(async (
+    id: string,
+    paidDate: string,
+    paidVia?: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    if (!businessId) return { ok: false, error: 'No business selected' };
 
-    let inv: Invoice | undefined;
+    let original: Invoice | undefined;
     setInvoices((list) => {
-      inv = list.find((i) => i.id === id);
-      if (!inv || inv.paid) return list;
-      return list.map((i) => i.id === id
-        ? { ...i, paid: true, paidDate, paidVia: paidVia ?? i.paidVia }
-        : i);
+      original = list.find((i) => i.id === id);
+      if (!original || original.paid) return list;
+      return list.map((i) => i.id === id ? {
+        ...i,
+        statusBeforePaid: i.status === 'draft' ? 'draft' : 'sent',
+        status: 'paid',
+        paid: true,
+        paidDate,
+        paidVia: paidVia ?? i.paidVia,
+      } : i);
     });
+    if (!original) return { ok: false, error: 'Invoice not found' };
+    if (original.paid) return { ok: true };
 
-    if (!inv || inv.paid) return;
-
-    // Optimistic: also synthesize an income entry locally so cash-basis
-    // numbers update immediately. The real entry id replaces the temp one
-    // when the Supabase write returns.
-    const grossAmount = inv.amountInclGst
-      ?? (inv.gstApplies ? inv.amountExGst * 1.15 : inv.amountExGst);
-    const gst = inv.gstComponent
-      ?? (inv.gstApplies ? inv.amountExGst * 0.15 : 0);
-    const tempEntryId = `ent_${Date.now()}`;
-    const localEntry: Entry = {
+    const tempEntryId = original.incomeEntryId ? null : `ent_${Date.now()}`;
+    const grossAmount = original.amountInclGst
+      ?? (original.gstApplies ? original.amountExGst * 1.15 : original.amountExGst);
+    const gst = original.gstComponent
+      ?? (original.gstApplies ? original.amountExGst * 0.15 : 0);
+    const localEntry: Entry | null = tempEntryId ? {
       id: tempEntryId,
       businessId,
-      jobId: inv.jobId,
+      jobId: original.jobId,
       type: 'income',
       amount: grossAmount,
-      gstApplies: inv.gstApplies,
-      amountExGst: inv.amountExGst,
+      gstApplies: original.gstApplies,
+      amountExGst: original.amountExGst,
       gstComponent: gst,
-      description: `${inv.invoiceNumber} payment received`,
+      description: `${original.invoiceNumber} payment received`,
       entryDate: paidDate,
       paymentMethod: paidVia ?? 'Bank transfer',
       createdAt: new Date().toISOString(),
-    };
-    setEntries((prev) => [localEntry, ...prev]);
+    } : null;
+    if (localEntry) setEntries((prev) => [localEntry, ...prev]);
 
-    (async () => {
-      // Insert the entry first, get its real id, then mark the invoice paid
-      // with income_entry_id linked. If either step fails, roll back both.
-      const entryRow = entryToRow({ ...localEntry, businessId });
-      const { data: entryData, error: entryErr } = await supabase
-        .from('entries').insert(entryRow).select('*').single();
-      if (entryErr || !entryData) {
-        const msg = describeError(entryErr) || 'Failed to log payment';
-        console.error('[store] markInvoicePaid: entry insert failed —', msg, entryErr);
-        setError(msg);
-        // Roll back local state
-        setEntries((prev) => prev.filter((e) => e.id !== tempEntryId));
-        setInvoices((list) => list.map((i) => i.id === id
-          ? { ...i, paid: false, paidDate: undefined, paidVia: undefined }
-          : i));
-        return;
-      }
-      const persistedEntry = rowToEntry(entryData);
-      setEntries((prev) => prev.map((e) => (e.id === tempEntryId ? persistedEntry : e)));
+    const { data, error: rpcErr } = await supabase.rpc('mark_invoice_paid', {
+      p_invoice_id: id,
+      p_paid_date: paidDate,
+      p_paid_via: paidVia ?? null,
+    });
+    const payload = data as {
+      invoice?: Record<string, unknown>;
+      entry?: Record<string, unknown> | null;
+    } | null;
+    if (rpcErr || !payload?.invoice) {
+      const msg = describeError(rpcErr) || 'Failed to mark invoice paid';
+      console.error('[store] markInvoicePaid failed:', msg, rpcErr);
+      setError(msg);
+      if (localEntry) setEntries((prev) => prev.filter((e) => e.id !== localEntry.id));
+      setInvoices((list) => list.map((i) => i.id === id ? original! : i));
+      return { ok: false, error: msg };
+    }
 
-      // Now flip the invoice with the link. We `.select()` the updated rows
-      // so we can detect the silent "0 rows changed" case — that happens when
-      // RLS blocks the update without returning an error (Supabase quirk).
-      const invRow = invoiceToRow({
-        paid: true,
-        paidDate,
-        paidVia,
-        incomeEntryId: persistedEntry.id,
+    const persistedInvoice = rowToInvoice(payload.invoice);
+    setInvoices((list) => list.map((i) => i.id === id ? persistedInvoice : i));
+    if (payload.entry) {
+      const persistedEntry = rowToEntry(payload.entry);
+      setEntries((list) => {
+        if (localEntry) return list.map((e) => e.id === localEntry.id ? persistedEntry : e);
+        return list.some((e) => e.id === persistedEntry.id)
+          ? list.map((e) => e.id === persistedEntry.id ? persistedEntry : e)
+          : [persistedEntry, ...list];
       });
-      const { data: updated, error: invErr } = await supabase
-        .from('invoices')
-        .update(invRow)
-        .eq('id', id)
-        .select('id');
+    }
+    return { ok: true };
+  }, [businessId]);
 
-      // Differentiate the two failure modes for diagnostics.
-      const noRowsTouched = !invErr && (!updated || updated.length === 0);
-      if (invErr || noRowsTouched) {
-        const msg = invErr
-          ? describeError(invErr)
-          : `No invoice row matched id=${id} (likely RLS — confirm businesses.owner_id matches your auth.uid()).`;
-        console.error('[store] markInvoicePaid: invoice update failed —', msg, invErr ?? '(no error, 0 rows updated)');
-        setError(msg);
-        // Best-effort rollback: delete the entry we just created.
-        const { error: rollbackErr } = await supabase
-          .from('entries').delete().eq('id', persistedEntry.id);
-        if (rollbackErr) {
-          console.warn('[store] markInvoicePaid: entry rollback also failed —', describeError(rollbackErr));
-        }
-        setEntries((prev) => prev.filter((e) => e.id !== persistedEntry.id));
-        setInvoices((list) => list.map((i) => i.id === id
-          ? { ...i, paid: false, paidDate: undefined, paidVia: undefined }
-          : i));
-        return;
+  const unmarkInvoicePaid = useCallback(async (
+    id: string,
+  ): Promise<{ ok: boolean; preservedEntry?: boolean; error?: string }> => {
+    let original: Invoice | undefined;
+    setInvoices((list) => {
+      original = list.find((i) => i.id === id);
+      if (!original || !original.paid) return list;
+      return list.map((i) => i.id === id ? {
+        ...i,
+        status: i.statusBeforePaid ?? 'sent',
+        statusBeforePaid: undefined,
+        paid: false,
+        paidDate: undefined,
+        paidVia: undefined,
+        incomeEntryId: undefined,
+        paymentEntryGenerated: false,
+      } : i);
+    });
+    if (!original) return { ok: false, error: 'Invoice not found' };
+    if (!original.paid) return { ok: true };
+
+    const linkedEntry = original.incomeEntryId
+      ? entriesRef.current.find((entry) => entry.id === original!.incomeEntryId)
+      : undefined;
+    if (linkedEntry && original.paymentEntryGenerated) {
+      setEntries((list) => list.filter((entry) => entry.id !== linkedEntry.id));
+    }
+
+    const { data, error: rpcErr } = await supabase.rpc('unmark_invoice_paid', { p_invoice_id: id });
+    const payload = data as {
+      invoice?: Record<string, unknown>;
+      deleted_entry?: boolean;
+      preserved_entry?: boolean;
+    } | null;
+    if (rpcErr || !payload?.invoice) {
+      const msg = describeError(rpcErr) || 'Failed to undo invoice payment';
+      console.error('[store] unmarkInvoicePaid failed:', msg, rpcErr);
+      setError(msg);
+      setInvoices((list) => list.map((i) => i.id === id ? original! : i));
+      if (linkedEntry && original.paymentEntryGenerated) {
+        setEntries((list) => list.some((e) => e.id === linkedEntry.id) ? list : [linkedEntry, ...list]);
       }
-      // Update local invoice with the income_entry_id
-      setInvoices((list) => list.map((i) => i.id === id
-        ? { ...i, incomeEntryId: persistedEntry.id }
-        : i));
-      // If this paid invoice means the job is fully billed + paid (final
-      // invoice paid AND all invoices paid), bump status to 'paid'. Same
-      // helper is also called from addInvoice/updateInvoice so the chain
-      // completed → invoiced → paid stays in sync regardless of entry path.
-      maybeAdvanceJobStatus(inv!.jobId);
-    })();
-  }, [businessId, maybeAdvanceJobStatus]);
+      return { ok: false, error: msg };
+    }
+
+    const persistedInvoice = rowToInvoice(payload.invoice);
+    setInvoices((list) => list.map((i) => i.id === id ? persistedInvoice : i));
+    if (payload.deleted_entry && original.incomeEntryId) {
+      setEntries((list) => list.filter((entry) => entry.id !== original!.incomeEntryId));
+    }
+    return { ok: true, preservedEntry: payload.preserved_entry === true };
+  }, []);
+
+  const voidInvoice = useCallback(async (
+    id: string,
+    reason?: string,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    let original: Invoice | undefined;
+    const now = new Date().toISOString();
+    setInvoices((list) => {
+      original = list.find((i) => i.id === id);
+      if (!original || original.paid) return list;
+      return list.map((i) => i.id === id
+        ? { ...i, status: 'void', paid: false, voidedAt: now, voidReason: reason?.trim() || undefined }
+        : i);
+    });
+    if (!original) return { ok: false, error: 'Invoice not found' };
+    if (original.paid) return { ok: false, error: 'Undo the payment before voiding this invoice' };
+
+    const { data, error: rpcErr } = await supabase.rpc('void_invoice', {
+      p_invoice_id: id,
+      p_reason: reason?.trim() || null,
+    });
+    if (rpcErr || !data) {
+      const msg = describeError(rpcErr) || 'Failed to void invoice';
+      console.error('[store] voidInvoice failed:', msg, rpcErr);
+      setError(msg);
+      setInvoices((list) => list.map((i) => i.id === id ? original! : i));
+      return { ok: false, error: msg };
+    }
+    const persistedInvoice = rowToInvoice(data as Record<string, unknown>);
+    setInvoices((list) => list.map((i) => i.id === id ? persistedInvoice : i));
+    return { ok: true };
+  }, []);
 
   // ── Bank transaction mutators ────────────────────────────────────────────
 
@@ -4045,7 +4059,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         jobContacts, logContact,
         jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
-        addInvoice, updateInvoice, markInvoicePaid,
+        addInvoice, updateInvoice, markInvoicePaid, unmarkInvoicePaid, voidInvoice,
         addPayRun, updatePayRun,
         confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,
         addMaterials, addMaterialFromOverhead,

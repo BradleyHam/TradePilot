@@ -1,8 +1,9 @@
 'use client';
 
 import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
-import type { Job, Invoice, InvoiceKind, ParsedInvoice } from '@/lib/types';
+import type { Job, Invoice, InvoiceKind, InvoiceStatus, ParsedInvoice } from '@/lib/types';
 import { useStore } from '@/lib/store';
+import { defaultInvoiceDueDate } from '@/lib/invoice-lifecycle';
 import { buildInvoicePdfData } from '@/lib/invoice-pdf-data';
 import { supabase } from '@/lib/supabase/client';
 import { extractPdfText } from '@/lib/pdf/extract-text';
@@ -36,19 +37,18 @@ interface InvoiceActionProps {
  * Create mode (default — no invoice prop):
  *   - No invoices yet → kind = deposit, suggest 30% of quote.
  *   - Deposit issued → kind = final, suggest balance (job total − deposit).
- *   - On save: creates an invoice, sets job.status = 'invoiced', updates
- *     invoice_amount if needed.
+ *   - On save: creates an invoice and updates invoice_amount if needed.
+ *     Work status is deliberately untouched.
  *
  * Edit mode (invoice prop passed):
  *   - Form populated with the invoice's existing values.
  *   - On save: updates the invoice in place. Job's invoice_amount adjusts
  *     to reflect the new sum of invoices if it changed.
- *   - "Mark paid" tickbox handles transition unpaid → paid (auto-creates
- *     income entry). Going paid → unpaid would need a separate "unmark paid"
- *     action; not built tonight.
+ *   - "Mark paid" is atomic with the linked income entry. Corrections use
+ *     the invoice list's explicit "Correct payment" action.
  */
 export function InvoiceAction({ job, open, onClose, invoice, initialFile }: InvoiceActionProps) {
-  const { invoices, entries, addInvoice, updateInvoice, updateJob, markInvoicePaid, businessId, ensureJobHasQuote, addQuoteAttachments, getQuoteTemplate, quotes, resolveLogoUrl } = useStore();
+  const { invoices, entries, addInvoice, updateInvoice, updateJob, markInvoicePaid, voidInvoice, businessId, ensureJobHasQuote, addQuoteAttachments, getQuoteTemplate, quotes, resolveLogoUrl } = useStore();
   const isEdit = invoice != null;
 
   // Opens the "no hours on this job" quick-add right after a save that
@@ -62,7 +62,7 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
 
   // Existing invoices on this job
   const jobInvoices = useMemo(
-    () => invoices.filter((i) => i.jobId === job.id).sort((a, b) =>
+    () => invoices.filter((i) => i.jobId === job.id && i.status !== 'void').sort((a, b) =>
       a.invoiceDate.localeCompare(b.invoiceDate),
     ),
     [invoices, job.id],
@@ -116,6 +116,13 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
   const [kind, setKind]                   = useState<InvoiceKind>(invoice?.kind ?? defaultKind);
   const [invoiceNumber, setInvoiceNumber] = useState(invoice?.invoiceNumber ?? defaultNumber);
   const [invoiceDate, setInvoiceDate]     = useState(invoice?.invoiceDate ?? todayIso());
+  const [invoiceStatus, setInvoiceStatus] = useState<Extract<InvoiceStatus, 'draft' | 'sent'>>(
+    invoice?.status === 'draft' ? 'draft' : 'sent',
+  );
+  const depositDueDays = getQuoteTemplate()?.paymentTerms?.depositDueDays ?? 0;
+  const [dueDate, setDueDate] = useState(
+    invoice?.dueDate ?? defaultInvoiceDueDate(invoice?.invoiceDate ?? todayIso(), invoice?.kind ?? defaultKind, depositDueDays),
+  );
   const [amountStr, setAmountStr]         = useState(
     invoice
       ? String(invoice.amountExGst)
@@ -125,6 +132,9 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
   const [markPaid, setMarkPaid]           = useState(invoice?.paid ?? false);
   const [paidDate, setPaidDate]           = useState(invoice?.paidDate ?? todayIso());
   const [submitting, setSubmitting]       = useState(false);
+  const [saveError, setSaveError]         = useState<string | null>(null);
+  const [showVoidConfirm, setShowVoidConfirm] = useState(false);
+  const [voidReason, setVoidReason] = useState(invoice?.voidReason ?? '');
 
   // ── PDF upload / extract state ──────────────────────────────────────────
   // The user can drag an invoice PDF into the drop zone (or tap to pick one).
@@ -336,26 +346,35 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       setKind(invoice.kind);
       setInvoiceNumber(invoice.invoiceNumber);
       setInvoiceDate(invoice.invoiceDate);
+      setInvoiceStatus(invoice.status === 'draft' ? 'draft' : 'sent');
+      setDueDate(invoice.dueDate ?? defaultInvoiceDueDate(invoice.invoiceDate, invoice.kind, depositDueDays));
       setAmountStr(String(invoice.amountExGst));
       setVariation(invoice.notes ?? '');
       setMarkPaid(invoice.paid);
       setPaidDate(invoice.paidDate ?? todayIso());
+      setVoidReason(invoice.voidReason ?? '');
     } else {
       setKind(defaultKind);
       setInvoiceNumber(defaultNumber);
-      setInvoiceDate(todayIso());
+      const today = todayIso();
+      setInvoiceDate(today);
+      setInvoiceStatus('sent');
+      setDueDate(defaultInvoiceDueDate(today, defaultKind, depositDueDays));
       setAmountStr(suggestedAmount > 0 ? String(suggestedAmount) : '');
       setVariation('');
       setMarkPaid(false);
       setPaidDate(todayIso());
+      setVoidReason('');
     }
+    setSaveError(null);
+    setShowVoidConfirm(false);
     // Clear extract state too — re-opening should feel like a fresh start,
     // not show a stale "Filled 4 fields" banner from the last time.
     setExtractStage('idle');
     setExtractMsg(null);
     setUndoSnapshot(null);
     setFilledCount(0);
-  }, [open, job.id, invoice, defaultKind, defaultNumber, suggestedAmount]);
+  }, [open, job.id, invoice, defaultKind, defaultNumber, suggestedAmount, depositDueDays]);
 
   // Re-derive number when user changes kind — but only in CREATE mode.
   // In edit mode we don't auto-rewrite the user's existing invoice number.
@@ -367,6 +386,16 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
     else setInvoiceNumber(`${base}-P${jobInvoices.filter(i => i.kind === 'progress').length + 1}`);
   }, [kind, job.legacyId, job.id, hasDeposit, jobInvoices, isEdit]);
 
+  function handleKindChange(nextKind: InvoiceKind) {
+    setKind(nextKind);
+    if (!isEdit) setDueDate(defaultInvoiceDueDate(invoiceDate, nextKind, depositDueDays));
+  }
+
+  function handleInvoiceDateChange(nextDate: string) {
+    setInvoiceDate(nextDate);
+    if (!isEdit) setDueDate(defaultInvoiceDueDate(nextDate, kind, depositDueDays));
+  }
+
   const amountExGst = useMemo(() => {
     const n = Number(amountStr.replace(/[$,\s]/g, ''));
     return Number.isFinite(n) ? n : 0;
@@ -376,7 +405,6 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
 
   // After this invoice (whether new or edited), what's the total invoiced?
   const balanceAfter = totalInvoicedExcludingThis + amountExGst;
-  const variance = totalWorkValue > 0 ? balanceAfter - totalWorkValue : 0;
   const willUpdateTotal = balanceAfter > totalWorkValue;
 
   const canSave = amountExGst > 0
@@ -387,16 +415,26 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
   async function handleSave() {
     if (!canSave) return;
     setSubmitting(true);
+    setSaveError(null);
 
     const noteParts: string[] = [];
     if (variation.trim()) noteParts.push(variation.trim());
     const noteValue = noteParts.length > 0 ? noteParts.join(' ') : undefined;
 
     if (isEdit) {
+      if (invoice.status === 'void') {
+        setSubmitting(false);
+        return;
+      }
       // Edit mode: update the existing invoice in place.
-      updateInvoice(invoice.id, {
+      const saved = await updateInvoice(invoice.id, {
         invoiceNumber: invoiceNumber.trim(),
         invoiceDate,
+        status: invoice.paid ? 'paid' : invoiceStatus,
+        dueDate,
+        sentAt: !invoice.paid && invoiceStatus === 'sent'
+          ? (invoice.sentAt ?? new Date().toISOString())
+          : (!invoice.paid ? '' : invoice.sentAt),
         kind,
         amountExGst,
         gstApplies: true,
@@ -404,6 +442,11 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
         amountInclGst: inclGst,
         notes: noteValue,
       });
+      if (!saved.ok) {
+        setSaveError(saved.error ?? 'Invoice changes were not saved.');
+        setSubmitting(false);
+        return;
+      }
 
       // If the job's invoice_amount was tracking the old total and the new
       // sum has changed, update it. We only bump it up; never auto-shrink
@@ -419,7 +462,12 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       //   was paid, now unticked → not built tonight; show a note
       const wasPaid = invoice.paid;
       if (!wasPaid && markPaid) {
-        markInvoicePaid(invoice.id, paidDate);
+        const paidResult = await markInvoicePaid(invoice.id, paidDate);
+        if (!paidResult.ok) {
+          setSaveError(paidResult.error ?? 'The invoice saved, but the payment did not.');
+          setSubmitting(false);
+          return;
+        }
         // Paid with zero hours on the job → prompt to backfill them so the
         // $/h maths can exist. Uses the form's CURRENT kind (deposits are
         // exempt — paid-before-work is their normal state).
@@ -427,9 +475,6 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
           setHoursPromptJobId(job.id);
         }
       }
-      // Note: paid → unpaid would need to delete the linked income entry too.
-      // Not handling it here; user can do via SQL if needed.
-
       setSubmitting(false);
       onClose();
       return;
@@ -443,6 +488,9 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       jobId: job.id,
       invoiceNumber: invoiceNumber.trim(),
       invoiceDate,
+      status: invoiceStatus,
+      dueDate,
+      sentAt: invoiceStatus === 'sent' ? new Date().toISOString() : undefined,
       kind,
       amountExGst,
       gstApplies: true,
@@ -462,10 +510,7 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
     const createdPromise = addInvoice(newInvoice);
 
     const newTotal = Math.max(totalWorkValue, balanceAfter);
-    updateJob(job.id, {
-      status: 'invoiced',
-      invoiceAmount: newTotal,
-    });
+    updateJob(job.id, { invoiceAmount: newTotal });
 
     // Keep the dropped invoice PDF on the job as a document (best-effort —
     // the invoice record itself is what drives the money; this is the file).
@@ -485,7 +530,12 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       // rolled back the optimistic row), so there's nothing to mark paid.
       const created = await createdPromise;
       if (created) {
-        markInvoicePaid(created.id, paidDate);
+        const paidResult = await markInvoicePaid(created.id, paidDate);
+        if (!paidResult.ok) {
+          setSaveError(paidResult.error ?? 'The invoice saved, but the payment did not.');
+          setSubmitting(false);
+          return;
+        }
         if (shouldPromptForHours({ jobId: job.id, kind }, entries)) {
           setHoursPromptJobId(job.id);
         }
@@ -493,6 +543,19 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
     }
 
     setSubmitting(false);
+    onClose();
+  }
+
+  async function handleVoid() {
+    if (!isEdit || invoice.paid || invoice.status === 'void') return;
+    setSubmitting(true);
+    setSaveError(null);
+    const result = await voidInvoice(invoice.id, voidReason);
+    setSubmitting(false);
+    if (!result.ok) {
+      setSaveError(result.error ?? 'Invoice was not voided.');
+      return;
+    }
     onClose();
   }
 
@@ -524,6 +587,7 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
         kind,
         invoiceNumber: invoiceNumber.trim(),
         invoiceDateISO: invoiceDate,
+        dueDateISO: dueDate,
         amountExGst, gst, inclGst,
         job, quote: jobQuote, balanceInclGst, depositPercent: depPct,
       });
@@ -550,8 +614,6 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       setPdfBusy(false);
     }
   }
-
-  const allInvoiced = totalInvoicedSoFar >= totalWorkValue && totalWorkValue > 0;
 
   return (
     <>
@@ -660,9 +722,9 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
                 Invoice type
               </label>
               <div className="flex gap-2">
-                <KindButton label="Deposit" value="deposit" current={kind} onClick={() => setKind('deposit')} disabled={hasDeposit} />
-                <KindButton label="Final"   value="final"   current={kind} onClick={() => setKind('final')} disabled={hasFinal} />
-                <KindButton label="Progress" value="progress" current={kind} onClick={() => setKind('progress')} />
+                <KindButton label="Deposit" value="deposit" current={kind} onClick={() => handleKindChange('deposit')} disabled={hasDeposit} />
+                <KindButton label="Final"   value="final"   current={kind} onClick={() => handleKindChange('final')} disabled={hasFinal} />
+                <KindButton label="Progress" value="progress" current={kind} onClick={() => handleKindChange('progress')} />
               </div>
               {hasDeposit && kind === 'deposit' && (
                 <p className="mt-1 text-[10px] text-amber-600">A deposit invoice already exists.</p>
@@ -671,6 +733,55 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
                 <p className="mt-1 text-[10px] text-amber-600">A final invoice already exists. Saving will create another.</p>
               )}
             </div>
+
+            {!invoice?.paid && invoice?.status !== 'void' && (
+              <div>
+                <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1.5 block">
+                  Invoice status
+                </label>
+                <div className="grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => setInvoiceStatus('draft')}
+                    className={cn(
+                      'h-11 rounded-lg border text-sm font-semibold',
+                      invoiceStatus === 'draft'
+                        ? 'border-slate-500 bg-slate-100 text-slate-800'
+                        : 'border-border bg-background text-muted-foreground',
+                    )}
+                  >
+                    Draft
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => setInvoiceStatus('sent')}
+                    className={cn(
+                      'h-11 rounded-lg border text-sm font-semibold',
+                      invoiceStatus === 'sent'
+                        ? 'border-blue-500 bg-blue-50 text-blue-800'
+                        : 'border-border bg-background text-muted-foreground',
+                    )}
+                  >
+                    Sent to client
+                  </button>
+                </div>
+                <p className="mt-1.5 text-[10px] text-muted-foreground">
+                  Drafts stay out of GST and money owing until you mark them sent.
+                </p>
+              </div>
+            )}
+
+            {invoice?.paid && (
+              <div className="rounded-xl border border-green-200 bg-green-50 p-3 text-sm font-medium text-green-800">
+                Paid {invoice.paidDate ? `on ${invoice.paidDate}` : ''}. Use “Correct payment” on the invoice row if this was a mistake.
+              </div>
+            )}
+
+            {invoice?.status === 'void' && (
+              <div className="rounded-xl border border-slate-200 bg-slate-50 p-3 text-sm text-slate-700">
+                This invoice is void and kept only for the audit trail{invoice.voidReason ? `: ${invoice.voidReason}` : '.'}
+              </div>
+            )}
 
             {/* Invoice number + date */}
             <div className="grid grid-cols-2 gap-3">
@@ -692,11 +803,25 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
                 <input
                   type="date"
                   value={invoiceDate}
-                  onChange={(e) => setInvoiceDate(e.target.value)}
+                  onChange={(e) => handleInvoiceDateChange(e.target.value)}
                   className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                 />
               </div>
             </div>
+
+            {!invoice?.paid && invoice?.status !== 'void' && invoiceStatus === 'sent' && (
+              <div>
+                <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1 block">
+                  Payment due
+                </label>
+                <input
+                  type="date"
+                  value={dueDate}
+                  onChange={(e) => setDueDate(e.target.value)}
+                  className="w-full h-11 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
+                />
+              </div>
+            )}
 
             {/* Amount */}
             <div>
@@ -751,17 +876,18 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
               </div>
             )}
 
-            {/* Mark paid */}
-            <label className="flex items-center gap-2.5 cursor-pointer p-3 rounded-xl border border-border bg-muted/30">
-              <input
-                type="checkbox"
-                checked={markPaid}
-                onChange={(e) => setMarkPaid(e.target.checked)}
-                className="h-4 w-4 accent-primary"
-              />
-              <span className="text-sm font-medium text-foreground flex-1">Mark as paid now</span>
-            </label>
-            {markPaid && (
+            {!invoice?.paid && invoice?.status !== 'void' && (
+              <label className="flex min-h-11 items-center gap-2.5 cursor-pointer p-3 rounded-xl border border-border bg-muted/30">
+                <input
+                  type="checkbox"
+                  checked={markPaid}
+                  onChange={(e) => setMarkPaid(e.target.checked)}
+                  className="h-5 w-5 accent-primary"
+                />
+                <span className="text-sm font-medium text-foreground flex-1">Payment has already arrived</span>
+              </label>
+            )}
+            {!invoice?.paid && invoice?.status !== 'void' && markPaid && (
               <div>
                 <label className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide mb-1 block">
                   Payment date
@@ -773,17 +899,47 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
                   className="w-full h-10 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring"
                 />
                 <p className="text-[10px] text-muted-foreground mt-1.5 italic">
-                  An income entry of {fmt(inclGst)} ({fmt(amountExGst)} ex GST) will be added on this date.
+                  The invoice and {fmt(inclGst)} income record are saved together.
                 </p>
+              </div>
+            )}
+
+            {isEdit && !invoice.paid && invoice.status !== 'void' && (
+              <div className="border-t border-border pt-3">
+                {!showVoidConfirm ? (
+                  <button
+                    type="button"
+                    onClick={() => setShowVoidConfirm(true)}
+                    className="min-h-11 w-full text-sm font-medium text-muted-foreground"
+                  >
+                    Void this invoice
+                  </button>
+                ) : (
+                  <div className="space-y-2 rounded-xl border border-amber-200 bg-amber-50 p-3">
+                    <p className="text-xs text-amber-900">Void invoices stay in the history but no longer count as billed or owing.</p>
+                    <input
+                      value={voidReason}
+                      onChange={(e) => setVoidReason(e.target.value)}
+                      placeholder="Reason, optional"
+                      className="h-11 w-full rounded-lg border border-amber-300 bg-white px-3 text-sm"
+                    />
+                    <div className="flex gap-2">
+                      <button type="button" onClick={() => setShowVoidConfirm(false)} className="h-11 flex-1 rounded-lg border border-amber-300 bg-white text-sm font-medium">Cancel</button>
+                      <button type="button" onClick={() => void handleVoid()} disabled={submitting} className="h-11 flex-1 rounded-lg bg-amber-700 text-sm font-semibold text-white disabled:opacity-60">
+                        {submitting ? 'Voiding…' : 'Confirm void'}
+                      </button>
+                    </div>
+                  </div>
+                )}
               </div>
             )}
           </div>
 
           {/* Footer */}
           <div className="shrink-0 px-4 py-3 border-t border-border bg-card flex flex-col gap-2">
-            {pdfError && (
+            {(pdfError || saveError) && (
               <p className="text-[11px] px-3 py-1.5 rounded-lg bg-red-50 text-red-700 border border-red-200">
-                {pdfError}
+                {pdfError ?? saveError}
               </p>
             )}
             <Button
@@ -797,13 +953,15 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
             </Button>
             <div className="flex gap-2">
               <Button variant="outline" className="flex-1" onClick={onClose} disabled={submitting}>
-                Cancel
+                {invoice?.status === 'void' ? 'Close' : 'Cancel'}
               </Button>
-              <Button className={cn('flex-1 bg-primary')} onClick={handleSave} disabled={!canSave}>
-                {isEdit
-                  ? (markPaid && !invoice.paid ? 'Save & mark paid' : 'Save changes')
-                  : (markPaid ? 'Save & mark paid' : 'Save invoice')}
-              </Button>
+              {invoice?.status !== 'void' && (
+                <Button className={cn('flex-1 bg-primary')} onClick={handleSave} disabled={!canSave}>
+                  {isEdit
+                    ? (markPaid && !invoice.paid ? 'Save & mark paid' : 'Save changes')
+                    : (markPaid ? 'Save & mark paid' : invoiceStatus === 'draft' ? 'Save draft' : 'Save invoice')}
+                </Button>
+              )}
             </div>
           </div>
         </div>

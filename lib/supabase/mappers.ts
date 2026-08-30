@@ -7,7 +7,7 @@ import type {
   JobImport, ImportConfidence, ImportStatus, ImportDecision,
   FolderFileCounts, ParsedQuote,
   JobStatus, EntryType, ExpenseCategory, ActivityType,
-  ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind,
+  ProductType, Finish, Unit, QuoteStatus, ScheduleItemType, InvoiceKind, InvoiceStatus,
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
@@ -698,6 +698,10 @@ export function rowToInvoice(r: Row): Invoice {
     jobId: r.job_id as string,
     invoiceNumber: r.invoice_number as string,
     invoiceDate: r.invoice_date as string,
+    status: (asString(r.status) as InvoiceStatus | undefined)
+      ?? (asBool(r.paid, false) ? 'paid' : 'sent'),
+    dueDate: asString(r.due_date),
+    sentAt: asString(r.sent_at),
     kind: (r.kind as InvoiceKind) ?? 'final',
     amountExGst: asNumber(r.amount_ex_gst) ?? 0,
     gstApplies: asBool(r.gst_applies, true),
@@ -707,6 +711,10 @@ export function rowToInvoice(r: Row): Invoice {
     paidDate: asString(r.paid_date),
     paidVia: asString(r.paid_via),
     incomeEntryId: asString(r.income_entry_id),
+    paymentEntryGenerated: asBool(r.payment_entry_generated, false),
+    statusBeforePaid: asString(r.status_before_paid) as Invoice['statusBeforePaid'],
+    voidedAt: asString(r.voided_at),
+    voidReason: asString(r.void_reason),
     notes: asString(r.notes),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
@@ -719,6 +727,9 @@ export function invoiceToRow(inv: Partial<Invoice>): Row {
   if (inv.jobId !== undefined)          out.job_id          = inv.jobId;
   if (inv.invoiceNumber !== undefined)  out.invoice_number  = inv.invoiceNumber;
   if (inv.invoiceDate !== undefined)    out.invoice_date    = inv.invoiceDate;
+  if (inv.status !== undefined)         out.status          = inv.status;
+  if (inv.dueDate !== undefined)        out.due_date        = inv.dueDate || null;
+  if (inv.sentAt !== undefined)         out.sent_at         = inv.sentAt || null;
   if (inv.kind !== undefined)           out.kind            = inv.kind;
   if (inv.amountExGst !== undefined)    out.amount_ex_gst   = inv.amountExGst;
   if (inv.gstApplies !== undefined)     out.gst_applies     = inv.gstApplies;
@@ -728,6 +739,10 @@ export function invoiceToRow(inv: Partial<Invoice>): Row {
   if (inv.paidDate !== undefined)       out.paid_date       = inv.paidDate || null;
   if (inv.paidVia !== undefined)        out.paid_via        = inv.paidVia || null;
   if (inv.incomeEntryId !== undefined)  out.income_entry_id = inv.incomeEntryId || null;
+  if (inv.paymentEntryGenerated !== undefined) out.payment_entry_generated = inv.paymentEntryGenerated;
+  if (inv.statusBeforePaid !== undefined) out.status_before_paid = inv.statusBeforePaid || null;
+  if (inv.voidedAt !== undefined)       out.voided_at       = inv.voidedAt || null;
+  if (inv.voidReason !== undefined)     out.void_reason     = inv.voidReason || null;
   if (inv.notes !== undefined)          out.notes           = inv.notes || null;
   return out;
 }

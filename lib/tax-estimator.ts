@@ -11,6 +11,7 @@
 // from the store instead.
 
 import type { Entry, Invoice, Setting } from './types';
+import { invoiceCountsAsIssued } from './invoice-lifecycle';
 
 // ── Tax-year helpers ─────────────────────────────────────────────────────────
 export interface TaxYear {
@@ -196,7 +197,8 @@ export function estimateInvoiceBasisGst(
 ): GstPeriodEstimate {
   const period = gstPeriodOf(date);
   let output = invoices
-    .filter((invoice) => inRange(invoice.invoiceDate, period.start, period.end))
+    .filter((invoice) => invoiceCountsAsIssued(invoice)
+      && inRange(invoice.invoiceDate, period.start, period.end))
     .reduce((sum, invoice) => sum + (invoice.gstComponent ?? (
       invoice.gstApplies ? invoice.amountExGst * NZ_GST_RATE : 0
     )), 0);

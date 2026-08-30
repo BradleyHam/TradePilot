@@ -276,6 +276,10 @@ create table if not exists invoices (
 
   invoice_number  text not null,
   invoice_date    date not null default current_date,
+  status          text not null default 'sent'
+                    check (status in ('draft','sent','paid','void')),
+  due_date        date,
+  sent_at         timestamptz,
 
   kind            text not null default 'final'
                     check (kind in ('deposit','progress','final')),
@@ -288,17 +292,22 @@ create table if not exists invoices (
   paid            boolean default false not null,
   paid_date       date,
   paid_via        text,
+  status_before_paid text check (status_before_paid in ('draft','sent')),
   -- Link to the auto-created income entry (or any existing entry the
   -- migration matched up). Nulled if the entry is later deleted; the
   -- invoice survives.
   income_entry_id uuid references entries(id) on delete set null,
+  payment_entry_generated boolean default false not null,
+  voided_at       timestamptz,
+  void_reason     text,
 
   notes           text,
   created_at      timestamptz default now() not null,
   updated_at      timestamptz default now() not null,
 
   -- Per-business unique invoice numbers
-  unique (business_id, invoice_number)
+  unique (business_id, invoice_number),
+  check ((status = 'paid' and paid) or (status <> 'paid' and not paid))
 );
 
 alter table invoices enable row level security;
@@ -311,6 +320,8 @@ create policy "Users can manage own invoices"
 create index invoices_job_id_idx on invoices(job_id);
 create index invoices_business_id_idx on invoices(business_id);
 create index invoices_paid_idx on invoices(paid);
+create index invoices_status_idx on invoices(status);
+create index invoices_due_date_idx on invoices(due_date);
 
 create trigger invoices_updated_at
   before update on invoices

@@ -1280,6 +1280,7 @@ export interface QuoteTemplate {
 }
 
 export type InvoiceKind = 'deposit' | 'progress' | 'final';
+export type InvoiceStatus = 'draft' | 'sent' | 'paid' | 'void';
 
 export interface Invoice {
   id: string;
@@ -1287,6 +1288,10 @@ export interface Invoice {
   jobId: string;
   invoiceNumber: string;
   invoiceDate: string;
+  /** Accounting lifecycle. `due` / `overdue` are derived from sent + dueDate. */
+  status: InvoiceStatus;
+  dueDate?: string;
+  sentAt?: string;
   kind: InvoiceKind;
   amountExGst: number;
   gstApplies: boolean;
@@ -1297,6 +1302,12 @@ export interface Invoice {
   paidVia?: string;
   /** When marked paid, an income entry is auto-created and linked here. */
   incomeEntryId?: string;
+  /** True only when TradePilot created the linked income entry for this payment. */
+  paymentEntryGenerated?: boolean;
+  /** Restores a draft correctly if a mistaken payment is undone. */
+  statusBeforePaid?: 'draft' | 'sent';
+  voidedAt?: string;
+  voidReason?: string;
   notes?: string;
   createdAt: string;
   updatedAt: string;

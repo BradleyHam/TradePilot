@@ -88,6 +88,8 @@ export function buildInvoicePdfData(opts: {
   invoiceNumber: string;
   /** ISO yyyy-mm-dd. */
   invoiceDateISO: string;
+  /** ISO yyyy-mm-dd. Same as invoice date means "On receipt". */
+  dueDateISO?: string;
   amountExGst: number;
   gst: number;
   inclGst: number;
@@ -97,7 +99,7 @@ export function buildInvoicePdfData(opts: {
   balanceInclGst: number;
   depositPercent: number;
 }): InvoicePdfData {
-  const { kind, invoiceNumber, invoiceDateISO, amountExGst, gst, inclGst, job, quote, balanceInclGst, depositPercent } = opts;
+  const { kind, invoiceNumber, invoiceDateISO, dueDateISO, amountExGst, gst, inclGst, job, quote, balanceInclGst, depositPercent } = opts;
 
   const quoteRef = quote?.legacyId ?? undefined;
   const quoteDateDisplay = fmtDateNZ(quote?.dateSent);
@@ -130,7 +132,9 @@ export function buildInvoicePdfData(opts: {
   return {
     invoiceNumber,
     invoiceDateDisplay: fmtDateNZ(invoiceDateISO) ?? invoiceDateISO,
-    dueText: 'On receipt',
+    dueText: !dueDateISO || dueDateISO === invoiceDateISO
+      ? 'On receipt'
+      : (fmtDateNZ(dueDateISO) ?? dueDateISO),
     lineTitle,
     description,
     notes,
