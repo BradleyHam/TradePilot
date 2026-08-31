@@ -10,10 +10,11 @@ import { useEffect, useMemo, useState } from 'react';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { cn } from '@/lib/utils';
-import type { ShiftReport } from '@/lib/types';
+import type { Job, JobVariation, ShiftPhoto, ShiftReport } from '@/lib/types';
+import { VariationAction } from '@/components/jobs/variation-action';
 import {
   AlertTriangle, Camera, Check, ChevronDown, ClipboardCheck,
-  Clock, Sparkles, Star, Users,
+  Clock, Copy, DollarSign, Sparkles, Star, Users,
 } from 'lucide-react';
 
 function localIso(date: Date): string {
@@ -42,9 +43,15 @@ const STATUS_COPY = {
 
 export function TeamUpdatesCard() {
   const {
-    shiftReports, shiftPhotos, entries, jobs, teamMembers, updateShiftPhoto,
+    shiftReports, shiftPhotos, entries, jobs, teamMembers, jobVariations, updateShiftPhoto,
   } = useStore();
   const [open, setOpen] = useState(false);
+  const [variationTarget, setVariationTarget] = useState<{
+    report: ShiftReport;
+    job: Job;
+    photos: ShiftPhoto[];
+  } | null>(null);
+  const [copiedVariationId, setCopiedVariationId] = useState<string | null>(null);
 
   const recent = useMemo(() => {
     const cutoff = new Date();
@@ -121,36 +128,64 @@ export function TeamUpdatesCard() {
 
         {visible.length > 0 && (
           <div className="space-y-2 border-t border-border bg-muted/25 p-2">
-            {visible.map((report) => (
-              <TeamUpdateRow
-                key={report.id}
-                report={report}
-                person={firstName(report.uploadedBy)}
-                jobName={jobs.find((job) => job.id === report.jobId)?.name ?? 'Job'}
-                hours={entries
-                  .filter((entry) => entry.type === 'hours'
-                    && entry.loggedByUserId === report.uploadedBy
-                    && entry.jobId === report.jobId
-                    && entry.entryDate === report.workDate)
-                  .reduce((sum, entry) => sum + (entry.hours ?? 0), 0)}
-                photos={shiftPhotos
-                  .filter((photo) => photo.uploadedBy === report.uploadedBy
-                    && photo.jobId === report.jobId
-                    && photo.takenOn === report.workDate)
-                  .slice(0, 6)}
-                urls={urls}
-                onToggleMarketing={(id, current) => updateShiftPhoto(id, { marketingCandidate: !current })}
-              />
-            ))}
+            {visible.map((report) => {
+              const reportJob = jobs.find((job) => job.id === report.jobId);
+              const reportPhotos = shiftPhotos
+                .filter((photo) => photo.uploadedBy === report.uploadedBy
+                  && photo.jobId === report.jobId
+                  && photo.takenOn === report.workDate)
+                .slice(0, 6);
+              const variation = jobVariations.find((item) => item.shiftReportId === report.id);
+              return (
+                <TeamUpdateRow
+                  key={report.id}
+                  report={report}
+                  person={firstName(report.uploadedBy)}
+                  jobName={reportJob?.name ?? 'Job'}
+                  hours={entries
+                    .filter((entry) => entry.type === 'hours'
+                      && entry.loggedByUserId === report.uploadedBy
+                      && entry.jobId === report.jobId
+                      && entry.entryDate === report.workDate)
+                    .reduce((sum, entry) => sum + (entry.hours ?? 0), 0)}
+                  photos={reportPhotos}
+                  urls={urls}
+                  variation={variation}
+                  copied={variation?.id === copiedVariationId}
+                  onCreateVariation={reportJob ? () => setVariationTarget({ report, job: reportJob, photos: reportPhotos }) : undefined}
+                  onCopyVariation={variation ? async () => {
+                    try {
+                      await navigator.clipboard.writeText(`${window.location.origin}/variation/${variation.approvalToken}`);
+                      setCopiedVariationId(variation.id);
+                    } catch {
+                      setCopiedVariationId(null);
+                    }
+                  } : undefined}
+                  onToggleMarketing={(id, current) => updateShiftPhoto(id, { marketingCandidate: !current })}
+                />
+              );
+            })}
           </div>
         )}
       </div>
+
+      {variationTarget && (
+        <VariationAction
+          key={variationTarget.report.id}
+          job={variationTarget.job}
+          shiftReport={variationTarget.report}
+          photos={variationTarget.photos}
+          open
+          onClose={() => setVariationTarget(null)}
+        />
+      )}
     </section>
   );
 }
 
 function TeamUpdateRow({
-  report, person, jobName, hours, photos, urls, onToggleMarketing,
+  report, person, jobName, hours, photos, urls, variation, copied,
+  onCreateVariation, onCopyVariation, onToggleMarketing,
 }: {
   report: ShiftReport;
   person: string;
@@ -158,6 +193,10 @@ function TeamUpdateRow({
   hours: number;
   photos: ReturnType<typeof useStore>['shiftPhotos'];
   urls: Record<string, string>;
+  variation?: JobVariation;
+  copied: boolean;
+  onCreateVariation?: () => void;
+  onCopyVariation?: () => void;
   onToggleMarketing: (id: string, current: boolean) => void;
 }) {
   const status = STATUS_COPY[report.status];
@@ -218,6 +257,42 @@ function TeamUpdateRow({
       )}
       {photos.length > 0 && (
         <p className="mt-1.5 text-[11px] text-muted-foreground">Tap a star to keep a photo for marketing. Nothing is published automatically.</p>
+      )}
+
+      {report.status === 'needs_attention' && !variation && onCreateVariation && (
+        <button
+          type="button"
+          onClick={onCreateVariation}
+          className="mt-3 flex min-h-11 w-full items-center justify-center gap-2 rounded-xl bg-primary px-3 text-sm font-semibold text-primary-foreground"
+        >
+          <DollarSign size={17} /> Turn into a variation
+        </button>
+      )}
+
+      {variation && variation.status !== 'cancelled' && (
+        <div className={cn(
+          'mt-3 flex min-h-11 items-center gap-2 rounded-xl border px-3 py-2',
+          variation.status === 'approved'
+            ? 'border-green-200 bg-green-50 text-green-900'
+            : variation.status === 'declined'
+              ? 'border-red-200 bg-red-50 text-red-900'
+              : 'border-blue-200 bg-blue-50 text-blue-900',
+        )}>
+          <DollarSign size={16} className="shrink-0" />
+          <span className="min-w-0 flex-1 text-xs font-semibold">
+            {variation.status === 'approved'
+              ? 'Variation approved'
+              : variation.status === 'declined'
+                ? 'Variation declined'
+                : 'Variation ready for client'}
+          </span>
+          {variation.status === 'ready' && onCopyVariation && (
+            <button type="button" onClick={onCopyVariation} className="flex min-h-9 shrink-0 items-center gap-1 rounded-lg bg-white px-2 text-xs font-semibold shadow-sm">
+              {copied ? <Check size={14} /> : <Copy size={14} />}
+              {copied ? 'Copied' : 'Copy link'}
+            </button>
+          )}
+        </div>
       )}
     </article>
   );

@@ -11,7 +11,7 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
-  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, ShiftReport, PayRun,
+  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, ShiftReport, JobVariation, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from '../types';
@@ -613,6 +613,24 @@ export function rowToShiftReport(r: Row): ShiftReport {
     workDate: r.work_date as string,
     status: (asString(r.status) as ShiftReport['status'] | undefined) ?? 'all_good',
     note: asString(r.note),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function rowToJobVariation(r: Row): JobVariation {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    shiftReportId: asString(r.shift_report_id),
+    title: r.title as string,
+    description: asString(r.description),
+    amountExGst: asNumber(r.amount_ex_gst) ?? 0,
+    status: (asString(r.status) as JobVariation['status'] | undefined) ?? 'draft',
+    approvalToken: r.approval_token as string,
+    photoIds: Array.isArray(r.photo_ids) ? (r.photo_ids as string[]) : [],
+    respondedAt: asString(r.responded_at),
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };

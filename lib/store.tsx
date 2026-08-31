@@ -9,7 +9,7 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
-  rowToBusinessMember, rowToShiftPhoto, rowToShiftReport, rowToJobContact,
+  rowToBusinessMember, rowToShiftPhoto, rowToShiftReport, rowToJobVariation, rowToJobContact,
   rowToPayRun, payRunToRow,
   rowToJobAssignment, rowToScheduleAssignment,
 } from './supabase/mappers';
@@ -18,7 +18,7 @@ import type {
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
-  BusinessMember, MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, PayRun,
+  BusinessMember, MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, JobVariation, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from './types';
@@ -266,6 +266,16 @@ interface StoreState {
     status: ShiftReportStatus;
     note?: string;
   }) => Promise<ShiftReport | null>;
+  /** Owner-only priced extra work and its client approval state. */
+  jobVariations: JobVariation[];
+  addJobVariation: (input: {
+    jobId: string;
+    shiftReportId?: string;
+    title: string;
+    description?: string;
+    amountExGst: number;
+    photoIds?: string[];
+  }) => Promise<JobVariation | null>;
   /**
    * Every contact with a customer, both directions, newest first
    * (migration 042). Owner-only, so empty for employees.
@@ -694,6 +704,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [quoteAttachments, setQuoteAttachments] = useState<QuoteAttachment[]>([]);
   const [shiftPhotos, setShiftPhotos] = useState<ShiftPhoto[]>([]);
   const [shiftReports, setShiftReports] = useState<ShiftReport[]>([]);
+  const [jobVariations, setJobVariations] = useState<JobVariation[]>([]);
   const [jobContacts, setJobContacts] = useState<JobContact[]>([]);
   const [teamMembers, setTeamMembers] = useState<BusinessMember[]>([]);
   const [jobAssignments, setJobAssignments] = useState<JobAssignment[]>([]);
@@ -741,7 +752,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setJobs([]); setEntries([]); setScheduleItems([]);
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
         setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
-        setPaintStock([]); setShiftPhotos([]); setShiftReports([]);
+        setPaintStock([]); setShiftPhotos([]); setShiftReports([]); setJobVariations([]);
         setLoading(false);
         return;
       }
@@ -798,7 +809,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // the missing money columns (they map to undefined). Owners read the
       // full base table as before.
       const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
-      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, tm, pr, ja, sa, jc] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, jv, tm, pr, ja, sa, jc] = await Promise.all([
         supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -829,6 +840,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         supabase.from('shift_reports').select('*').eq('business_id', bizId)
           .order('work_date', { ascending: false })
           .order('updated_at', { ascending: false }),
+        // Priced variations are owner-only. Employee RLS returns an empty
+        // list, preserving the existing money-blind staff experience.
+        supabase.from('job_variations').select('*').eq('business_id', bizId)
+          .order('created_at', { ascending: false }),
         // Team members — owner reads all rows (RLS); employees only their
         // own. Drives payroll flags + Settings → Team.
         supabase.from('business_members').select('*').eq('business_id', bizId)
@@ -899,6 +914,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setShiftPhotos((sp.data ?? []).map(rowToShiftPhoto));
       if (sr.error) console.warn('[store] shift_reports load failed (migration 050 applied?):', sr.error.message);
       setShiftReports((sr.data ?? []).map(rowToShiftReport));
+      if (jv.error) console.warn('[store] job_variations load failed (migration 051 applied?):', jv.error.message);
+      setJobVariations((jv.data ?? []).map(rowToJobVariation));
       setTeamMembers((tm.data ?? []).map(rowToBusinessMember));
       if (pr.error) console.warn('[store] pay_runs load failed (migration 032 applied?):', pr.error.message);
       setPayRuns((pr.data ?? []).map(rowToPayRun));
@@ -3045,6 +3062,65 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   }, [businessId, membership, shiftReports]);
 
   /**
+   * Create a reviewed variation and its public approval token. The client
+   * link is never sent here — callers explicitly copy/share it after the
+   * persisted row comes back.
+   */
+  const addJobVariation = useCallback(async (input: {
+    jobId: string;
+    shiftReportId?: string;
+    title: string;
+    description?: string;
+    amountExGst: number;
+    photoIds?: string[];
+  }): Promise<JobVariation | null> => {
+    if (!businessId) return null;
+    const now = new Date().toISOString();
+    const tempId = `variation_${crypto.randomUUID()}`;
+    const optimistic: JobVariation = {
+      id: tempId,
+      businessId,
+      jobId: input.jobId,
+      shiftReportId: input.shiftReportId,
+      title: input.title.trim(),
+      description: input.description?.trim() || undefined,
+      amountExGst: input.amountExGst,
+      status: 'ready',
+      approvalToken: crypto.randomUUID(),
+      photoIds: input.photoIds ?? [],
+      createdAt: now,
+      updatedAt: now,
+    };
+    setJobVariations((list) => [optimistic, ...list]);
+
+    const { data, error: insertErr } = await supabase
+      .from('job_variations')
+      .insert({
+        business_id: businessId,
+        job_id: input.jobId,
+        shift_report_id: input.shiftReportId ?? null,
+        title: optimistic.title,
+        description: optimistic.description ?? null,
+        amount_ex_gst: optimistic.amountExGst,
+        status: 'ready',
+        approval_token: optimistic.approvalToken,
+        photo_ids: optimistic.photoIds,
+      })
+      .select('*')
+      .single();
+
+    if (insertErr || !data) {
+      console.error('[addJobVariation] failed:', describeError(insertErr));
+      setError(insertErr?.message ?? 'Could not create that variation.');
+      setJobVariations((list) => list.filter((variation) => variation.id !== tempId));
+      return null;
+    }
+    const persisted = rowToJobVariation(data);
+    setJobVariations((list) => [persisted, ...list.filter((variation) => variation.id !== tempId && variation.id !== persisted.id)]);
+    return persisted;
+  }, [businessId]);
+
+  /**
    * Set (or clear) a job's cover photo. See the interface docs above for
    * why quote-attachments images get copied rather than referenced: that
    * bucket is owner-only and holds priced PDFs, so handing employees a
@@ -4166,6 +4242,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         addEntry, updateEntry, deleteEntry, markLabourBilled, logMyHours,
         shiftPhotos, uploadShiftPhotos, updateShiftPhoto, deleteShiftPhoto, setJobCoverPhoto,
         shiftReports, saveShiftReport,
+        jobVariations, addJobVariation,
         jobContacts, logContact,
         jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,

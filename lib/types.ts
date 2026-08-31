@@ -289,6 +289,34 @@ export interface ShiftReport {
   updatedAt: string;
 }
 
+export type JobVariationStatus = 'draft' | 'ready' | 'approved' | 'declined' | 'cancelled';
+
+/**
+ * Extra work discovered after the job price was agreed (migration 051).
+ *
+ * The client-facing approval page is reached through `approvalToken`; the
+ * normal UUID remains the owner-side identifier. Money is always stored
+ * ex-GST, matching Job.quoteAmount and the rest of the job maths.
+ */
+export interface JobVariation {
+  id: string;
+  businessId: string;
+  jobId: string;
+  /** Optional employee close-out that first raised the issue. */
+  shiftReportId?: string;
+  title: string;
+  description?: string;
+  amountExGst: number;
+  status: JobVariationStatus;
+  /** Unguessable bearer token used only by the public approval link. */
+  approvalToken: string;
+  /** shift_photos ids selected as client-visible evidence. */
+  photoIds: string[];
+  respondedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
 /**
  * One wage payment to an employee for one pay period (fortnightly for
  * Suzie). Rows are created only when the period is marked PAID — pending

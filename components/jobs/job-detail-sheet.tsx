@@ -29,6 +29,7 @@ import { payrollConfig } from '@/lib/payroll';
 import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
 import { ShiftPhotosPanel } from './shift-photos-panel';
+import { JobVariationsPanel } from './job-variations-panel';
 import { JobTeamPanel } from './job-team-panel';
 import { ContactTimeline } from './contact-timeline';
 import { JobScopePanel } from './job-scope-panel';
@@ -1151,6 +1152,10 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
 
           {/* Site photos logged by staff on their shifts. */}
           <ShiftPhotosPanel jobId={liveJob.id} />
+
+          {/* Extra work that needs a separate client yes before it changes
+              the agreed price. Owner-only inside the panel. */}
+          <JobVariationsPanel job={liveJob} />
 
           <JobMaterialsList jobId={liveJob.id} materials={materials} entries={entries} />
 
