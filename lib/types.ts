@@ -265,7 +265,28 @@ export interface ShiftPhoto {
   /** Object path inside the `shift-photos` bucket (NOT a URL — signed on demand). */
   storagePath: string;
   caption?: string;
+  /** Owner-only shortlist flag. Never means published. */
+  marketingCandidate: boolean;
   createdAt: string;
+}
+
+export type ShiftReportStatus = 'all_good' | 'needs_attention' | 'ready_for_review';
+
+/**
+ * End-of-day operational handoff from a staff member to the owner.
+ * Hours and photos deliberately remain in their canonical tables; this
+ * record only carries the signal and note that tie the day together.
+ */
+export interface ShiftReport {
+  id: string;
+  businessId: string;
+  jobId: string;
+  uploadedBy: string;
+  workDate: string;
+  status: ShiftReportStatus;
+  note?: string;
+  createdAt: string;
+  updatedAt: string;
 }
 
 /**

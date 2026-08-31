@@ -11,7 +11,7 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
-  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, PayRun,
+  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, ShiftReport, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from '../types';
@@ -599,7 +599,22 @@ export function rowToShiftPhoto(r: Row): ShiftPhoto {
     takenOn: r.taken_on as string,
     storagePath: r.storage_path as string,
     caption: asString(r.caption),
+    marketingCandidate: asBool(r.marketing_candidate),
     createdAt: r.created_at as string,
+  };
+}
+
+export function rowToShiftReport(r: Row): ShiftReport {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    uploadedBy: r.uploaded_by as string,
+    workDate: r.work_date as string,
+    status: (asString(r.status) as ShiftReport['status'] | undefined) ?? 'all_good',
+    note: asString(r.note),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
   };
 }
 

@@ -31,6 +31,7 @@ import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { BillItemsAttacher } from '@/components/bills/bill-items-attacher';
 import { BillDetailSheet } from '@/components/bills/bill-detail-sheet';
 import { PayrollFlags } from '@/components/payroll/payroll-flags';
+import { TeamUpdatesCard } from '@/components/team/team-updates-card';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { InvoiceAction } from '@/components/jobs/invoice-action';
 import { BookJobDatesSheet } from '@/components/jobs/booked-dates';
@@ -591,6 +592,10 @@ export default function HomePage() {
             }
           }}
         />
+
+        {/* Staff close-outs: quiet when all is well, but any "Brad needs to
+            check" report is expanded directly under the summary. */}
+        <TeamUpdatesCard />
 
         {attentionCount > 0 ? (
           <section>

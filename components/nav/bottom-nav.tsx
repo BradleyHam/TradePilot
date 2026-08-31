@@ -30,7 +30,7 @@ const NAV_ITEMS: NavItem[] = [
 // check their schedule. Everything financial is absent (and RLS-blocked
 // even if the URL were typed in directly).
 const EMPLOYEE_NAV_ITEMS: NavItem[] = [
-  { href: '/my/hours', label: 'Hours', icon: Clock },
+  { href: '/my/hours', label: 'My day', icon: Clock },
   { href: '/my/schedule', label: 'Schedule', icon: CalendarDays },
 ];
 

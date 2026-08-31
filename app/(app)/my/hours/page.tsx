@@ -1,6 +1,6 @@
 'use client';
 
-import { useEffect, useMemo, useState } from 'react';
+import { useMemo, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
 import { useStore } from '@/lib/store';
@@ -10,10 +10,10 @@ import { ScopeLists } from '@/components/jobs/job-scope-panel';
 import { JobPhoto } from '@/components/shared/job-photo';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
-import type { ActivityType, JobStatus } from '@/lib/types';
+import type { ActivityType, JobStatus, ShiftReportStatus } from '@/lib/types';
 import {
   Clock, LogOut, Check, Trash2, Navigation, CalendarDays, ChevronRight,
-  Camera, X, ClipboardList, ChevronDown, ChevronUp,
+  Camera, X, ClipboardList, ChevronDown, ChevronUp, AlertTriangle, ClipboardCheck,
 } from 'lucide-react';
 
 // Statuses an employee can log time against.
@@ -67,7 +67,10 @@ function mapsHref(location: string) {
 
 export default function MyHoursPage() {
   const router = useRouter();
-  const { jobs, entries, scheduleItems, membership, logMyHours, deleteEntry, shiftPhotos, uploadShiftPhotos } = useStore();
+  const {
+    jobs, entries, scheduleItems, membership, logMyHours, deleteEntry,
+    shiftPhotos, uploadShiftPhotos, shiftReports, saveShiftReport,
+  } = useStore();
 
   const [jobId, setJobId] = useState<string>('');
   const [hours, setHours] = useState<string>('');
@@ -82,11 +85,18 @@ export default function MyHoursPage() {
   const [activities, setActivities] = useState<ActivityType[]>([]);
   /** activity → hours string, only used when 2+ activities are selected. */
   const [activitySplit, setActivitySplit] = useState<Partial<Record<ActivityType, string>>>({});
-  const [note, setNote] = useState('');
+  // Drafts are keyed by job + date. That means switching between Today and
+  // Yesterday never leaks one day's note into another, and an existing
+  // report can hydrate directly without a set-state effect.
+  const [reportDrafts, setReportDrafts] = useState<Record<string, {
+    status: ShiftReportStatus;
+    note: string;
+  }>>({});
   const [date, setDate] = useState(todayIso());
   const [photos, setPhotos] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
   const [justSaved, setJustSaved] = useState(false);
+  const [saveError, setSaveError] = useState<string | null>(null);
   /** Is the collapsible "what's included" block open? Closed by default. */
   const [showDetail, setShowDetail] = useState(false);
 
@@ -118,9 +128,24 @@ export default function MyHoursPage() {
   const selectedId = jobId || suggestedJobId;
   const selectedJob = jobs.find((j) => j.id === selectedId);
 
-  // Picking a different job starts collapsed again — selecting a job
-  // should never dump a wall of scope on you, which was the complaint.
-  useEffect(() => { setShowDetail(false); }, [selectedId]);
+  const existingReport = useMemo(() => shiftReports.find((report) =>
+    report.jobId === selectedId
+    && report.workDate === date
+    && (!myUid || report.uploadedBy === myUid),
+  ), [shiftReports, selectedId, date, myUid]);
+  const reportKey = `${selectedId || 'offsite'}::${date}`;
+  const reportDraft = reportDrafts[reportKey];
+  const reportStatus = reportDraft?.status ?? existingReport?.status ?? 'all_good';
+  const note = reportDraft?.note ?? existingReport?.note ?? '';
+  function setReportStatus(status: ShiftReportStatus) {
+    setReportDrafts((drafts) => ({ ...drafts, [reportKey]: { status, note } }));
+  }
+  function setNote(nextNote: string) {
+    setReportDrafts((drafts) => ({
+      ...drafts,
+      [reportKey]: { status: reportStatus, note: nextNote },
+    }));
+  }
 
   // Is there anything behind the "What's included?" toggle worth opening?
   const hasDetail = !!selectedJob && (
@@ -171,9 +196,16 @@ export default function MyHoursPage() {
       .sort((a, b) => b.createdAt.localeCompare(a.createdAt)),
     [entries, date, myUid]);
   const totalToday = todaysLogged.reduce((sum, e) => sum + (e.hours ?? 0), 0);
+  const selectedHoursAlreadyLogged = todaysLogged
+    .filter((entry) => entry.jobId === selectedId)
+    .reduce((sum, entry) => sum + (entry.hours ?? 0), 0);
 
   // Photos already uploaded for this job + day (confirmation count).
-  const uploadedTodayCount = shiftPhotos.filter((p) => p.jobId === selectedId && p.takenOn === date).length;
+  const uploadedTodayCount = shiftPhotos.filter((p) =>
+    p.jobId === selectedId
+    && p.takenOn === date
+    && (!myUid || p.uploadedBy === myUid),
+  ).length;
 
   // ── Activity selection + the multi-activity split ──────────────────────
   const multi = activities.length > 1;
@@ -219,7 +251,14 @@ export default function MyHoursPage() {
   // Allow a cent of float slop so 8/3 splits don't block the save button.
   const splitBalances = !multi || Math.abs(allocated - totalHours) < 0.01;
 
-  const canSave = (!jobRequired || !!selectedId) && totalHours > 0 && splitBalances && !busy;
+  const reportChanged = !!selectedJob && (
+    !existingReport
+    || reportStatus !== existingReport.status
+    || note.trim() !== (existingReport?.note ?? '')
+  );
+  const hasSomethingToSave = totalHours > 0
+    || (!!selectedJob && selectedHoursAlreadyLogged > 0 && (photos.length > 0 || reportChanged));
+  const canSave = (!jobRequired || !!selectedId) && hasSomethingToSave && splitBalances && !busy;
 
   function onPickPhotos(e: React.ChangeEvent<HTMLInputElement>) {
     const picked = Array.from(e.target.files ?? []);
@@ -232,6 +271,8 @@ export default function MyHoursPage() {
 
   async function handleSave() {
     if (!canSave) return;
+    setBusy(true);
+    setSaveError(null);
     const theJob = selectedId;
     const theDate = date;
     const toUpload = photos;
@@ -244,7 +285,7 @@ export default function MyHoursPage() {
     const jobFor = (a?: ActivityType) =>
       a && OFFSITE.includes(a) ? undefined : (theJob || undefined);
 
-    if (multi) {
+    if (totalHours > 0 && multi) {
       for (const a of activities) {
         const h = parseFloat(activitySplit[a] ?? '') || 0;
         if (h <= 0) continue;
@@ -256,7 +297,7 @@ export default function MyHoursPage() {
           entryDate: theDate,
         });
       }
-    } else {
+    } else if (totalHours > 0) {
       logMyHours({
         jobId: jobFor(activities[0]),
         hours: totalHours,
@@ -265,13 +306,38 @@ export default function MyHoursPage() {
         entryDate: theDate,
       });
     }
-    setHours(''); setActivities([]); setActivitySplit({}); setNote(''); setPhotos([]);
+    setHours(''); setActivities([]); setActivitySplit({}); setPhotos([]);
     // Photos hang off a job, so there's nothing to attach on an
     // office-only day.
+    let failedPhotos = 0;
+    let failedPhotoFiles: File[] = [];
     if (toUpload.length > 0 && theJob) {
-      setBusy(true);
-      await uploadShiftPhotos({ jobId: theJob, takenOn: theDate, files: toUpload });
-      setBusy(false);
+      const uploadResult = await uploadShiftPhotos({ jobId: theJob, takenOn: theDate, files: toUpload });
+      failedPhotos = uploadResult.failed;
+      failedPhotoFiles = uploadResult.failedFiles;
+    }
+    // A report is the operational handoff only. It never changes the job
+    // status or creates an invoice — "ready" means ready for Brad to review.
+    let reportSaved = true;
+    if (theJob) {
+      const savedReport = await saveShiftReport({
+        jobId: theJob,
+        workDate: theDate,
+        status: reportStatus,
+        note: note.trim() || undefined,
+      });
+      reportSaved = savedReport !== null;
+    }
+    setBusy(false);
+    if (!reportSaved || failedPhotos > 0) {
+      if (failedPhotoFiles.length > 0) setPhotos(failedPhotoFiles);
+      setSaveError([
+        'Your hours were saved.',
+        !reportSaved ? 'The team update did not save.' : '',
+        failedPhotos > 0 ? `${failedPhotos} photo${failedPhotos === 1 ? '' : 's'} did not upload.` : '',
+        failedPhotos > 0 ? 'The failed photos are still here so you can try again.' : 'Tap Update my day to try again.',
+      ].filter(Boolean).join(' '));
+      return;
     }
     setJustSaved(true);
     setTimeout(() => setJustSaved(false), 2000);
@@ -290,7 +356,8 @@ export default function MyHoursPage() {
           <p className="text-xs font-medium text-muted-foreground uppercase tracking-wide">
             {firstName ? `Hi ${firstName}` : 'Welcome'}
           </p>
-          <h1 className="text-2xl font-bold">{prettyDate(todayIso())}</h1>
+          <h1 className="text-2xl font-bold">Finish your day</h1>
+          <p className="text-sm text-muted-foreground">{prettyDate(date)}</p>
         </div>
         <Button variant="outline" size="sm" onClick={handleSignOut}>
           <LogOut size={15} /> Sign out
@@ -399,7 +466,7 @@ export default function MyHoursPage() {
               // you're logging the same job across several days — the
               // whole point of switching to Yesterday. If nothing was
               // explicitly picked, the day's suggestion still applies.
-              onClick={() => setDate(d)}
+              onClick={() => { setDate(d); setShowDetail(false); }}
               className={cn(
                 'flex-1 min-h-[44px] rounded-xl border text-sm font-medium transition-colors',
                 date === d ? 'bg-primary text-primary-foreground border-primary' : 'bg-card border-border text-muted-foreground',
@@ -418,7 +485,10 @@ export default function MyHoursPage() {
             max={todayIso()}
             onChange={(e) => {
               // Same as the chips: keep whatever job was picked.
-              if (e.target.value) setDate(e.target.value);
+              if (e.target.value) {
+                setDate(e.target.value);
+                setShowDetail(false);
+              }
             }}
             className="w-full min-h-[44px] rounded-xl border border-border bg-card px-3 text-sm outline-none focus:border-primary"
           />
@@ -440,7 +510,7 @@ export default function MyHoursPage() {
               return (
                 <button
                   key={j.id}
-                  onClick={() => setJobId(j.id)}
+                  onClick={() => { setJobId(j.id); setShowDetail(false); }}
                   className={cn(
                     'w-full text-left rounded-xl border p-2.5 min-h-[44px] transition-colors flex items-center gap-3',
                     selectedId === j.id ? 'bg-primary/10 border-primary' : 'bg-card border-border',
@@ -585,20 +655,6 @@ export default function MyHoursPage() {
         )}
       </div>
 
-      {/* Note */}
-      <div>
-        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-          Note <span className="normal-case text-[10px]">(optional)</span>
-        </label>
-        <textarea
-          value={note}
-          onChange={(e) => setNote(e.target.value)}
-          placeholder="e.g. masked and sanded the west wall"
-          rows={2}
-          className="w-full rounded-xl border border-border bg-card px-3 py-2 text-sm outline-none focus:border-primary resize-none"
-        />
-      </div>
-
       {/* Photos */}
       <div>
         <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
@@ -625,9 +681,71 @@ export default function MyHoursPage() {
           </label>
         </div>
         <p className="text-[11px] text-muted-foreground mt-1">
-          Snap the work you did — Brad sees these on the job.
+          Snap what changed today. These stay private until Brad chooses one for marketing.
           {uploadedTodayCount > 0 && ` · ${uploadedTodayCount} already added.`}
         </p>
+      </div>
+
+      {/* End-of-day signal — deliberately separate from job status. Staff can
+          surface an issue or say the work looks ready, but only Brad closes
+          the job and triggers invoicing. */}
+      {!offsiteOnly && selectedJob && (
+        <div>
+          <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+            Update for Brad
+          </label>
+          <div className="space-y-2">
+            <button
+              type="button"
+              onClick={() => setReportStatus('all_good')}
+              className={cn(
+                'w-full min-h-[48px] rounded-xl border px-3 flex items-center gap-3 text-left transition-colors',
+                reportStatus === 'all_good' ? 'border-green-500 bg-green-50 text-green-900' : 'border-border bg-card',
+              )}
+            >
+              <Check size={18} className="shrink-0" />
+              <span><span className="font-semibold block">All good</span><span className="text-xs opacity-75">Work went as expected</span></span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setReportStatus('needs_attention')}
+              className={cn(
+                'w-full min-h-[48px] rounded-xl border px-3 flex items-center gap-3 text-left transition-colors',
+                reportStatus === 'needs_attention' ? 'border-amber-500 bg-amber-50 text-amber-950' : 'border-border bg-card',
+              )}
+            >
+              <AlertTriangle size={18} className="shrink-0" />
+              <span><span className="font-semibold block">Brad needs to check something</span><span className="text-xs opacity-75">Problem, change or extra work</span></span>
+            </button>
+            <button
+              type="button"
+              onClick={() => setReportStatus('ready_for_review')}
+              className={cn(
+                'w-full min-h-[48px] rounded-xl border px-3 flex items-center gap-3 text-left transition-colors',
+                reportStatus === 'ready_for_review' ? 'border-primary bg-primary/10 text-primary' : 'border-border bg-card',
+              )}
+            >
+              <ClipboardCheck size={18} className="shrink-0" />
+              <span><span className="font-semibold block">Ready for your review</span><span className="text-xs opacity-75">Brad confirms before the job is closed</span></span>
+            </button>
+          </div>
+        </div>
+      )}
+
+      {/* One useful sentence beats a daily report form. */}
+      <div>
+        <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
+          Quick note <span className="normal-case text-[10px]">(optional)</span>
+        </label>
+        <textarea
+          value={note}
+          onChange={(e) => setNote(e.target.value)}
+          placeholder={reportStatus === 'needs_attention'
+            ? 'What should Brad check?'
+            : 'What did you get done today?'}
+          rows={2}
+          className="w-full rounded-xl border border-border bg-card px-3 py-2 text-sm outline-none focus:border-primary resize-none"
+        />
       </div>
 
       {/* Today's logged list */}
@@ -670,11 +788,17 @@ export default function MyHoursPage() {
         </Link>
       )}
 
+      {saveError && (
+        <div role="alert" className="rounded-xl border border-red-200 bg-red-50 px-3 py-2 text-sm font-medium text-red-800">
+          {saveError}
+        </div>
+      )}
+
       {/* Sticky save */}
       <div className="fixed bottom-16 md:bottom-0 left-0 right-0 md:left-60 bg-background/95 backdrop-blur border-t border-border p-3 z-40">
         <div className="max-w-xl mx-auto">
           <Button className="w-full min-h-[52px] text-base" disabled={!canSave} onClick={handleSave}>
-            {busy ? 'Uploading photos…' : justSaved ? (<><Check size={18} /> Saved</>) : `Save ${hours ? hours + 'h' : 'hours'}${photos.length ? ` + ${photos.length} photo${photos.length > 1 ? 's' : ''}` : ''}`}
+            {busy ? 'Saving your day…' : justSaved ? (<><Check size={18} /> Day saved</>) : `${hours ? 'Save my day' : 'Update my day'}${hours ? ` · ${hours}h` : ''}${photos.length ? ` · ${photos.length} photo${photos.length > 1 ? 's' : ''}` : ''}`}
           </Button>
         </div>
       </div>

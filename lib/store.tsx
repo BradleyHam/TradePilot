@@ -9,7 +9,7 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
-  rowToBusinessMember, rowToShiftPhoto, rowToJobContact,
+  rowToBusinessMember, rowToShiftPhoto, rowToShiftReport, rowToJobContact,
   rowToPayRun, payRunToRow,
   rowToJobAssignment, rowToScheduleAssignment,
 } from './supabase/mappers';
@@ -18,7 +18,7 @@ import type {
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
-  BusinessMember, MemberRole, ShiftPhoto, PayRun,
+  BusinessMember, MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from './types';
@@ -254,8 +254,18 @@ interface StoreState {
     takenOn: string;
     files: File[];
     entryId?: string;
-  }) => Promise<{ inserted: number; failed: number }>;
+  }) => Promise<{ inserted: number; failed: number; failedFiles: File[] }>;
+  /** Owner-only review action. Shortlisting never publishes the photo. */
+  updateShiftPhoto: (id: string, updates: Pick<ShiftPhoto, 'marketingCandidate'>) => void;
   deleteShiftPhoto: (id: string) => void;
+  /** End-of-day staff handoffs, filtered by RLS for the current role. */
+  shiftReports: ShiftReport[];
+  saveShiftReport: (input: {
+    jobId: string;
+    workDate: string;
+    status: ShiftReportStatus;
+    note?: string;
+  }) => Promise<ShiftReport | null>;
   /**
    * Every contact with a customer, both directions, newest first
    * (migration 042). Owner-only, so empty for employees.
@@ -683,6 +693,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   /* eslint-enable react-hooks/refs */
   const [quoteAttachments, setQuoteAttachments] = useState<QuoteAttachment[]>([]);
   const [shiftPhotos, setShiftPhotos] = useState<ShiftPhoto[]>([]);
+  const [shiftReports, setShiftReports] = useState<ShiftReport[]>([]);
   const [jobContacts, setJobContacts] = useState<JobContact[]>([]);
   const [teamMembers, setTeamMembers] = useState<BusinessMember[]>([]);
   const [jobAssignments, setJobAssignments] = useState<JobAssignment[]>([]);
@@ -730,7 +741,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setJobs([]); setEntries([]); setScheduleItems([]);
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
         setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
-        setPaintStock([]); setShiftPhotos([]);
+        setPaintStock([]); setShiftPhotos([]); setShiftReports([]);
         setLoading(false);
         return;
       }
@@ -787,7 +798,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // the missing money columns (they map to undefined). Owners read the
       // full base table as before.
       const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
-      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, tm, pr, ja, sa, jc] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, tm, pr, ja, sa, jc] = await Promise.all([
         supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -813,6 +824,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // Degrades to empty if migration 027 hasn't been applied yet.
         supabase.from('shift_photos').select('*').eq('business_id', bizId)
           .order('created_at', { ascending: false }),
+        // End-of-day handoffs — employees see their own, owner sees all.
+        // Log-only on failure so a pending migration never blanks the app.
+        supabase.from('shift_reports').select('*').eq('business_id', bizId)
+          .order('work_date', { ascending: false })
+          .order('updated_at', { ascending: false }),
         // Team members — owner reads all rows (RLS); employees only their
         // own. Drives payroll flags + Settings → Team.
         supabase.from('business_members').select('*').eq('business_id', bizId)
@@ -881,6 +897,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setQuoteAttachments((qa.data ?? []).map(rowToQuoteAttachment));
       setPaintStock((ps.data ?? []).map(rowToPaintStock));
       setShiftPhotos((sp.data ?? []).map(rowToShiftPhoto));
+      if (sr.error) console.warn('[store] shift_reports load failed (migration 050 applied?):', sr.error.message);
+      setShiftReports((sr.data ?? []).map(rowToShiftReport));
       setTeamMembers((tm.data ?? []).map(rowToBusinessMember));
       if (pr.error) console.warn('[store] pay_runs load failed (migration 032 applied?):', pr.error.message);
       setPayRuns((pr.data ?? []).map(rowToPayRun));
@@ -2885,11 +2903,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     takenOn: string;
     files: File[];
     entryId?: string;
-  }): Promise<{ inserted: number; failed: number }> => {
-    if (!businessId || input.files.length === 0) return { inserted: 0, failed: 0 };
+  }): Promise<{ inserted: number; failed: number; failedFiles: File[] }> => {
+    if (!businessId || input.files.length === 0) return { inserted: 0, failed: 0, failedFiles: [] };
     const uid = membership?.userId ?? null;
     let inserted = 0;
     let failed = 0;
+    const failedFiles: File[] = [];
 
     for (const file of input.files) {
       try {
@@ -2903,6 +2922,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         if (upErr) {
           console.error('[uploadShiftPhotos] upload failed:', describeError(upErr));
           failed++;
+          failedFiles.push(file);
           continue;
         }
 
@@ -2922,6 +2942,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
           console.error('[uploadShiftPhotos] insert failed:', describeError(insErr));
           await supabase.storage.from('shift-photos').remove([storagePath]).catch(() => {});
           failed++;
+          failedFiles.push(file);
           continue;
         }
         setShiftPhotos((prev) => [rowToShiftPhoto(data), ...prev]);
@@ -2929,11 +2950,99 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       } catch (err) {
         console.error('[uploadShiftPhotos] unexpected error:', err);
         failed++;
+        failedFiles.push(file);
       }
     }
     if (failed > 0) setError(`${failed} of ${input.files.length} photos failed to upload.`);
-    return { inserted, failed };
+    return { inserted, failed, failedFiles };
   }, [businessId, membership]);
+
+  const updateShiftPhoto = useCallback((id: string, updates: Pick<ShiftPhoto, 'marketingCandidate'>) => {
+    const previous = shiftPhotos.find((photo) => photo.id === id);
+    if (!previous) return;
+    setShiftPhotos((list) => list.map((photo) => photo.id === id ? { ...photo, ...updates } : photo));
+    (async () => {
+      const { data, error: updateErr } = await supabase
+        .from('shift_photos')
+        .update({ marketing_candidate: updates.marketingCandidate })
+        .eq('id', id)
+        .select('*')
+        .single();
+      if (updateErr || !data) {
+        console.error('[updateShiftPhoto] failed:', describeError(updateErr));
+        setError(updateErr?.message ?? 'Could not update that photo.');
+        setShiftPhotos((list) => list.map((photo) => photo.id === id ? previous : photo));
+        return;
+      }
+      const persisted = rowToShiftPhoto(data);
+      setShiftPhotos((list) => list.map((photo) => photo.id === id ? persisted : photo));
+    })();
+  }, [shiftPhotos]);
+
+  /**
+   * Upsert one end-of-day report per person + job + date. Hours and photo
+   * writes stay independent, so editing the report can never alter payroll.
+   */
+  const saveShiftReport = useCallback(async (input: {
+    jobId: string;
+    workDate: string;
+    status: ShiftReportStatus;
+    note?: string;
+  }): Promise<ShiftReport | null> => {
+    if (!businessId) return null;
+    const authUser = membership?.userId
+      ? { id: membership.userId }
+      : (await supabase.auth.getUser()).data.user;
+    if (!authUser?.id) {
+      setError('Could not tell which team member is signed in.');
+      return null;
+    }
+
+    const previous = shiftReports.find((report) =>
+      report.jobId === input.jobId
+      && report.uploadedBy === authUser.id
+      && report.workDate === input.workDate,
+    );
+    const now = new Date().toISOString();
+    const optimistic: ShiftReport = {
+      id: previous?.id ?? crypto.randomUUID(),
+      businessId,
+      jobId: input.jobId,
+      uploadedBy: authUser.id,
+      workDate: input.workDate,
+      status: input.status,
+      note: input.note?.trim() || undefined,
+      createdAt: previous?.createdAt ?? now,
+      updatedAt: now,
+    };
+    setShiftReports((list) => [optimistic, ...list.filter((report) => report.id !== optimistic.id)]);
+
+    const { data, error: upsertErr } = await supabase
+      .from('shift_reports')
+      .upsert({
+        business_id: businessId,
+        job_id: input.jobId,
+        uploaded_by: authUser.id,
+        work_date: input.workDate,
+        status: input.status,
+        note: input.note?.trim() || null,
+      }, { onConflict: 'job_id,uploaded_by,work_date' })
+      .select('*')
+      .single();
+
+    if (upsertErr || !data) {
+      console.error('[saveShiftReport] failed:', describeError(upsertErr));
+      setError(upsertErr?.message ?? 'Could not save the team update.');
+      setShiftReports((list) => {
+        const withoutOptimistic = list.filter((report) => report.id !== optimistic.id);
+        return previous ? [previous, ...withoutOptimistic] : withoutOptimistic;
+      });
+      return null;
+    }
+    const persisted = rowToShiftReport(data);
+    setShiftReports((list) => [persisted, ...list.filter((report) => report.id !== optimistic.id && report.id !== persisted.id)]);
+    return persisted;
+  }, [businessId, membership, shiftReports]);
 
   /**
    * Set (or clear) a job's cover photo. See the interface docs above for
@@ -4055,7 +4164,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         businessId, role, membership, teamMembers, payRuns, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
         addEntry, updateEntry, deleteEntry, markLabourBilled, logMyHours,
-        shiftPhotos, uploadShiftPhotos, deleteShiftPhoto, setJobCoverPhoto,
+        shiftPhotos, uploadShiftPhotos, updateShiftPhoto, deleteShiftPhoto, setJobCoverPhoto,
+        shiftReports, saveShiftReport,
         jobContacts, logContact,
         jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
