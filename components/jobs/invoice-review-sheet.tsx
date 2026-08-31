@@ -32,9 +32,11 @@ interface Props {
   job: Job | null;
   open: boolean;
   onClose: () => void;
+  /** Continue the accepted-job handoff after the deposit is saved and sent. */
+  onSaved?: () => void;
 }
 
-export function InvoiceReviewSheet({ job, open, onClose }: Props) {
+export function InvoiceReviewSheet({ job, open, onClose, onSaved }: Props) {
   const { invoices, quotes, addInvoice, updateInvoice, updateJob, getQuoteTemplate, resolveLogoUrl, businessId } = useStore();
 
   // Editable invoice fields
@@ -214,6 +216,7 @@ export function InvoiceReviewSheet({ job, open, onClose }: Props) {
     if (!await ensureInvoiceSaved('sent')) return;
     downloadCurrentPdf();
     window.open(gmailComposeUrl(emailTo.trim(), { subject: emailSubject, body: emailBody }), '_blank');
+    onSaved?.();
     onClose();
   }
 

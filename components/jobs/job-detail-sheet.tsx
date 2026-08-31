@@ -32,7 +32,7 @@ import { ShiftPhotosPanel } from './shift-photos-panel';
 import { JobTeamPanel } from './job-team-panel';
 import { ContactTimeline } from './contact-timeline';
 import { JobScopePanel } from './job-scope-panel';
-import { BookedDates } from './booked-dates';
+import { BookedDates, BookJobDatesSheet } from './booked-dates';
 import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
 import { DeclineJobSheet } from './decline-job-sheet';
@@ -148,6 +148,7 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   // the review-and-send sheet (PDF preview + email draft).
   const [acceptInvoicePromptOpen, setAcceptInvoicePromptOpen] = useState(false);
   const [reviewInvoiceOpen, setReviewInvoiceOpen] = useState(false);
+  const [bookDatesOpen, setBookDatesOpen] = useState(false);
   // When true, the MarkAsQuotedSheet opens — collects total $, date
   // sent, and follow-up date, then flips the lead to status='quoted'.
   const [markAsQuotedOpen, setMarkAsQuotedOpen] = useState(false);
@@ -1431,6 +1432,20 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         job={reviewInvoiceOpen ? liveJob : null}
         open={reviewInvoiceOpen}
         onClose={() => setReviewInvoiceOpen(false)}
+        onSaved={() => {
+          setReviewInvoiceOpen(false);
+          setBookDatesOpen(true);
+        }}
+      />
+
+      {/* Deposit sent → finish the won-job handoff while the job is still in
+          Brad's hands. Same booking form as the Booked dates section, opened
+          directly so there is no hunt through the job sheet. */}
+      <BookJobDatesSheet
+        job={bookDatesOpen ? liveJob : null}
+        open={bookDatesOpen}
+        onSaved={() => setBookDatesOpen(false)}
+        onCancel={() => setBookDatesOpen(false)}
       />
     </Sheet>
   );

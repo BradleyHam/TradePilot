@@ -24,6 +24,8 @@ interface InvoiceActionProps {
   job: Job;
   open: boolean;
   onClose: () => void;
+  /** Optional workflow handoff after a successful save (for example, book dates). */
+  onSaved?: () => void;
   /** When provided, the form edits this invoice rather than creating a new one. */
   invoice?: Invoice;
   /** When provided (create mode), the sheet opens pre-loaded from this PDF —
@@ -47,7 +49,7 @@ interface InvoiceActionProps {
  *   - "Mark paid" is atomic with the linked income entry. Corrections use
  *     the invoice list's explicit "Correct payment" action.
  */
-export function InvoiceAction({ job, open, onClose, invoice, initialFile }: InvoiceActionProps) {
+export function InvoiceAction({ job, open, onClose, onSaved, invoice, initialFile }: InvoiceActionProps) {
   const { invoices, entries, addInvoice, updateInvoice, updateJob, markInvoicePaid, voidInvoice, businessId, ensureJobHasQuote, addQuoteAttachments, getQuoteTemplate, quotes, resolveLogoUrl } = useStore();
   const isEdit = invoice != null;
 
@@ -476,6 +478,7 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
         }
       }
       setSubmitting(false);
+      onSaved?.();
       onClose();
       return;
     }
@@ -523,14 +526,15 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       })();
     }
 
+    let persistedInvoice: Invoice | null = null;
     if (markPaid) {
       // Wait for the persisted invoice (real UUID) before marking it paid so
       // we never key the DB update on the temp id. If the insert failed,
       // addInvoice resolves null (and has already surfaced the error +
       // rolled back the optimistic row), so there's nothing to mark paid.
-      const created = await createdPromise;
-      if (created) {
-        const paidResult = await markInvoicePaid(created.id, paidDate);
+      persistedInvoice = await createdPromise;
+      if (persistedInvoice) {
+        const paidResult = await markInvoicePaid(persistedInvoice.id, paidDate);
         if (!paidResult.ok) {
           setSaveError(paidResult.error ?? 'The invoice saved, but the payment did not.');
           setSubmitting(false);
@@ -542,7 +546,19 @@ export function InvoiceAction({ job, open, onClose, invoice, initialFile }: Invo
       }
     }
 
+    // A handoff callback means the next screen depends on this invoice really
+    // existing. Keep the ordinary create flow optimistic, but wait for the
+    // persisted UUID when a caller wants to continue into another workflow.
+    if (onSaved && !persistedInvoice) {
+      persistedInvoice = await createdPromise;
+      if (!persistedInvoice) {
+        setSubmitting(false);
+        return;
+      }
+    }
+
     setSubmitting(false);
+    onSaved?.();
     onClose();
   }
 

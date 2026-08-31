@@ -9,6 +9,7 @@ import { Textarea } from '@/components/ui/textarea';
 import { CalendarDays, Pencil, Briefcase, Scissors, Trash2, Plus } from 'lucide-react';
 import { format, parseISO } from 'date-fns';
 import { cn } from '@/lib/utils';
+import { isBookingDatesFollowUp } from '@/lib/booking-handoff';
 
 interface BookedDatesProps {
   job: Job;
@@ -75,7 +76,7 @@ function FormInput(props: React.InputHTMLAttributes<HTMLInputElement>) {
  * render as two separate bars.
  */
 export function BookedDates({ job }: BookedDatesProps) {
-  const { scheduleItems, businessId, addScheduleItem, deleteScheduleItem, updateScheduleItem } = useStore();
+  const { scheduleItems, businessId, addScheduleItem, deleteScheduleItem, updateScheduleItem, updateJob } = useStore();
 
   // Sheet state. `mode` controls what form opens:
   //   - { kind: 'add' }                  → add a brand-new block
@@ -102,6 +103,14 @@ export function BookedDates({ job }: BookedDatesProps) {
 
   const hasBlocks = blocks.length > 0;
 
+  function completeDateFollowUps() {
+    for (const item of scheduleItems) {
+      if (isBookingDatesFollowUp(item, job.id) && !item.completed) {
+        updateScheduleItem(item.id, { completed: true });
+      }
+    }
+  }
+
   // Renumber every block's "Day X/N" titles after any structural change.
   // Done as a helper so split / edit / remove all stay consistent.
   function renumberBlock(blockItems: ScheduleItem[]) {
@@ -122,6 +131,11 @@ export function BookedDates({ job }: BookedDatesProps) {
       form,
       addScheduleItem,
     });
+    completeDateFollowUps();
+    // A real work booking is the point where an accepted job becomes booked.
+    // Keep the pipeline status in step with the calendar so Money, Jobs and
+    // availability all tell the same story without another manual status tap.
+    if (job.status === 'accepted') updateJob(job.id, { status: 'booked' });
     setMode(null);
   }
 
@@ -138,6 +152,7 @@ export function BookedDates({ job }: BookedDatesProps) {
       form,
       addScheduleItem,
     });
+    completeDateFollowUps();
     setMode(null);
   }
 
@@ -242,6 +257,61 @@ export function BookedDates({ job }: BookedDatesProps) {
         </SheetContent>
       </Sheet>
     </div>
+  );
+}
+
+/**
+ * Focused booking sheet used by the accepted-job handoff on Home and after a
+ * deposit is prepared. It deliberately reuses the exact same form and row
+ * creation logic as JobDetailSheet's BookedDates section: one screen, one
+ * save, no second scheduling implementation to drift out of step.
+ */
+export function BookJobDatesSheet({
+  job,
+  open,
+  onSaved,
+  onCancel,
+}: {
+  job: Job | null;
+  open: boolean;
+  onSaved: () => void;
+  onCancel: () => void;
+}) {
+  const { businessId, scheduleItems, addScheduleItem, updateScheduleItem, updateJob } = useStore();
+
+  function handleSave(form: BookingFormValues) {
+    if (!job || !businessId) return;
+    createBlockRows({ job, businessId, form, addScheduleItem });
+    for (const item of scheduleItems) {
+      if (isBookingDatesFollowUp(item, job.id) && !item.completed) {
+        updateScheduleItem(item.id, { completed: true });
+      }
+    }
+    if (job.status === 'accepted') updateJob(job.id, { status: 'booked' });
+    onSaved();
+  }
+
+  return (
+    <Sheet open={open} onOpenChange={(nextOpen) => { if (!nextOpen) onCancel(); }}>
+      <SheetContent side="bottom" className="h-auto max-h-[90vh] overflow-y-auto rounded-t-2xl pb-10">
+        <SheetHeader className="pb-2">
+          <SheetTitle>Book {job?.name || 'job'} dates</SheetTitle>
+          <p className="text-sm text-muted-foreground">
+            Put the work on the calendar now. You can split or move the block later.
+          </p>
+        </SheetHeader>
+        {job && (
+          <div className="pt-3">
+            <BookedDatesForm
+              key={`${job.id}:${open ? 'open' : 'closed'}`}
+              existing={[]}
+              onCancel={onCancel}
+              onSave={handleSave}
+            />
+          </div>
+        )}
+      </SheetContent>
+    </Sheet>
   );
 }
 
@@ -451,7 +521,7 @@ function SplitForm({
     <div className="space-y-3">
       <p className="text-sm text-muted-foreground">
         Cut this block on the last day you worked. Anything scheduled after
-        that day will be removed, and you'll be prompted to set a new date
+        that day will be removed, and you&apos;ll be prompted to set a new date
         range for when the work resumes.
       </p>
 

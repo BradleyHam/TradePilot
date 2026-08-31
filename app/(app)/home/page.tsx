@@ -33,6 +33,7 @@ import { BillDetailSheet } from '@/components/bills/bill-detail-sheet';
 import { PayrollFlags } from '@/components/payroll/payroll-flags';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { InvoiceAction } from '@/components/jobs/invoice-action';
+import { BookJobDatesSheet } from '@/components/jobs/booked-dates';
 import { LogHoursPrompt, shouldPromptForHours } from '@/components/jobs/log-hours-prompt';
 import { EditScheduleItemSheet, type ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -64,6 +65,7 @@ import {
 import { cn, gmailComposeUrl } from '@/lib/utils';
 import { computeQuoteFollowUps, type QuoteFollowUp } from '@/lib/quote-follow-up';
 import { invoiceDisplayStatus } from '@/lib/invoice-lifecycle';
+import { BOOKING_DATES_FOLLOW_UP_NOTE, needsBookingDates } from '@/lib/booking-handoff';
 
 // ── ISO date helpers (local time — UTC drift bites week boundaries) ─────────
 function parseISODate(s: string): Date {
@@ -221,6 +223,9 @@ export default function HomePage() {
   // When set, the InvoiceAction sheet opens in create mode for this job —
   // pre-filled as a deposit. Driven by the "Deposits to send" Home flag.
   const [depositForJob, setDepositForJob] = useState<Job | null>(null);
+  // Accepted work with no future job_booking opens the focused booking
+  // sheet. Hold an id so the sheet always resolves the live store record.
+  const [bookingDatesJobId, setBookingDatesJobId] = useState<string | null>(null);
   // "No hours on this job" quick-add — fires after the overdue-invoices
   // flag's Mark paid when the invoice's job has zero hours logged, so the
   // hourly-rate maths can exist before the job is closed out. Null = closed.
@@ -280,6 +285,9 @@ export default function HomePage() {
     : null;
   const markQuotedJob = markQuotedJobId
     ? jobs.find((j) => j.id === markQuotedJobId) ?? null
+    : null;
+  const bookingDatesJob = bookingDatesJobId
+    ? jobs.find((j) => j.id === bookingDatesJobId) ?? null
     : null;
 
   // Compute "today" once per render and pin the ISO strings in stable values
@@ -392,6 +400,16 @@ export default function HomePage() {
       .sort((a, b) => a.updatedAt.localeCompare(b.updatedAt));
   }, [jobs, invoices, todayISO]);
 
+  // Won work that still has no real future work day. A future "confirm the
+  // dates" follow-up temporarily owns the next action, so the dashboard does
+  // not nag twice. Booking a date or deliberately deferring it clears the row
+  // immediately through the optimistic store.
+  const jobsWaitingForDates = useMemo(() => {
+    return jobs
+      .filter((job) => needsBookingDates(job, scheduleItems, todayISO, weekStartISO))
+      .sort((a, b) => (a.acceptedAt ?? a.updatedAt).localeCompare(b.acceptedAt ?? b.updatedAt));
+  }, [jobs, scheduleItems, todayISO, weekStartISO]);
+
   // Quoted jobs gone quiet — the follow-up ladder (7d nudge → 3wk
   // "either way" message → a week later, prompt to mark lost). All the
   // rules live in lib/quote-follow-up.ts, shared with the Leads tab.
@@ -487,6 +505,7 @@ export default function HomePage() {
   const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
   const attentionCount = leadsToContact.length
     + toQuoteJobs.length
+    + jobsWaitingForDates.length
     + overdueInvoices.length
     + billsDueSoon.length
     + billDrafts.length
@@ -597,6 +616,39 @@ export default function HomePage() {
 
               {toQuoteJobs.length > 0 && (
                 <QuotesToPrepSection items={toQuoteJobs} compactHeading />
+              )}
+
+              {jobsWaitingForDates.length > 0 && (
+                <JobsWaitingForDatesFlag
+                  jobs={jobsWaitingForDates}
+                  onBookDates={(job) => setBookingDatesJobId(job.id)}
+                  onDatesNotConfirmed={(job) => {
+                    if (!businessId) return;
+                    // Retire an overdue booking-date reminder before creating
+                    // the fresh one, otherwise the old Today row keeps nagging.
+                    for (const item of scheduleItems) {
+                      if (
+                        item.jobId === job.id
+                        && item.type === 'follow_up'
+                        && item.notes === BOOKING_DATES_FOLLOW_UP_NOTE
+                        && !item.completed
+                      ) {
+                        updateScheduleItem(item.id, { completed: true });
+                      }
+                    }
+                    addScheduleItem({
+                      id: crypto.randomUUID(),
+                      businessId,
+                      jobId: job.id,
+                      type: 'follow_up',
+                      title: `Confirm dates — ${job.name}`,
+                      date: formatISODate(addDays(parseISODate(todayISO), 14)),
+                      notes: BOOKING_DATES_FOLLOW_UP_NOTE,
+                      completed: false,
+                      createdAt: new Date().toISOString(),
+                    });
+                  }}
+                />
               )}
 
               {showMoneyFlags && (
@@ -839,8 +891,16 @@ export default function HomePage() {
           job={depositForJob}
           open
           onClose={() => setDepositForJob(null)}
+          onSaved={() => setBookingDatesJobId(depositForJob.id)}
         />
       )}
+
+      <BookJobDatesSheet
+        job={bookingDatesJob}
+        open={bookingDatesJob !== null}
+        onSaved={() => setBookingDatesJobId(null)}
+        onCancel={() => setBookingDatesJobId(null)}
+      />
 
       {/* Reschedule sheet — opened by tapping any Today row (including
           overdue ones). Same component the Schedule tab uses, so a
@@ -1482,6 +1542,85 @@ function WeekFigure({
       </p>
       <p className="mt-0.5 truncate text-[11px] text-muted-foreground">{note}</p>
     </div>
+  );
+}
+
+// ── Flag: Accepted jobs waiting for dates ──────────────────────────────────
+// This is the missing half of the won-job handoff. A quote can be accepted and
+// have its deposit prepared while still not occupying a single calendar day.
+// Keep the reminder on Home until a real future job_booking exists, with one
+// honest escape hatch that schedules a follow-up instead of hiding the job.
+function JobsWaitingForDatesFlag({
+  jobs,
+  onBookDates,
+  onDatesNotConfirmed,
+}: {
+  jobs: Job[];
+  onBookDates: (job: Job) => void;
+  onDatesNotConfirmed: (job: Job) => void;
+}) {
+  const [open, setOpen] = useState(false);
+
+  return (
+    <section>
+      <p className="mb-2 text-sm font-semibold text-foreground">Booking</p>
+      <div className="bg-card border border-border rounded-2xl overflow-hidden">
+        <button
+          type="button"
+          onClick={() => setOpen((value) => !value)}
+          aria-expanded={open}
+          className="w-full flex items-center gap-3 px-4 py-3 min-h-[60px] text-left hover:bg-accent transition-colors"
+        >
+          <div className="w-9 h-9 rounded-xl bg-orange-50 flex items-center justify-center shrink-0">
+            <CalendarPlus size={17} className="text-orange-600" strokeWidth={1.9} />
+          </div>
+          <div className="min-w-0 flex-1">
+            <p className="text-sm font-semibold text-foreground">
+              {jobs.length} job{jobs.length === 1 ? '' : 's'} need{jobs.length === 1 ? 's' : ''} dates
+            </p>
+            <p className="text-xs text-muted-foreground">
+              Accepted work not on the calendar yet
+            </p>
+          </div>
+          <ChevronDown
+            size={16}
+            className={cn('shrink-0 text-muted-foreground transition-transform', open && 'rotate-180')}
+          />
+        </button>
+
+        {open && (
+          <ul className="border-t border-border bg-muted/30 p-2 space-y-2">
+            {jobs.map((job) => (
+              <li key={job.id} className="rounded-xl border border-border bg-card px-3 py-3">
+                <p className="text-sm font-semibold text-foreground truncate">{job.name}</p>
+                {(job.clientName || job.location) && (
+                  <p className="mt-0.5 text-xs text-muted-foreground truncate">
+                    {[job.clientName, job.location].filter(Boolean).join(' · ')}
+                  </p>
+                )}
+                <div className="mt-3 grid grid-cols-2 gap-2">
+                  <button
+                    type="button"
+                    onClick={() => onDatesNotConfirmed(job)}
+                    title="Add a reminder in two weeks"
+                    className="min-h-11 rounded-full border border-border bg-background px-3 text-xs font-semibold text-foreground hover:bg-accent active:scale-95 transition-colors"
+                  >
+                    Dates not confirmed
+                  </button>
+                  <button
+                    type="button"
+                    onClick={() => onBookDates(job)}
+                    className="min-h-11 rounded-full bg-primary px-3 text-xs font-semibold text-primary-foreground hover:bg-primary/90 active:scale-95 transition-colors"
+                  >
+                    Book dates
+                  </button>
+                </div>
+              </li>
+            ))}
+          </ul>
+        )}
+      </div>
+    </section>
   );
 }
 
