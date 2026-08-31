@@ -8,6 +8,7 @@
     "start": "next start",
     "lint": "eslint",
     "test:invoice-lifecycle": "node --import tsx scripts/test-invoice-lifecycle.ts",
+    "test:tax-certainty": "node --import tsx scripts/test-notification-rules.ts",
     "import": "tsx scripts/import-finances.ts",
     "import:apply": "tsx scripts/import-finances.ts --apply",
     "import:reset": "tsx scripts/import-finances.ts --apply --reset"

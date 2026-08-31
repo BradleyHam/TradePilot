@@ -594,9 +594,8 @@ today / overdue), uncontacted leads (24h + 3d, skipped when
 `quote_ready_by` implies contact or the job is snoozed), quote
 follow-ups (`follow_up_date`), EI payday filing + monthly PAYE (reuses
 `lib/payroll.ts` date math so push and Home flags can't disagree), GST
-(pure date math, odd-month two-monthly cycle with the Mar→7-May and
-Nov→15-Jan exceptions — fix `gstDueDateForPeriodEnd` if myIR says the
-cycle differs), and a single tagged morning digest (today's schedule +
+(the verified six-monthly Jan/Jul cycle from `lib/gst-calendar.ts`, shared
+with the estimator so push and Money cannot disagree), and a single tagged morning digest (today's schedule +
 attention counts; skipped entirely on a nothing-day).
 
 **Delivery paths:**
@@ -648,7 +647,7 @@ prune + re-toggle handles it.
 
 ---
 
-## Brad's tax structure (confirmed April 2026)
+## Brad's tax structure (GST re-verified in myIR 23 August 2026)
 
 This is the source of truth for Brad's tax position. Update this section whenever something changes — every other tax-related decision in the app and in conversations should be consistent with what's written here.
 
@@ -656,7 +655,7 @@ This is the source of truth for Brad's tax position. Update this section wheneve
 
 **Not** a look-through company (LTC). Considered, decided regular Ltd is appropriate given consistent profitability and the shareholder-salary mechanism. Revisit only if there's ever a loss-making year, or if the partner becomes a shareholder.
 
-**GST.** Registered. Back-registered to **January 2026** when Brad started operating again. Payments basis (GST owed when cash moves, not when invoice issued). Two-monthly returns — assume standard cycle ending odd months unless he says otherwise.
+**GST.** Registered. Back-registered to **January 2026** when Brad started operating again. myIR shows **Invoice (accruals) basis** and **six-monthly returns ending 31 January and 31 July**. Customer GST follows issued invoice dates; confirmed supplier bills follow invoice dates even when not yet paid. `lib/gst-calendar.ts` is the shared filing calendar for the estimator and reminders.
 
 Pre-registration GST claim under s 21B may be available for assets/inventory bought before January 2026 that are still in use (e.g. tools, vehicle if company-owned). Worth a one-off audit.
 
@@ -736,7 +735,9 @@ laptopDepreciationAnnual:  $1,600   ($4k FV × 50% IRD rate × 80% biz)
 
 NZ personal tax bands 2025/26 are encoded in `PERSONAL_TAX_BANDS`. Income tax is estimated at personal rates (post shareholder-salary reclassification) rather than the 28% company rate.
 
-Bills count as expenses only when `paid = true` (matches Brad's payments-basis GST registration).
+For the cash/profit and income-tax views, bills count as expenses only when
+`paid = true`. The GST estimator is separate: on Brad's verified invoice
+basis it includes confirmed supplier bills by invoice date.
 
 These defaults need to move to a Settings UI / per-business table when we want to onboard other users — they're the single biggest reason this app isn't yet shippable to a stranger.
 

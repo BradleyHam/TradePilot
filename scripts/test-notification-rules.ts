@@ -3,7 +3,8 @@
 //
 //   npx tsx scripts/test-notification-rules.ts
 
-import { evaluateNotificationRules, gstDueDateForPeriodEnd } from '../lib/notification-rules';
+import { evaluateNotificationRules } from '../lib/notification-rules';
+import { gstPeriodOf, mostRecentlyClosedGstPeriod } from '../lib/gst-calendar';
 import type { Entry, Job, PayRun, ScheduleItem } from '../lib/types';
 
 let failures = 0;
@@ -84,15 +85,20 @@ check('PAYE overdue → late',
 check('paid PAYE is silent',
   keys({ todayISO: '2026-08-20', payRuns: [run({ paidDate: '2026-07-24', eiFiled: true, payePaid: true })] }).every((k) => !k.startsWith('paye')));
 
-// ── GST (odd-month periods; due 28th next month; Mar→7 May, Nov→15 Jan) ────
-check('GST due-date math: Jul period → 28 Aug', gstDueDateForPeriodEnd('2026-07-31') === '2026-08-28');
-check('GST due-date math: Mar exception → 7 May', gstDueDateForPeriodEnd('2026-03-31') === '2026-05-07');
-check('GST due-date math: Nov exception → 15 Jan', gstDueDateForPeriodEnd('2026-11-30') === '2027-01-15');
+// ── GST (verified six-monthly Jan/Jul cycle) ──────────────────────────────
+check('GST period in June is Feb–Jul', gstPeriodOf(new Date('2026-06-15T12:00:00')).end === '2026-07-31');
+check('GST period in October is Aug–Jan', gstPeriodOf(new Date('2026-10-15T12:00:00')).end === '2027-01-31');
+check('Jul period is due 28 Aug', gstPeriodOf(new Date('2026-06-15T12:00:00')).dueDate === '2026-08-28');
+check('Jan 2027 period rolls Sunday deadline to Monday', gstPeriodOf(new Date('2027-01-15T12:00:00')).dueDate === '2027-03-01');
+check('latest closed period on 31 Jul is still Jan', mostRecentlyClosedGstPeriod(new Date('2026-07-31T12:00:00')).end === '2026-01-31');
+check('latest closed period on 1 Aug is Jul', mostRecentlyClosedGstPeriod(new Date('2026-08-01T12:00:00')).end === '2026-07-31');
 check('GST 16 days out is quiet', keys({}).every((k) => !k.startsWith('gst')));
 check('GST inside 7 days → soon', keys({ todayISO: '2026-08-22' }).includes('gst:2026-07-31:soon'));
 check('GST due day → due', keys({ todayISO: '2026-08-28' }).includes('gst:2026-07-31:due'));
 check('GST just past → late', keys({ todayISO: '2026-09-02' }).includes('gst:2026-07-31:late'));
-check('GST Nov period from mid-Jan → soon', keys({ todayISO: '2027-01-10' }).includes('gst:2026-11-30:soon'));
+check('No false two-monthly GST reminder in mid-Jan', keys({ todayISO: '2027-01-10' }).every((k) => !k.startsWith('gst')));
+check('Jan period reminder starts inside 7 days', keys({ todayISO: '2027-02-22' }).includes('gst:2027-01-31:soon'));
+check('Jan period is due on rolled working day', keys({ todayISO: '2027-03-01' }).includes('gst:2027-01-31:due'));
 
 // ── Morning digest ─────────────────────────────────────────────────────────
 const digest = evaluateNotificationRules({

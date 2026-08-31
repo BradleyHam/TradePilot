@@ -27,6 +27,7 @@
 import type { Entry, Job, PayRun, ScheduleItem } from './types';
 import { eiFilingDueDate, payeMonthsDue } from './payroll';
 import type { BusinessNotification } from './push-notify';
+import { mostRecentlyClosedGstPeriod } from './gst-calendar';
 
 export interface RuleInputs {
   /** ISO date in NZ local time — the caller resolves Pacific/Auckland. */
@@ -287,43 +288,10 @@ function paydayRules(payRuns: PayRun[], todayISO: string): BusinessNotification[
   return out;
 }
 
-/**
- * GST returns — pure date math, no data needed. Two-monthly cycle
- * ending ODD months (Brad's assumed standard cycle — see AGENTS.md
- * "Brad's tax structure"; fix here if myIR says otherwise). Return +
- * payment due the 28th of the following month, with IRD's two
- * exceptions: period ending 31 Mar → due 7 May, ending 30 Nov → due
- * 15 Jan.
- */
-export function gstDueDateForPeriodEnd(periodEndISO: string): string {
-  const end = parseISO(periodEndISO);
-  const m = end.getMonth() + 1; // 1-12
-  const y = end.getFullYear();
-  if (m === 3) return `${y}-05-07`;
-  if (m === 11) return `${y + 1}-01-15`;
-  const dueMonth = m === 12 ? 1 : m + 1;
-  const dueYear = m === 12 ? y + 1 : y;
-  return `${dueYear}-${String(dueMonth).padStart(2, '0')}-28`;
-}
-
-function lastDayOfMonthISO(y: number, m1to12: number): string {
-  const d = new Date(y, m1to12, 0); // day 0 of next month
-  return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
-}
-
 function gstRules(todayISO: string): BusinessNotification[] {
-  // Most recent odd-month period end strictly before today.
-  const t = parseISO(todayISO);
-  let y = t.getFullYear();
-  let m = t.getMonth() + 1;
-  for (let i = 0; i < 13; i++) {
-    if (m % 2 === 1 && lastDayOfMonthISO(y, m) < todayISO) break;
-    m -= 1;
-    if (m === 0) { m = 12; y -= 1; }
-  }
-  const periodEnd = lastDayOfMonthISO(y, m);
-  const periodLabel = `${parseISO(lastDayOfMonthISO(y, m === 1 ? 12 : m - 1)).toLocaleDateString('en-NZ', { month: 'short' })}–${parseISO(periodEnd).toLocaleDateString('en-NZ', { month: 'short' })}`;
-  const due = gstDueDateForPeriodEnd(periodEnd);
+  const period = mostRecentlyClosedGstPeriod(parseISO(todayISO));
+  const periodEnd = period.end;
+  const due = period.dueDate;
 
   const out: BusinessNotification[] = [];
   if (todayISO > due && daysBetween(due, todayISO) <= 14) {
@@ -331,7 +299,7 @@ function gstRules(todayISO: string): BusinessNotification[] {
       ruleKey: 'gst',
       dedupeKey: `${periodEnd}:late`,
       title: 'GST return overdue',
-      body: `The ${periodLabel} GST return was due ${friendlyDate(due)} — file + pay in myIR.`,
+      body: `The ${period.label} GST return was due ${friendlyDate(due)} — file + pay in myIR.`,
       url: '/money',
     });
   } else if (todayISO === due) {
@@ -339,7 +307,7 @@ function gstRules(todayISO: string): BusinessNotification[] {
       ruleKey: 'gst',
       dedupeKey: `${periodEnd}:due`,
       title: 'GST due today',
-      body: `File + pay the ${periodLabel} GST return in myIR by end of day.`,
+      body: `File + pay the ${period.label} GST return in myIR by end of day.`,
       url: '/money',
     });
   } else if (todayISO < due && daysBetween(todayISO, due) <= 7) {
@@ -347,7 +315,7 @@ function gstRules(todayISO: string): BusinessNotification[] {
       ruleKey: 'gst',
       dedupeKey: `${periodEnd}:soon`,
       title: `GST due ${friendlyDate(due)}`,
-      body: `${periodLabel} return — the Money tab's tax card has the running estimate.`,
+      body: `${period.label} return — the Money tab's tax card has the running estimate.`,
       url: '/money',
     });
   }

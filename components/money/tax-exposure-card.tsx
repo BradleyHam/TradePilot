@@ -120,6 +120,7 @@ export function TaxExposureCard() {
   const futurePaye = paye.filter((month) => month.dueDate > today);
   const overduePayeTotal = overduePaye.reduce((sum, month) => sum + (month.payeTotal ?? 0), 0);
   const futurePayeTotal = futurePaye.reduce((sum, month) => sum + (month.payeTotal ?? 0), 0);
+  const hasUnknownFuturePaye = futurePaye.some((month) => month.payeTotal == null);
 
   const confirmedDueNow = snapshot
     ? snapshot.gstDueNow + snapshot.incomeTaxDueNow + Math.max(snapshot.payeDueNow, overduePayeTotal)
@@ -130,6 +131,18 @@ export function TaxExposureCard() {
   const incomeTaxReserve = Math.max(0, incomeTax.incomeTax);
   const keepAside = gstReserve + futurePayeTotal + incomeTaxReserve;
   const totalNotFree = confirmedDueNow + keepAside + (supplierReserve?.amount ?? 0);
+  const nextPaye = futurePaye[0];
+  const nextAction = nextPaye && nextPaye.dueDate < gst.period.dueDate
+    ? {
+        label: 'PAYE',
+        dueDate: nextPaye.dueDate,
+        detail: nextPaye.payeTotal == null ? 'Check amount in myIR' : `${fmt(nextPaye.payeTotal, true)} to send`,
+      }
+    : {
+        label: 'GST return',
+        dueDate: gst.period.dueDate,
+        detail: `${fmt(gstReserve, true)} building up`,
+      };
 
   return (
     <div className="bg-card border border-border/70 rounded-[1.5rem] overflow-hidden shadow-sm">
@@ -151,12 +164,30 @@ export function TaxExposureCard() {
           <div className="rounded-2xl border border-amber-200 bg-amber-50 px-3.5 py-3">
             <div className="flex items-center gap-1.5 text-amber-700">
               <Landmark size={14} strokeWidth={2} />
-              <p className="text-[10px] font-semibold uppercase tracking-wide">Keep aside</p>
+              <p className="text-[10px] font-semibold uppercase tracking-wide">Building up</p>
             </div>
             <p className="mt-1 text-xl font-bold tabular-nums text-amber-900">{fmt(keepAside)}</p>
-            <p className="mt-0.5 text-[10px] leading-snug text-amber-700">Open periods · planning reserve</p>
+            <p className="mt-0.5 text-[10px] leading-snug text-amber-700">
+              {hasUnknownFuturePaye ? 'Plus PAYE amount to check' : 'Not due yet · keep untouched'}
+            </p>
           </div>
         </div>
+      </div>
+
+      <div className="border-t border-border/60 px-5 py-3">
+        <p className="text-[10px] font-semibold uppercase tracking-[0.1em] text-muted-foreground">Next tax deadline</p>
+        <div className="mt-1 flex items-start justify-between gap-3">
+          <div className="min-w-0">
+            <p className="text-sm font-semibold text-foreground">{nextAction.label}</p>
+            <p className="text-[11px] text-muted-foreground">{nextAction.detail}</p>
+          </div>
+          <p className="shrink-0 text-sm font-semibold tabular-nums text-foreground">
+            {formatShortDate(nextAction.dueDate)}
+          </p>
+        </div>
+        <p className="mt-2 text-[10px] leading-relaxed text-muted-foreground">
+          GST is six-monthly on invoice basis · {gst.period.label} · due {formatShortDate(gst.period.dueDate)}
+        </p>
       </div>
 
       <button
@@ -180,8 +211,10 @@ export function TaxExposureCard() {
             <ReserveRow
               icon={<Users size={14} className="text-violet-500" strokeWidth={1.8} />}
               label="PAYE"
-              sublabel={futurePaye.length > 0 ? `Next due ${formatShortDate(futurePaye[0].dueDate)}` : 'Nothing awaiting payment'}
-              value={fmt(futurePayeTotal, true)}
+              sublabel={futurePaye.length > 0
+                ? `Next due ${formatShortDate(futurePaye[0].dueDate)}`
+                : 'Nothing awaiting payment'}
+              value={hasUnknownFuturePaye ? `${fmt(futurePayeTotal, true)} + check` : fmt(futurePayeTotal, true)}
             />
             <ReserveRow
               icon={<TrendingDown size={14} className="text-blue-500" strokeWidth={1.8} />}
@@ -231,7 +264,7 @@ export function TaxExposureCard() {
           <div className="flex items-start gap-2 rounded-xl border border-amber-200 bg-amber-50 px-3 py-2 text-amber-800">
             <Info size={13} className="mt-0.5 shrink-0" strokeWidth={2} />
             <p className="text-[11px] leading-relaxed">
-              “Due now” is the last reconciled myIR position. “Keep aside” moves with TradePilot.
+              “Due now” is the last reconciled myIR position. “Building up” moves with TradePilot.
               Vehicle depreciation and any late second-hand GST claims stay out until the records are confirmed.
             </p>
           </div>

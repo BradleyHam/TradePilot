@@ -1,5 +1,10 @@
 # Bill allocation — implementation plan
 
+> Historical plan: its payments-basis GST timing notes are superseded. myIR
+> was re-verified on 23 August 2026 as invoice (accruals) basis with six-monthly
+> periods ending January/July. Use `lib/gst-calendar.ts` and
+> `lib/tax-estimator.ts` for current GST behaviour.
+
 **Goal (Brad's words):** "I pay 3–4 supplier invoices in one bank payment. I want the AI to read the bills and allocate the right proportion of each cost to the job it was used on — as painless as possible."
 
 **Chosen shape (from the kickoff Q&A):**

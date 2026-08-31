@@ -12,6 +12,11 @@
 
 import type { Entry, Invoice, Setting } from './types';
 import { invoiceCountsAsIssued } from './invoice-lifecycle';
+import { gstPeriodOf } from './gst-calendar';
+import type { GstPeriod } from './gst-calendar';
+
+export { gstPeriodOf } from './gst-calendar';
+export type { GstPeriod } from './gst-calendar';
 
 // ── Tax-year helpers ─────────────────────────────────────────────────────────
 export interface TaxYear {
@@ -129,46 +134,6 @@ function entryGst(e: Entry): number {
 
 function inRange(date: string, start: string, end: string): boolean {
   return date >= start && date <= end;
-}
-
-// ── GST periods ──────────────────────────────────────────────────────────────
-// Lakeside is registered on invoice basis and files six-monthly, with periods
-// ending 31 January and 31 July. Keeping this separate from the income-tax year
-// stops already-filed GST from reappearing as money still to reserve.
-export interface GstPeriod {
-  start: string;
-  end: string;
-  dueDate: string;
-  label: string;
-}
-
-function isoDate(year: number, month: number, day: number): string {
-  return `${year}-${String(month).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
-}
-
-function rollWeekendForward(iso: string): string {
-  const date = new Date(`${iso}T12:00:00`);
-  while (date.getDay() === 0 || date.getDay() === 6) date.setDate(date.getDate() + 1);
-  return isoDate(date.getFullYear(), date.getMonth() + 1, date.getDate());
-}
-
-/** Six-monthly GST period containing `date` (period ends Jan/Jul). */
-export function gstPeriodOf(date: Date = new Date()): GstPeriod {
-  const year = date.getFullYear();
-  const month = date.getMonth() + 1;
-  if (month <= 1) {
-    const start = isoDate(year - 1, 8, 1);
-    const end = isoDate(year, 1, 31);
-    return { start, end, dueDate: rollWeekendForward(isoDate(year, 2, 28)), label: `Aug ${year - 1} – Jan ${year}` };
-  }
-  if (month <= 7) {
-    const start = isoDate(year, 2, 1);
-    const end = isoDate(year, 7, 31);
-    return { start, end, dueDate: rollWeekendForward(isoDate(year, 8, 28)), label: `Feb – Jul ${year}` };
-  }
-  const start = isoDate(year, 8, 1);
-  const end = isoDate(year + 1, 1, 31);
-  return { start, end, dueDate: rollWeekendForward(isoDate(year + 1, 2, 28)), label: `Aug ${year} – Jan ${year + 1}` };
 }
 
 export interface GstPeriodEstimate {
