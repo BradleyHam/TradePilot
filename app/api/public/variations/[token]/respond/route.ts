@@ -1,5 +1,6 @@
 import { NextRequest, NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
+import { sendBusinessNotificationSafe } from '@/lib/push-notify';
 
 export const dynamic = 'force-dynamic';
 
@@ -43,14 +44,40 @@ export async function POST(
   }
 
   const payload = data as {
-    variation?: { status?: string };
-    job?: { quote_amount?: number | string | null };
+    variation?: { id?: string; business_id?: string; job_id?: string; title?: string; status?: string };
+    job?: { id?: string; business_id?: string; name?: string; quote_amount?: number | string | null };
     already_responded?: boolean;
   } | null;
+  const alreadyResponded = payload?.already_responded === true;
+  const jobId = payload?.job?.id ?? payload?.variation?.job_id;
+  const businessId = payload?.job?.business_id ?? payload?.variation?.business_id;
+  const variationId = payload?.variation?.id;
+
+  if (!alreadyResponded && jobId && businessId && variationId) {
+    const activityKind = body.response === 'approved' ? 'variation-approved' : 'variation-declined';
+    const { error: linkUpdateError } = await supabaseAdmin
+      .from('job_client_links')
+      .update({ last_activity_at: new Date().toISOString(), last_activity_kind: activityKind })
+      .eq('business_id', businessId)
+      .eq('job_id', jobId);
+    // A missing 052 migration must not undo a variation response that was
+    // already committed atomically by 051.
+    if (linkUpdateError) console.warn('[public variation response] client-link activity update failed:', linkUpdateError.message);
+
+    await sendBusinessNotificationSafe(supabaseAdmin, businessId, {
+      ruleKey: `client-variation-${body.response}`,
+      dedupeKey: variationId,
+      title: body.response === 'approved' ? 'Extra work approved' : 'Extra work declined',
+      body: `${payload?.variation?.title ?? 'The variation'} on ${payload?.job?.name ?? 'the job'} was ${body.response}.`,
+      url: '/jobs',
+      tag: `client-variation-${variationId}`,
+    });
+  }
+
   return json({
     ok: true,
     status: payload?.variation?.status ?? body.response,
     newJobTotalExGst: payload?.job?.quote_amount ?? null,
-    alreadyResponded: payload?.already_responded === true,
+    alreadyResponded,
   });
 }

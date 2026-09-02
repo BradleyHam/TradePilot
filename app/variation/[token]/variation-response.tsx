@@ -13,10 +13,12 @@ export function VariationResponse({
   token,
   initialStatus,
   amountInclGst,
+  businessName = 'the business',
 }: {
   token: string;
   initialStatus: SettledStatus;
   amountInclGst: number;
+  businessName?: string;
 }) {
   const [status, setStatus] = useState<SettledStatus>(initialStatus);
   const [busy, setBusy] = useState<'approved' | 'declined' | null>(null);
@@ -56,7 +58,7 @@ export function VariationResponse({
       <div className="rounded-3xl border border-slate-200 bg-slate-50 p-5 text-center text-slate-900">
         <XCircle size={34} className="mx-auto text-slate-600" />
         <h2 className="mt-3 text-xl font-bold">Not approved</h2>
-        <p className="mt-1 text-sm leading-relaxed">No extra charge has been added. Lakeside Painting can talk through another option with you.</p>
+        <p className="mt-1 text-sm leading-relaxed">No extra charge has been added. {businessName} can talk through another option with you.</p>
       </div>
     );
   }

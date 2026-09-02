@@ -115,6 +115,7 @@ export default async function VariationPage({ params }: { params: Promise<{ toke
                 token={token}
                 initialStatus={variation.status as 'ready' | 'approved' | 'declined'}
                 amountInclGst={amountInclGst}
+                businessName={business.name}
               />
             </div>
           </div>

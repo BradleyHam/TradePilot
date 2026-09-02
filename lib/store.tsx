@@ -9,7 +9,7 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
-  rowToBusinessMember, rowToShiftPhoto, rowToShiftReport, rowToJobVariation, rowToJobContact,
+  rowToBusinessMember, rowToShiftPhoto, rowToShiftReport, rowToJobVariation, rowToClientJobLink, rowToJobContact,
   rowToPayRun, payRunToRow,
   rowToJobAssignment, rowToScheduleAssignment,
 } from './supabase/mappers';
@@ -18,7 +18,7 @@ import type {
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
-  BusinessMember, MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, JobVariation, PayRun,
+  BusinessMember, MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, JobVariation, ClientJobLink, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from './types';
@@ -256,7 +256,10 @@ interface StoreState {
     entryId?: string;
   }) => Promise<{ inserted: number; failed: number; failedFiles: File[] }>;
   /** Owner-only review action. Shortlisting never publishes the photo. */
-  updateShiftPhoto: (id: string, updates: Pick<ShiftPhoto, 'marketingCandidate'>) => void;
+  updateShiftPhoto: (
+    id: string,
+    updates: Partial<Pick<ShiftPhoto, 'marketingCandidate' | 'clientVisible'>>,
+  ) => void;
   deleteShiftPhoto: (id: string) => void;
   /** End-of-day staff handoffs, filtered by RLS for the current role. */
   shiftReports: ShiftReport[];
@@ -276,6 +279,15 @@ interface StoreState {
     amountExGst: number;
     photoIds?: string[];
   }) => Promise<JobVariation | null>;
+  /** Owner-only reusable client portal links, one per job. */
+  clientJobLinks: ClientJobLink[];
+  /** Creates the link only when Brad explicitly opens the sharing flow. */
+  ensureClientJobLink: (jobId: string) => Promise<ClientJobLink | null>;
+  /** Reversibly turn a client link on or off. */
+  updateClientJobLink: (
+    id: string,
+    updates: Pick<ClientJobLink, 'enabled'>,
+  ) => Promise<{ ok: boolean; error?: string }>;
   /**
    * Every contact with a customer, both directions, newest first
    * (migration 042). Owner-only, so empty for employees.
@@ -705,6 +717,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [shiftPhotos, setShiftPhotos] = useState<ShiftPhoto[]>([]);
   const [shiftReports, setShiftReports] = useState<ShiftReport[]>([]);
   const [jobVariations, setJobVariations] = useState<JobVariation[]>([]);
+  const [clientJobLinks, setClientJobLinks] = useState<ClientJobLink[]>([]);
   const [jobContacts, setJobContacts] = useState<JobContact[]>([]);
   const [teamMembers, setTeamMembers] = useState<BusinessMember[]>([]);
   const [jobAssignments, setJobAssignments] = useState<JobAssignment[]>([]);
@@ -753,6 +766,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
         setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
         setPaintStock([]); setShiftPhotos([]); setShiftReports([]); setJobVariations([]);
+        setClientJobLinks([]); setJobContacts([]);
         setLoading(false);
         return;
       }
@@ -809,7 +823,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // the missing money columns (they map to undefined). Owners read the
       // full base table as before.
       const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
-      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, jv, tm, pr, ja, sa, jc] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, jv, cjl, tm, pr, ja, sa, jc] = await Promise.all([
         supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -844,6 +858,10 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // list, preserving the existing money-blind staff experience.
         supabase.from('job_variations').select('*').eq('business_id', bizId)
           .order('created_at', { ascending: false }),
+        // Reusable client job links — owner-only. Missing migration degrades
+        // to an empty list just like variations and shift reports.
+        supabase.from('job_client_links').select('*').eq('business_id', bizId)
+          .order('updated_at', { ascending: false }),
         // Team members — owner reads all rows (RLS); employees only their
         // own. Drives payroll flags + Settings → Team.
         supabase.from('business_members').select('*').eq('business_id', bizId)
@@ -916,6 +934,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       setShiftReports((sr.data ?? []).map(rowToShiftReport));
       if (jv.error) console.warn('[store] job_variations load failed (migration 051 applied?):', jv.error.message);
       setJobVariations((jv.data ?? []).map(rowToJobVariation));
+      if (cjl.error) console.warn('[store] job_client_links load failed (migration 052 applied?):', cjl.error.message);
+      setClientJobLinks((cjl.data ?? []).map(rowToClientJobLink));
       setTeamMembers((tm.data ?? []).map(rowToBusinessMember));
       if (pr.error) console.warn('[store] pay_runs load failed (migration 032 applied?):', pr.error.message);
       setPayRuns((pr.data ?? []).map(rowToPayRun));
@@ -2974,14 +2994,20 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { inserted, failed, failedFiles };
   }, [businessId, membership]);
 
-  const updateShiftPhoto = useCallback((id: string, updates: Pick<ShiftPhoto, 'marketingCandidate'>) => {
+  const updateShiftPhoto = useCallback((
+    id: string,
+    updates: Partial<Pick<ShiftPhoto, 'marketingCandidate' | 'clientVisible'>>,
+  ) => {
     const previous = shiftPhotos.find((photo) => photo.id === id);
     if (!previous) return;
     setShiftPhotos((list) => list.map((photo) => photo.id === id ? { ...photo, ...updates } : photo));
     (async () => {
+      const row: Record<string, boolean> = {};
+      if (updates.marketingCandidate !== undefined) row.marketing_candidate = updates.marketingCandidate;
+      if (updates.clientVisible !== undefined) row.client_visible = updates.clientVisible;
       const { data, error: updateErr } = await supabase
         .from('shift_photos')
-        .update({ marketing_candidate: updates.marketingCandidate })
+        .update(row)
         .eq('id', id)
         .select('*')
         .single();
@@ -3119,6 +3145,97 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     setJobVariations((list) => [persisted, ...list.filter((variation) => variation.id !== tempId && variation.id !== persisted.id)]);
     return persisted;
   }, [businessId]);
+
+  /**
+   * Create one stable private link for a job. Creating the row never sends
+   * anything to the client; sharing remains a separate explicit UI action.
+   */
+  const ensureClientJobLink = useCallback(async (jobId: string): Promise<ClientJobLink | null> => {
+    const existing = clientJobLinks.find((link) => link.jobId === jobId);
+    if (existing) return existing;
+    if (!businessId) return null;
+
+    const now = new Date().toISOString();
+    const optimistic: ClientJobLink = {
+      id: crypto.randomUUID(),
+      businessId,
+      jobId,
+      accessToken: crypto.randomUUID(),
+      enabled: true,
+      viewCount: 0,
+      createdAt: now,
+      updatedAt: now,
+    };
+    setClientJobLinks((list) => [optimistic, ...list]);
+
+    const { data, error: insertErr } = await supabase
+      .from('job_client_links')
+      .insert({
+        id: optimistic.id,
+        business_id: businessId,
+        job_id: jobId,
+        access_token: optimistic.accessToken,
+        enabled: true,
+      })
+      .select('*')
+      .single();
+
+    if (insertErr || !data) {
+      // A rapid second tap can lose the unique(job_id) race. Resolve it to
+      // the existing row instead of presenting a false failure.
+      if (insertErr?.code === '23505') {
+        const { data: existingRow } = await supabase
+          .from('job_client_links')
+          .select('*')
+          .eq('business_id', businessId)
+          .eq('job_id', jobId)
+          .maybeSingle();
+        if (existingRow) {
+          const persisted = rowToClientJobLink(existingRow);
+          setClientJobLinks((list) => [persisted, ...list.filter((link) => link.id !== optimistic.id && link.id !== persisted.id)]);
+          return persisted;
+        }
+      }
+      console.error('[ensureClientJobLink] failed:', describeError(insertErr));
+      setError(insertErr?.message ?? 'Could not create the client link.');
+      setClientJobLinks((list) => list.filter((link) => link.id !== optimistic.id));
+      return null;
+    }
+
+    const persisted = rowToClientJobLink(data);
+    setClientJobLinks((list) => [persisted, ...list.filter((link) => link.id !== optimistic.id && link.id !== persisted.id)]);
+    return persisted;
+  }, [businessId, clientJobLinks]);
+
+  const updateClientJobLink = useCallback(async (
+    id: string,
+    updates: Pick<ClientJobLink, 'enabled'>,
+  ): Promise<{ ok: boolean; error?: string }> => {
+    const previous = clientJobLinks.find((link) => link.id === id);
+    if (!previous) return { ok: false, error: 'Client link not found.' };
+
+    setClientJobLinks((list) => list.map((link) => (
+      link.id === id ? { ...link, ...updates, updatedAt: new Date().toISOString() } : link
+    )));
+
+    const { data, error: updateErr } = await supabase
+      .from('job_client_links')
+      .update({ enabled: updates.enabled })
+      .eq('id', id)
+      .select('*')
+      .single();
+
+    if (updateErr || !data) {
+      console.error('[updateClientJobLink] failed:', describeError(updateErr));
+      setError(updateErr?.message ?? 'Could not update the client link.');
+      setClientJobLinks((list) => list.map((link) => link.id === id ? previous : link));
+      return { ok: false, error: updateErr?.message ?? 'Could not update the client link.' };
+    }
+
+    const persisted = rowToClientJobLink(data);
+    setClientJobLinks((list) => list.map((link) => link.id === id ? persisted : link));
+    return { ok: true };
+  }, [clientJobLinks]);
 
   /**
    * Set (or clear) a job's cover photo. See the interface docs above for
@@ -4243,6 +4360,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         shiftPhotos, uploadShiftPhotos, updateShiftPhoto, deleteShiftPhoto, setJobCoverPhoto,
         shiftReports, saveShiftReport,
         jobVariations, addJobVariation,
+        clientJobLinks, ensureClientJobLink, updateClientJobLink,
         jobContacts, logContact,
         jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,

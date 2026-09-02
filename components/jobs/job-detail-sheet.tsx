@@ -30,6 +30,7 @@ import { InvoiceAction } from './invoice-action';
 import { InvoicesList } from './invoices-list';
 import { ShiftPhotosPanel } from './shift-photos-panel';
 import { JobVariationsPanel } from './job-variations-panel';
+import { ClientJobLinkPanel } from './client-job-link-panel';
 import { JobTeamPanel } from './job-team-panel';
 import { ContactTimeline } from './contact-timeline';
 import { JobScopePanel } from './job-scope-panel';
@@ -752,6 +753,13 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               historical and edited via the Schedule page if needed. */}
           {(['accepted','booked','in-progress'] as JobStatus[]).includes(liveJob.status) && (
             <BookedDates job={liveJob} />
+          )}
+
+          {/* One reusable customer page for the quote, live dates, issued
+              invoices, approved photos and variations. Kept in Overview so
+              sharing it never means hunting through internal job details. */}
+          {(['quoted','accepted','booked','in-progress','completed','invoiced','paid','lost','declined'] as JobStatus[]).includes(liveJob.status) && (
+            <ClientJobLinkPanel job={liveJob} />
           )}
 
           {/* "Reconcile schedule" — only shown for terminal-status jobs that

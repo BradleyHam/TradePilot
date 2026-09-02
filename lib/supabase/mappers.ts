@@ -11,7 +11,7 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
-  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, ShiftReport, JobVariation, PayRun,
+  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, ShiftReport, JobVariation, ClientJobLink, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from '../types';
@@ -600,6 +600,7 @@ export function rowToShiftPhoto(r: Row): ShiftPhoto {
     storagePath: r.storage_path as string,
     caption: asString(r.caption),
     marketingCandidate: asBool(r.marketing_candidate),
+    clientVisible: asBool(r.client_visible),
     createdAt: r.created_at as string,
   };
 }
@@ -631,6 +632,24 @@ export function rowToJobVariation(r: Row): JobVariation {
     approvalToken: r.approval_token as string,
     photoIds: Array.isArray(r.photo_ids) ? (r.photo_ids as string[]) : [],
     respondedAt: asString(r.responded_at),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function rowToClientJobLink(r: Row): ClientJobLink {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    accessToken: r.access_token as string,
+    enabled: asBool(r.enabled, true),
+    lastViewedAt: asString(r.last_viewed_at),
+    viewCount: asNumber(r.view_count) ?? 0,
+    quoteAcceptedAt: asString(r.quote_accepted_at),
+    quoteAcceptedBy: asString(r.quote_accepted_by),
+    lastActivityAt: asString(r.last_activity_at),
+    lastActivityKind: asString(r.last_activity_kind) as ClientJobLink['lastActivityKind'],
     createdAt: r.created_at as string,
     updatedAt: r.updated_at as string,
   };

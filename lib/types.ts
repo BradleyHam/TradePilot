@@ -267,6 +267,8 @@ export interface ShiftPhoto {
   caption?: string;
   /** Owner-only shortlist flag. Never means published. */
   marketingCandidate: boolean;
+  /** Owner-selected photo shown on this job's private client link. */
+  clientVisible: boolean;
   createdAt: string;
 }
 
@@ -313,6 +315,34 @@ export interface JobVariation {
   /** shift_photos ids selected as client-visible evidence. */
   photoIds: string[];
   respondedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type ClientJobActivityKind =
+  | 'viewed'
+  | 'quote-approved'
+  | 'variation-approved'
+  | 'variation-declined';
+
+/**
+ * The private, reusable client-facing link for one job (migration 052).
+ * The token is a bearer secret: only share the URL with that job's client.
+ * Client-facing reads still go through a narrow server projection rather
+ * than granting the token holder database access.
+ */
+export interface ClientJobLink {
+  id: string;
+  businessId: string;
+  jobId: string;
+  accessToken: string;
+  enabled: boolean;
+  lastViewedAt?: string;
+  viewCount: number;
+  quoteAcceptedAt?: string;
+  quoteAcceptedBy?: string;
+  lastActivityAt?: string;
+  lastActivityKind?: ClientJobActivityKind;
   createdAt: string;
   updatedAt: string;
 }
