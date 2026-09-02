@@ -82,6 +82,75 @@ function formatISODate(d: Date): string {
 function addDays(d: Date, n: number): Date {
   const c = new Date(d); c.setDate(c.getDate() + n); return c;
 }
+
+const SCHEDULE_MATCH_NOISE = new Set([
+  'quote', 'site', 'visit', 'job', 'booking', 'booked', 'the', 'and',
+  'for', 'with', 'from', 'at', 'wanaka', 'new', 'zealand',
+]);
+
+function normaliseScheduleMatchText(value?: string): string {
+  return (value ?? '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^a-z0-9]+/g, ' ')
+    .trim();
+}
+
+function scheduleMatchTokens(value?: string): Set<string> {
+  return new Set(
+    normaliseScheduleMatchText(value)
+      .split(' ')
+      .filter((token) => token && (token.length >= 3 || /^\d+$/.test(token)))
+      .filter((token) => !SCHEDULE_MATCH_NOISE.has(token)),
+  );
+}
+
+/**
+ * Some older/manual schedule rows point at a second Job record for the same
+ * real-world lead. Exact job_id remains the authority; this conservative
+ * fallback only recognises a duplicate when address/name/client evidence is
+ * strong enough that we would be comfortable preventing a second booking.
+ */
+function duplicateLeadScheduleScore(job: Job, item: ScheduleItem): number {
+  const jobLocation = normaliseScheduleMatchText(job.location);
+  const itemLocation = normaliseScheduleMatchText(item.location);
+  const jobLocationNumbers: string[] = jobLocation.match(/\b\d+[a-z]?\b/g) ?? [];
+  const itemLocationNumbers: string[] = itemLocation.match(/\b\d+[a-z]?\b/g) ?? [];
+  const sameStreetNumber = jobLocationNumbers.length === 0
+    || itemLocationNumbers.length === 0
+    || jobLocationNumbers.some((number) => itemLocationNumbers.includes(number));
+  const locationMatch = Boolean(
+    jobLocation
+    && itemLocation
+    && sameStreetNumber
+    && (jobLocation.includes(itemLocation) || itemLocation.includes(jobLocation)),
+  );
+
+  const jobClient = normaliseScheduleMatchText(job.clientName);
+  const itemPeople = normaliseScheduleMatchText(`${item.clientName ?? ''} ${item.title}`);
+  const clientMatch = jobClient.length >= 4 && itemPeople.includes(jobClient);
+
+  const jobTokens = scheduleMatchTokens(`${job.name} ${job.location ?? ''}`);
+  const itemTokens = scheduleMatchTokens(`${item.title} ${item.location ?? ''}`);
+  const sharedTokens = [...jobTokens].filter((token) => itemTokens.has(token));
+  const sharedNumber = sharedTokens.some((token) => /^\d+$/.test(token));
+
+  const strongEnough = locationMatch
+    || (clientMatch && sharedTokens.length >= 2)
+    || (sharedNumber && sharedTokens.length >= 3)
+    || sharedTokens.length >= 5;
+  if (!strongEnough) return 0;
+
+  return (locationMatch ? 12 : 0)
+    + (clientMatch ? 5 : 0)
+    + Math.min(sharedTokens.length, 8);
+}
+
+function earliestScheduleItem(items: ScheduleItem[]): ScheduleItem {
+  return [...items].sort((a, b) =>
+    `${a.date}${a.startTime ?? ''}`.localeCompare(`${b.date}${b.startTime ?? ''}`),
+  )[0];
+}
 /**
  * Monday-start week. Returns ISO YYYY-MM-DD for the Monday of `d`'s week.
  * NZ convention matches the rest of the app (see schedule's week view).
@@ -474,6 +543,53 @@ export default function HomePage() {
     return set;
   }, [scheduleItems, todayISO]);
 
+  // A lead can also be linked to a normal job_booking while still carrying
+  // status='lead'. Older/manual calendar rows can point at a duplicate Job
+  // record too (the Sawdon lead is the real example). We do NOT silently
+  // mark the lead won or booked: a calendar row is not proof the quote was
+  // accepted. Instead, recognise a strong duplicate match so one tap records
+  // the contact without creating another visit.
+  const scheduledLeadItemByJob = useMemo(() => {
+    const map = new Map<string, ScheduleItem>();
+    const upcomingItems = scheduleItems.filter((item) =>
+      (item.type === 'quote_visit' || item.type === 'job_booking')
+      && !item.completed
+      && !item.skipReasonKind
+      && item.date >= todayISO,
+    );
+
+    // Exact links always win.
+    for (const item of upcomingItems) {
+      if (!item.jobId) continue;
+      const existing = map.get(item.jobId);
+      if (!existing || `${item.date}${item.startTime ?? ''}` < `${existing.date}${existing.startTime ?? ''}`) {
+        map.set(item.jobId, item);
+      }
+    }
+
+    // Then recognise duplicate lead records conservatively. If equally strong
+    // matches point at different schedule jobs, leave the card alone rather
+    // than guessing and hiding a genuinely uncontacted lead.
+    for (const job of jobs) {
+      if (job.status !== 'lead' || map.has(job.id)) continue;
+      const scored = upcomingItems
+        .map((item) => ({ item, score: duplicateLeadScheduleScore(job, item) }))
+        .filter(({ score }) => score > 0)
+        .sort((a, b) => b.score - a.score);
+      if (scored.length === 0) continue;
+
+      const bestScore = scored[0].score;
+      const best = scored.filter(({ score }) => score === bestScore);
+      const distinctScheduleJobs = new Set(best.map(({ item }) =>
+        item.jobId ?? `${normaliseScheduleMatchText(item.title)}::${normaliseScheduleMatchText(item.location)}`,
+      ));
+      if (distinctScheduleJobs.size > 1) continue;
+      map.set(job.id, earliestScheduleItem(best.map(({ item }) => item)));
+    }
+
+    return map;
+  }, [jobs, scheduleItems, todayISO]);
+
   // Raw enquiries that still need a first contact: status=lead, no
   // site-visit data yet (those go to "Quotes to prep"), no upcoming
   // visit on the calendar (those are handled — see visitBookedJobIds),
@@ -610,9 +726,18 @@ export default function HomePage() {
                 <LeadsToContactSection
                   items={leadsToContact}
                   todayISO={todayISO}
+                  scheduledItemByJob={scheduledLeadItemByJob}
                   compactHeading
                   onMarkContacted={(jobId) =>
                     logContact({ jobId, direction: 'out', channel: 'email' })
+                  }
+                  onAlreadyScheduled={(job, item) =>
+                    logContact({
+                      jobId: job.id,
+                      direction: 'out',
+                      channel: 'other',
+                      note: `Existing ${item.type === 'quote_visit' ? 'site visit' : 'schedule booking'} confirmed for ${item.date}.`,
+                    })
                   }
                   onArrangeVisit={(job) => setVisitPromptJob(job)}
                   onSentQuote={(job) => setMarkQuotedJobId(job.id)}
@@ -3476,12 +3601,15 @@ const QUOTES_TO_PREP_MAX_ROWS = 4;
 // "I tapped Mark contacted and nothing happened").
 
 function LeadsToContactSection({
-  items, todayISO, onMarkContacted, onArrangeVisit, onSentQuote, compactHeading = false,
+  items, todayISO, scheduledItemByJob, onMarkContacted, onAlreadyScheduled, onArrangeVisit, onSentQuote, compactHeading = false,
 }: {
   items: Job[];
   todayISO: string;
+  scheduledItemByJob: Map<string, ScheduleItem>;
   compactHeading?: boolean;
   onMarkContacted: (jobId: string) => void;
+  /** Existing calendar row: record the contact without adding a duplicate. */
+  onAlreadyScheduled: (job: Job, item: ScheduleItem) => void;
   /** Primary action: opens the "site visit arranged?" prompt for this lead. */
   onArrangeVisit: (job: Job) => void;
   /** "Sent the quote" — opens MarkAsQuotedSheet for leads quoted directly
@@ -3507,7 +3635,9 @@ function LeadsToContactSection({
             key={job.id}
             job={job}
             todayISO={todayISO}
+            scheduledItem={scheduledItemByJob.get(job.id) ?? null}
             onMarkContacted={() => onMarkContacted(job.id)}
+            onAlreadyScheduled={(item) => onAlreadyScheduled(job, item)}
             onArrangeVisit={() => onArrangeVisit(job)}
             onSentQuote={() => onSentQuote(job)}
           />
@@ -3527,11 +3657,13 @@ function LeadsToContactSection({
 }
 
 function LeadToContactRow({
-  job, todayISO, onMarkContacted, onArrangeVisit, onSentQuote,
+  job, todayISO, scheduledItem, onMarkContacted, onAlreadyScheduled, onArrangeVisit, onSentQuote,
 }: {
   job: Job;
   todayISO: string;
+  scheduledItem: ScheduleItem | null;
   onMarkContacted: () => void;
+  onAlreadyScheduled: (item: ScheduleItem) => void;
   /** Opens the "site visit arranged?" prompt — the primary action. */
   onArrangeVisit: () => void;
   /** Quote already went out (no visit needed) — opens MarkAsQuotedSheet. */
@@ -3582,11 +3714,17 @@ function LeadToContactRow({
       <div className="border-t border-border/60 px-2 py-1.5 flex items-center gap-1">
         <button
           type="button"
-          onClick={(e) => { e.stopPropagation(); onArrangeVisit(); }}
+          onClick={(e) => {
+            e.stopPropagation();
+            if (scheduledItem) onAlreadyScheduled(scheduledItem);
+            else onArrangeVisit();
+          }}
           className="flex-1 min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 active:scale-[0.98] transition-all"
-          title="Mark contacted — asks if you arranged a site visit"
+          title={scheduledItem ? 'This lead already has an upcoming schedule item' : 'Mark contacted — asks if you arranged a site visit'}
         >
-          <MessageCircle size={14} strokeWidth={2} /> Mark contacted
+          {scheduledItem
+            ? <><CalendarCheck size={14} strokeWidth={2} /> Already in schedule</>
+            : <><MessageCircle size={14} strokeWidth={2} /> Mark contacted</>}
         </button>
         {job.clientPhone && (
           <a
