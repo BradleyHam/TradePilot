@@ -739,6 +739,7 @@ export default function HomePage() {
                       note: `Existing ${item.type === 'quote_visit' ? 'site visit' : 'schedule booking'} confirmed for ${item.date}.`,
                     })
                   }
+                  onAddToSchedule={(job) => setBookVisitJob(job)}
                   onArrangeVisit={(job) => setVisitPromptJob(job)}
                   onSentQuote={(job) => setMarkQuotedJobId(job.id)}
                 />
@@ -3601,7 +3602,7 @@ const QUOTES_TO_PREP_MAX_ROWS = 4;
 // "I tapped Mark contacted and nothing happened").
 
 function LeadsToContactSection({
-  items, todayISO, scheduledItemByJob, onMarkContacted, onAlreadyScheduled, onArrangeVisit, onSentQuote, compactHeading = false,
+  items, todayISO, scheduledItemByJob, onMarkContacted, onAlreadyScheduled, onAddToSchedule, onArrangeVisit, onSentQuote, compactHeading = false,
 }: {
   items: Job[];
   todayISO: string;
@@ -3610,6 +3611,8 @@ function LeadsToContactSection({
   onMarkContacted: (jobId: string) => void;
   /** Existing calendar row: record the contact without adding a duplicate. */
   onAlreadyScheduled: (job: Job, item: ScheduleItem) => void;
+  /** Open the booking form directly — no intermediate contact question. */
+  onAddToSchedule: (job: Job) => void;
   /** Primary action: opens the "site visit arranged?" prompt for this lead. */
   onArrangeVisit: (job: Job) => void;
   /** "Sent the quote" — opens MarkAsQuotedSheet for leads quoted directly
@@ -3638,6 +3641,7 @@ function LeadsToContactSection({
             scheduledItem={scheduledItemByJob.get(job.id) ?? null}
             onMarkContacted={() => onMarkContacted(job.id)}
             onAlreadyScheduled={(item) => onAlreadyScheduled(job, item)}
+            onAddToSchedule={() => onAddToSchedule(job)}
             onArrangeVisit={() => onArrangeVisit(job)}
             onSentQuote={() => onSentQuote(job)}
           />
@@ -3657,13 +3661,14 @@ function LeadsToContactSection({
 }
 
 function LeadToContactRow({
-  job, todayISO, scheduledItem, onMarkContacted, onAlreadyScheduled, onArrangeVisit, onSentQuote,
+  job, todayISO, scheduledItem, onMarkContacted, onAlreadyScheduled, onAddToSchedule, onArrangeVisit, onSentQuote,
 }: {
   job: Job;
   todayISO: string;
   scheduledItem: ScheduleItem | null;
   onMarkContacted: () => void;
   onAlreadyScheduled: (item: ScheduleItem) => void;
+  onAddToSchedule: () => void;
   /** Opens the "site visit arranged?" prompt — the primary action. */
   onArrangeVisit: () => void;
   /** Quote already went out (no visit needed) — opens MarkAsQuotedSheet. */
@@ -3707,24 +3712,28 @@ function LeadToContactRow({
         <ChevronRight size={14} className="text-muted-foreground shrink-0" />
       </Link>
 
-      {/* Action row — Mark contacted is the primary, sized to the
-          44px tap-target rule. Call / Email appear only when we have
-          the detail. stopPropagation so tapping an action never also
-          triggers the row's navigate-to-leads link. */}
+      {/* Action row — scheduling is the primary, sized to the 44px
+          tap-target rule. Call / Email appear only when we have the detail.
+          stopPropagation keeps actions from also navigating to Leads. */}
       <div className="border-t border-border/60 px-2 py-1.5 flex items-center gap-1">
         <button
           type="button"
           onClick={(e) => {
             e.stopPropagation();
             if (scheduledItem) onAlreadyScheduled(scheduledItem);
-            else onArrangeVisit();
+            else onAddToSchedule();
           }}
-          className="flex-1 min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold text-primary bg-primary/10 hover:bg-primary/15 active:scale-[0.98] transition-all"
-          title={scheduledItem ? 'This lead already has an upcoming schedule item' : 'Mark contacted — asks if you arranged a site visit'}
+          className={cn(
+            'flex-1 min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-xs font-semibold active:scale-[0.98] transition-all',
+            scheduledItem
+              ? 'text-primary bg-primary/10 hover:bg-primary/15'
+              : 'text-primary-foreground bg-primary hover:bg-primary/90',
+          )}
+          title={scheduledItem ? 'This lead already has an upcoming schedule item' : 'Add a site visit to the schedule'}
         >
           {scheduledItem
             ? <><CalendarCheck size={14} strokeWidth={2} /> Already in schedule</>
-            : <><MessageCircle size={14} strokeWidth={2} /> Mark contacted</>}
+            : <><CalendarPlus size={14} strokeWidth={2} /> Add to schedule</>}
         </button>
         {job.clientPhone && (
           <a
@@ -3753,16 +3762,27 @@ function LeadToContactRow({
         )}
       </div>
 
-      {/* "Sent the quote" — its own subtle row rather than a fourth
-          button above (four labels don't fit a 380px viewport). For
-          leads quoted directly with no site visit (commercial work
-          priced off plans): one tap opens MarkAsQuotedSheet, saving
-          flips the job to 'quoted' and this row clears for good. */}
-      <div className="border-t border-border/60 px-2 py-1">
+      {/* Less-common outcomes live together below the booking row. Keeping
+          them out of the Call / Email row means every action still fits at
+          380px without shrinking its tap target. */}
+      <div className={cn(
+        'border-t border-border/60 px-2 py-1 grid gap-1',
+        scheduledItem ? 'grid-cols-1' : 'grid-cols-2',
+      )}>
+        {!scheduledItem && (
+          <button
+            type="button"
+            onClick={(e) => { e.stopPropagation(); onArrangeVisit(); }}
+            className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+            title="Mark contacted and say whether a visit was arranged"
+          >
+            <MessageCircle size={13} strokeWidth={1.8} /> Mark contacted
+          </button>
+        )}
         <button
           type="button"
           onClick={(e) => { e.stopPropagation(); onSentQuote(); }}
-          className="w-full min-h-[36px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
+          className="min-h-[44px] inline-flex items-center justify-center gap-1.5 px-2 rounded-lg text-[11px] font-medium text-muted-foreground hover:text-foreground hover:bg-accent transition-colors"
           title="Already sent this one a quote? Record it — moves the lead to 'Quoted, awaiting reply'"
         >
           <Send size={12} strokeWidth={1.8} /> Sent the quote already
