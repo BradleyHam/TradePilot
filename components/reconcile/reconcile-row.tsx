@@ -7,6 +7,7 @@ import { JobPicker } from '@/components/shared/job-picker';
 import type { BankTransaction, Entry, ExpenseCategory, TaxPaymentKind } from '@/lib/types';
 import { CheckCircle2, ArrowRight, Receipt, DollarSign, Split, Plus, X, FileText, Landmark } from 'lucide-react';
 import { cn } from '@/lib/utils';
+import { asPersonalBankSplit } from '@/lib/bank-split';
 
 // User-facing labels for the IRD payment sub-types. Source of truth shared
 // by the picker card here and the "Paid to IRD" summary on the Money tab.
@@ -221,7 +222,7 @@ export function ReconcileRow({
               className="w-full text-[11px] font-medium text-primary hover:underline flex items-center justify-center gap-1 h-7"
             >
               <Split size={11} strokeWidth={2} />
-              Split this across multiple jobs
+              Split across jobs or personal
             </button>
           </>
         )}
@@ -627,6 +628,7 @@ interface SplitRowState {
   id: string;          // local-only for React keys
   jobId: string;       // '' = none (overhead candidate)
   isOverhead: boolean;
+  isPersonal: boolean;
   category: ExpenseCategory;
   amountStr: string;   // raw user input — interpreted as $ or %
   description: string;
@@ -650,8 +652,8 @@ function SplitForm({
 
   const [mode, setMode] = useState<'amount' | 'percent'>('amount');
   const [rows, setRows] = useState<SplitRowState[]>(() => [
-    { id: 'r1', jobId: '', isOverhead: false, category: defaultCategory, amountStr: '', description: txn.description, gstApplies: true },
-    { id: 'r2', jobId: '', isOverhead: false, category: defaultCategory, amountStr: '', description: txn.description, gstApplies: true },
+    { id: 'r1', jobId: '', isOverhead: false, isPersonal: false, category: defaultCategory, amountStr: '', description: txn.description, gstApplies: true },
+    { id: 'r2', jobId: '', isOverhead: false, isPersonal: false, category: defaultCategory, amountStr: '', description: txn.description, gstApplies: true },
   ]);
   const [saving, setSaving] = useState(false);
 
@@ -676,7 +678,7 @@ function SplitForm({
   const balanced = Math.abs(remaining) <= 0.02;
   const allRowsValid = rows.every((r) => {
     if (rowGross(r) <= 0) return false;
-    if (!r.isOverhead && !r.jobId) return false;
+    if (!r.isPersonal && !r.isOverhead && !r.jobId) return false;
     return true;
   });
   const canSave = balanced && allRowsValid && !saving;
@@ -692,6 +694,7 @@ function SplitForm({
         id: `r${Date.now()}`,
         jobId: '',
         isOverhead: false,
+        isPersonal: false,
         category: defaultCategory,
         amountStr: '',
         description: txn.description,
@@ -734,24 +737,26 @@ function SplitForm({
     try {
       const payloads: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'>[] = rows.map((r) => {
         const gross = rowGross(r);
-        const ex = r.gstApplies ? gross / (1 + NZ_GST_RATE) : gross;
+        const gstApplies = !r.isPersonal && r.gstApplies;
+        const ex = gstApplies ? gross / (1 + NZ_GST_RATE) : gross;
         const gstC = gross - ex;
-        return {
-          jobId: r.isOverhead ? undefined : (r.jobId || undefined),
-          type: defaultType,
-          category: defaultType === 'expense' ? r.category : undefined,
+        const entry: Omit<Entry, 'id' | 'businessId' | 'createdAt' | 'bankTransactionId'> = {
+          jobId: r.isPersonal || r.isOverhead ? undefined : (r.jobId || undefined),
+          type: r.isPersonal ? 'note' : defaultType,
+          category: !r.isPersonal && defaultType === 'expense' ? r.category : undefined,
           supplier: defaultType === 'expense' ? txn.payee : undefined,
           amount: gross,
-          gstApplies: r.gstApplies,
+          gstApplies,
           amountExGst: Math.round(ex * 100) / 100,
           gstComponent: Math.round(gstC * 100) / 100,
-          description: (r.isOverhead ? '[OH] ' : '') + (r.description.trim() || txn.description),
+          description: (!r.isPersonal && r.isOverhead ? '[OH] ' : '') + (r.description.trim() || txn.description),
           entryDate: txn.txnDate,
           paymentMethod: txn.tranType === 'POS' ? 'EFTPOS'
             : txn.tranType === 'FT'  ? 'Internet transfer'
             : txn.tranType === 'BP'  ? 'Bill payment'
             : undefined,
         };
+        return r.isPersonal ? asPersonalBankSplit(entry) : entry;
       });
       await onSubmit(payloads);
     } finally {
@@ -798,7 +803,7 @@ function SplitForm({
       <ul className="space-y-2">
         {rows.map((r, i) => (
           <li key={r.id} className="bg-background border border-border rounded-lg p-2 space-y-1.5">
-            <div className="flex items-center gap-1.5">
+            <div className="flex flex-wrap items-center gap-1.5">
               <span className="text-[10px] font-semibold text-muted-foreground uppercase tracking-wide w-10 shrink-0">
                 #{i + 1}
               </span>
@@ -838,7 +843,7 @@ function SplitForm({
                     : fmt(remaining)}
                 </button>
               )}
-              <JobPicker
+              {!r.isPersonal && <JobPicker
                 jobs={jobs}
                 entries={entries}
                 value={r.isOverhead ? '' : r.jobId}
@@ -848,7 +853,8 @@ function SplitForm({
                 context={jobContext}
                 placeholder="Pick a job…"
                 className="flex-1 min-w-0"
-              />
+              />}
+              {r.isPersonal && <span className="flex-1 text-sm font-medium">Personal</span>}
               {rows.length > 1 && (
                 <button
                   type="button"
@@ -860,15 +866,30 @@ function SplitForm({
                 </button>
               )}
             </div>
-            <div className="flex items-center gap-1.5">
+            <div className="flex gap-2">
+              {(['Business', 'Personal'] as const).map((label) => (
+                <button
+                  key={label}
+                  type="button"
+                  aria-pressed={r.isPersonal === (label === 'Personal')}
+                  onClick={() => updateRow(r.id, { isPersonal: label === 'Personal' })}
+                  className={cn('min-h-11 flex-1 rounded-md border px-3 text-xs font-medium',
+                    r.isPersonal === (label === 'Personal')
+                      ? 'border-primary bg-primary/10 text-primary'
+                      : 'border-input text-muted-foreground')}
+                >{label}</button>
+              ))}
+            </div>
+            {r.isPersonal && <p className="text-xs text-muted-foreground">Personal portion only. Excluded from business costs and GST.</p>}
+            <div className="flex flex-wrap items-center gap-1.5">
               <input
                 type="text"
                 value={r.description}
                 onChange={(e) => updateRow(r.id, { description: e.target.value })}
                 placeholder={txn.description}
-                className="flex-1 h-7 px-2 rounded-md border border-input bg-background text-[11px] focus:outline-none focus:ring-2 focus:ring-ring"
+                className="flex-1 min-w-0 h-11 px-2 rounded-md border border-input bg-background text-[11px] focus:outline-none focus:ring-2 focus:ring-ring"
               />
-              {defaultType === 'expense' && (
+              {!r.isPersonal && defaultType === 'expense' && (
                 <select
                   value={r.category}
                   onChange={(e) => updateRow(r.id, { category: e.target.value as ExpenseCategory })}
@@ -879,7 +900,7 @@ function SplitForm({
                   ))}
                 </select>
               )}
-              <label className="flex items-center gap-1 text-[11px] text-muted-foreground shrink-0 cursor-pointer">
+              {!r.isPersonal && <label className="flex items-center gap-1 text-[11px] text-muted-foreground shrink-0 cursor-pointer">
                 <input
                   type="checkbox"
                   checked={r.gstApplies}
@@ -887,7 +908,7 @@ function SplitForm({
                   className="h-3 w-3"
                 />
                 GST
-              </label>
+              </label>}
             </div>
           </li>
         ))}
@@ -933,7 +954,7 @@ function SplitForm({
           onClick={handleSubmit}
           disabled={!canSave}
           className={cn(
-            'flex-1 h-9 rounded-md text-xs font-semibold transition-colors flex items-center justify-center gap-1',
+            'flex-1 h-11 rounded-md text-xs font-semibold transition-colors flex items-center justify-center gap-1',
             canSave
               ? 'bg-primary text-primary-foreground hover:bg-primary/90'
               : 'bg-muted text-muted-foreground cursor-not-allowed',
