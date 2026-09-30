@@ -15,6 +15,7 @@ import { useState, useEffect } from 'react';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 import { CalendarCheck } from 'lucide-react';
+import { localTodayISO } from '@/lib/format-date';
 
 interface CompletionDateSheetProps {
   open: boolean;
@@ -28,7 +29,7 @@ interface CompletionDateSheetProps {
 export function CompletionDateSheet({
   open, jobName, initialDate, onSave, onCancel,
 }: CompletionDateSheetProps) {
-  const today = new Date().toISOString().split('T')[0];
+  const today = localTodayISO();
   const [date, setDate] = useState(initialDate ?? today);
 
   // Reset when the sheet reopens for a different job. Same pattern the

@@ -17,6 +17,8 @@ import {
   SelectValue,
 } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
+import { localTodayISO } from '@/lib/format-date';
+import { hourSlices } from '@/lib/hours-breakdown';
 
 interface EntryFormProps {
   defaultType?: EntryType;
@@ -39,7 +41,8 @@ interface EntryFormProps {
    * responsible for confirming the deletion (this form just calls it).
    */
   onDelete?: () => void;
-  onSave: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) => void;
+  onSave: (entry: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) => void | Promise<void>;
+  onSaveMany?: (entries: Omit<Entry, 'id' | 'businessId' | 'createdAt'>[]) => Promise<void>;
   /**
    * Create an ADDITIONAL entry, on top of the one `onSave` handles.
    *
@@ -108,11 +111,14 @@ export function EntryForm({
   submitLabel,
   onDelete,
   onSave,
+  onSaveMany,
   onSaveAdditional,
   onCancel,
 }: EntryFormProps) {
   const { jobs, entries, teamMembers } = useStore();
-  const today = new Date().toISOString().split('T')[0];
+  const today = localTodayISO();
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
 
   // Editing an existing row (has an id) vs creating. Some create flows pass
   // partial defaultValues (e.g. schedule pre-fills entryDate), so presence of
@@ -167,6 +173,12 @@ export function EntryForm({
     }
     return [(defaultValues?.workerKind ?? 'owner') === 'owner' ? 'me' : 'other'];
   });
+  const [differentWork, setDifferentWork] = useState(false);
+  const [personHours, setPersonHours] = useState<Record<string, Record<string, string>>>({});
+  const [hoursError, setHoursError] = useState('');
+  const customHours = !isEdit && differentWork;
+  const sharedHours = activities.length > 1 ? splitHours : { [activities[0] ?? '']: hours };
+  const personLabel = (sel: string) => sel === 'me' ? 'Me' : sel === 'other' ? (workerName || 'Someone else') : employeeMembers.find((m) => m.id === sel)?.displayName || 'Team member';
   const whoSel = whoSels[0] ?? 'me'; // representative, used by edit-mode paths
   // Worker tier for the 'other' path — defaults to 'helper' (the common
   // one-off case). Preserves whatever was saved when editing.
@@ -208,7 +220,9 @@ export function EntryForm({
   // Live "so what does this shift cost me" hint. Rounded — it's a sanity
   // check next to the box, not an invoice.
   const parsedRate = parseFloat(costRate);
-  const parsedHours = parseFloat(hours);
+  const parsedHours = customHours
+    ? (activities.length ? activities : ['']).reduce((sum, a) => sum + (Number(personHours.other?.[a]) || 0), 0)
+    : parseFloat(hours);
   const costHint = (parsedRate > 0 && parsedHours > 0)
     ? `= $${Math.round(parsedRate * parsedHours).toLocaleString('en-NZ')} for ${parsedHours}h`
     : undefined;
@@ -338,6 +352,7 @@ export function EntryForm({
    *  silently drop attribution. When the caller can't take extra rows
    *  (`canFanOut` false) a tap replaces instead, so edit stays a swap. */
   function toggleWho(key: WhoSel) {
+    if (customHours && !personHours[key]) setPersonHours((prev) => ({ ...prev, [key]: { ...sharedHours } }));
     if (!canFanOut) {
       setWhoSels([key]);
       return;
@@ -351,47 +366,35 @@ export function EntryForm({
     });
   }
 
-  function handleSave() {
-    if (!description.trim()) return;
+  async function handleSave() {
+    if (saving || (!description.trim() && type !== 'hours')) return;
+    setSaving(true);
+    setSaveError('');
+    try {
 
-    // Multi-activity and/or multi-person hours (create mode only): one entry
-    // per PERSON per ACTIVITY. Same description/date/job on every row — the
-    // person, activity and hours are the only things that differ. Everyone
-    // picked gets the full hours (two people on an 8h day both worked 8h);
-    // the activity split, when present, applies to each person alike.
-    if (type === 'hours' && !isEdit && (activities.length > 1 || whoSels.length > 1)) {
-      let slices: { activity: ActivityType | undefined; hours: number | undefined }[];
-      if (activities.length > 1) {
-        slices = activities
-          .map((a) => ({ activity: a as ActivityType | undefined, hours: parseFloat(splitHours[a] ?? '') }))
-          .filter((s) => isFinite(s.hours!) && s.hours! > 0);
-      } else {
-        slices = [{
-          activity: activities[0] || undefined,
-          hours: hours ? parseFloat(hours) : undefined,
-        }];
-      }
-      if (slices.length === 0) return;
-      for (const sel of whoSels) {
-        const who = resolveWho(sel);
-        for (const s of slices) {
-          onSave({
-            jobId: jobId || undefined,
-            type,
-            hours: s.hours,
-            activity: s.activity,
-            gstApplies: false,
-            description: description.trim(),
-            entryDate: entryDate || today,
-            workerKind: who.workerKind,
-            loggedByUserId: who.loggedByUserId,
-            workerName: who.workerName,
-            workerCostRate: who.workerCostRate,
-            labourBilled: who.labourBilled,
-          });
+    if (type === 'hours') {
+      try {
+        // Validate every person before emitting any entries.
+        const rows = whoSels.flatMap((sel) =>
+          hourSlices(activities, customHours ? (personHours[sel] ?? {}) : sharedHours)
+            .map((slice) => ({ ...slice, sel })),
+        );
+        setHoursError('');
+        if (!isEdit) {
+          const batch = rows.map((row) => ({
+            jobId: jobId || undefined, type, hours: row.hours,
+            activity: row.activity, gstApplies: false,
+            description: description.trim() || 'Hours worked', entryDate: entryDate || today,
+            ...resolveWho(row.sel),
+          }));
+          if (onSaveMany) await onSaveMany(batch);
+          else for (const entry of batch) await onSave(entry);
+          return;
         }
+      } catch (error) {
+        setHoursError(error instanceof Error ? error.message : 'Check the hours entered.');
+        return;
       }
-      return;
     }
 
     const who = type === 'hours' ? resolveWho() : undefined;
@@ -402,7 +405,7 @@ export function EntryForm({
     const extraWhoSels = type === 'hours' && isEdit && onSaveAdditional
       ? whoSels.slice(1)
       : [];
-    onSave({
+    await onSave({
       jobId: jobId || undefined,
       type,
       category: (category as ExpenseCategory) || undefined,
@@ -462,10 +465,15 @@ export function EntryForm({
         labourBilled: extra.labourBilled || undefined,
       });
     }
+    } catch (err) {
+      setSaveError(err instanceof Error ? err.message : 'Could not save. Please retry.');
+    } finally {
+      setSaving(false);
+    }
   }
 
   return (
-    <div className="space-y-3">
+    <fieldset disabled={saving} className="space-y-3 min-w-0">
       {/* Type selector — hidden entirely when the caller locked the type
           (e.g. the schedule's "Log hours", which is only ever hours). */}
       {!lockType && (
@@ -527,7 +535,7 @@ export function EntryForm({
       {/* Description */}
       <div>
         <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-          Description
+          {type === 'hours' ? 'Note (optional)' : 'Description'}
         </label>
         <Textarea
           placeholder={
@@ -589,10 +597,10 @@ export function EntryForm({
             />
           </div>
         )}
-        {type === 'hours' && (
+        {type === 'hours' && !customHours && (
           <div>
             <label className="text-xs font-medium text-muted-foreground uppercase tracking-wide mb-1.5 block">
-              {activities.length > 1 ? 'Total hours' : 'Hours'}
+              {whoSels.length > 1 ? 'Hours each' : activities.length > 1 ? 'Total hours' : 'Hours'}
             </label>
             <input
               type="number"
@@ -682,7 +690,7 @@ export function EntryForm({
           {/* The split — one row per selected activity. Adjusting a row
               updates the total (the rows are the truth once you're
               hand-tuning); editing the total up top re-splits evenly. */}
-          {activities.length > 1 && (
+          {activities.length > 1 && !customHours && (
             <div className="mt-2 space-y-1.5">
               {activities.map((a) => (
                 <div key={a} className="flex items-center gap-2">
@@ -706,7 +714,7 @@ export function EntryForm({
                 </div>
               ))}
               <p className="text-[11px] text-muted-foreground leading-snug">
-                Saves as {activities.length} entries — one per activity.
+                Split the hours between activities.
               </p>
             </div>
           )}
@@ -760,7 +768,7 @@ export function EntryForm({
           {/* Multi-person note — spell out exactly what saves, since "8h for
               two people" could plausibly mean 8h each or 4h each. It's 8h
               each: everyone picked gets the full hours. */}
-          {canFanOut && whoSels.length > 1 && (
+          {canFanOut && whoSels.length > 1 && !customHours && (
             <p className="mt-1.5 text-[11px] text-muted-foreground leading-snug">
               {isEdit ? (
                 // Editing: this row belongs to the first person picked, the
@@ -774,12 +782,47 @@ export function EntryForm({
                 </>
               ) : (
                 <>
-                  Saves separate entries — each person gets the
-                  {activities.length > 1 ? ' split' : ' full'} hours
-                  ({whoSels.length} {activities.length > 1 ? `× ${activities.length} entries` : 'entries'}).
+                  {whoSels.map((sel) => `${personLabel(sel)}: ${hours || '0'} h`).join(' · ')}
+                  {activities.length > 1 && ' — same activity split.'}
                 </>
               )}
             </p>
+          )}
+          {!isEdit && (whoSels.length > 1 || differentWork) && (
+            <label className="mt-3 flex min-h-11 items-center gap-3 text-sm font-medium cursor-pointer">
+              <input type="checkbox" className="h-5 w-5 accent-primary" checked={differentWork}
+                onChange={(e) => {
+                  setDifferentWork(e.target.checked);
+                  if (e.target.checked) setPersonHours(Object.fromEntries(whoSels.map((sel) => [sel, { ...sharedHours }])));
+                  setHoursError('');
+                }} />
+              Different work per person
+            </label>
+          )}
+          {customHours && (
+            <div className="mt-2 space-y-3">
+              <p className="text-xs text-muted-foreground">Adjust each person’s hours. Leave an activity blank if they didn’t do it.</p>
+              {whoSels.map((sel) => (
+                <fieldset key={sel} className="rounded-xl border p-3 space-y-2">
+                  <legend className="px-1 text-sm font-semibold">{personLabel(sel)}</legend>
+                  {(activities.length ? activities : ['']).map((activity) => (
+                    <label key={activity} className="flex items-center gap-2 text-sm">
+                      <span className="flex-1 capitalize">{activity || 'Hours'}</span>
+                      <input type="number" inputMode="decimal" min="0" step="any" placeholder="—"
+                        aria-label={`${personLabel(sel)} ${activity || 'total'} hours`}
+                        value={personHours[sel]?.[activity] ?? ''}
+                        onChange={(e) => {
+                          const value = e.target.value;
+                          setPersonHours((prev) => ({ ...prev, [sel]: { ...prev[sel], [activity]: value } }));
+                        }}
+                        className="w-20 h-11 px-3 rounded-lg border border-input bg-background text-right" />
+                      <span>h</span>
+                    </label>
+                  ))}
+                  <p className="text-sm font-medium text-right">Total: {Math.round((activities.length ? activities : ['']).reduce((sum, a) => sum + (Number(personHours[sel]?.[a]) || 0), 0) * 100) / 100} h</p>
+                </fieldset>
+              ))}
+            </div>
           )}
           {/* Attribution note — make the payroll consequence loud in both
               directions, since the two pills look identical. */}
@@ -1017,10 +1060,12 @@ export function EntryForm({
         </>
       )}
 
+      {type === 'hours' && hoursError && <p role="alert" className="text-sm text-red-600">{hoursError}</p>}
+      {saveError && <p role="alert" className="text-sm text-red-600">{saveError}</p>}
       {/* Actions. In edit mode, an extra Delete button is rendered so the user
           can remove a misclicked entry without a separate UI. */}
       <div className="flex gap-2 pt-1">
-        <Button variant="outline" className="flex-1" onClick={onCancel}>
+        <Button variant="outline" className="flex-1 min-h-11" onClick={onCancel}>
           Cancel
         </Button>
         {onDelete && (
@@ -1033,17 +1078,17 @@ export function EntryForm({
           </Button>
         )}
         <Button
-          className="flex-1 bg-primary"
+          className="flex-1 min-h-11 bg-primary"
           onClick={handleSave}
-          disabled={!description.trim()}
+          disabled={saving || (!description.trim() && type !== 'hours')}
         >
           {/* isEdit, not defaultValues — a pre-seeded CREATE form (the day
               sheet's "Log hours", the NL parser's hand-off) carries
               defaultValues with no id, and labelling that "Update" reads
               like it's editing something that doesn't exist yet. */}
-          {submitLabel ?? (isEdit ? 'Update' : 'Save Entry')}
+          {saving ? 'Saving…' : submitLabel ?? (isEdit ? 'Update' : type === 'hours' ? 'Save hours' : 'Save Entry')}
         </Button>
       </div>
-    </div>
+    </fieldset>
   );
 }

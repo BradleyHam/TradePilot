@@ -374,7 +374,7 @@ export default function JobsPage() {
             }
           />
         ) : (
-          <div className="space-y-2.5 pb-6">
+          <div className="space-y-2.5 pb-24 md:pb-6">
             {filteredJobs.map((job) => {
               const stats = jobStats(job, entries, materials, statsOpts);
               const coverPath = jobCoverPath(job, shiftPhotos);
@@ -385,8 +385,8 @@ export default function JobsPage() {
                   totalHours={stats.totalHours}
                   totalExpenses={stats.totalExpenses}
                   totalIncome={stats.totalIncome}
+                  expectedIncome={stats.expectedIncome}
                   expectedProfit={stats.expectedProfit}
-                  expectedIsConfident={stats.expectedIsConfident}
                   coverUrl={coverPath ? coverUrls[coverPath] : undefined}
                   onClick={() => setSelectedJob(job)}
                 />

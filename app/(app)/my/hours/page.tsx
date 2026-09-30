@@ -1,14 +1,15 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import { useRouter } from 'next/navigation';
 import Link from 'next/link';
-import { useStore } from '@/lib/store';
+import { useStore, type MyHoursInput } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { jobCoverPath, useSignedCovers } from '@/lib/job-cover';
 import { ScopeLists } from '@/components/jobs/job-scope-panel';
 import { JobPhoto } from '@/components/shared/job-photo';
 import { Button } from '@/components/ui/button';
+import { localTodayISO } from '@/lib/format-date';
 import { cn } from '@/lib/utils';
 import type { ActivityType, JobStatus, ShiftReportStatus } from '@/lib/types';
 import {
@@ -43,12 +44,12 @@ const ACTIVITY_LABELS: Partial<Record<ActivityType, string>> = {
 const HOUR_CHIPS = [2, 4, 6, 8];
 
 function todayIso() {
-  return new Date().toISOString().slice(0, 10);
+  return localTodayISO();
 }
 function isoDaysAgo(n: number) {
   const d = new Date();
   d.setDate(d.getDate() - n);
-  return d.toISOString().slice(0, 10);
+  return localTodayISO(d);
 }
 function prettyDate(iso: string) {
   if (iso === todayIso()) return 'Today';
@@ -68,7 +69,7 @@ function mapsHref(location: string) {
 export default function MyHoursPage() {
   const router = useRouter();
   const {
-    jobs, entries, scheduleItems, membership, logMyHours, deleteEntry,
+    jobs, entries, scheduleItems, membership, logMyHoursBatch, deleteEntry,
     shiftPhotos, uploadShiftPhotos, shiftReports, saveShiftReport,
   } = useStore();
 
@@ -95,6 +96,7 @@ export default function MyHoursPage() {
   const [date, setDate] = useState(todayIso());
   const [photos, setPhotos] = useState<File[]>([]);
   const [busy, setBusy] = useState(false);
+  const pendingHours = useRef<{ key: string; rows: MyHoursInput[] } | null>(null);
   const [justSaved, setJustSaved] = useState(false);
   const [saveError, setSaveError] = useState<string | null>(null);
   /** Is the collapsible "what's included" block open? Closed by default. */
@@ -285,26 +287,19 @@ export default function MyHoursPage() {
     const jobFor = (a?: ActivityType) =>
       a && OFFSITE.includes(a) ? undefined : (theJob || undefined);
 
-    if (totalHours > 0 && multi) {
-      for (const a of activities) {
-        const h = parseFloat(activitySplit[a] ?? '') || 0;
-        if (h <= 0) continue;
-        logMyHours({
-          jobId: jobFor(a),
-          hours: h,
-          activity: a,
-          note: note.trim() || undefined,
-          entryDate: theDate,
-        });
+    if (totalHours > 0) {
+      const drafts: MyHoursInput[] = multi
+        ? activities.map((activity) => ({ jobId: jobFor(activity), hours: parseFloat(activitySplit[activity] ?? '') || 0, activity, note: note.trim(), entryDate: theDate })).filter((entry) => entry.hours > 0)
+        : [{ jobId: jobFor(activities[0]), hours: totalHours, activity: activities[0], note: note.trim(), entryDate: theDate }];
+      const key = JSON.stringify(drafts);
+      if (pendingHours.current?.key !== key) pendingHours.current = { key, rows: drafts.map((entry) => ({ ...entry, id: crypto.randomUUID() })) };
+      const saved = await logMyHoursBatch(pendingHours.current.rows);
+      if (!saved) {
+        setSaveError('Could not confirm your hours. They are still here — please retry.');
+        setBusy(false);
+        return;
       }
-    } else if (totalHours > 0) {
-      logMyHours({
-        jobId: jobFor(activities[0]),
-        hours: totalHours,
-        activity: activities[0] || undefined,
-        note: note.trim() || undefined,
-        entryDate: theDate,
-      });
+      pendingHours.current = null;
     }
     setHours(''); setActivities([]); setActivitySplit({}); setPhotos([]);
     // Photos hang off a job, so there's nothing to attach on an

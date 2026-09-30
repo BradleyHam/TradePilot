@@ -1,12 +1,13 @@
 'use client';
 
-import { useMemo, useState } from 'react';
+import { useMemo, useRef, useState } from 'react';
 import dynamic from 'next/dynamic';
 import Link from 'next/link';
 import { useSearchParams } from 'next/navigation';
 import { PageHeader } from '@/components/shared/page-header';
-import { ParsedPreview } from '@/components/entry/parsed-preview';
+import { QuickHoursForm } from '@/components/entry/quick-hours-form';
 import { EntryForm } from '@/components/entry/entry-form';
+import { JobForm, type LeadSaveContext } from '@/components/jobs/job-form';
 import { BankUploadCard } from '@/components/reconcile/bank-upload-card';
 import { ReconcileRow } from '@/components/reconcile/reconcile-row';
 
@@ -17,32 +18,20 @@ const BillPdfUploadCard = dynamic(
   { ssr: false },
 );
 import { useStore } from '@/lib/store';
-import { parseNaturalLanguage } from '@/lib/nl-parser';
-import { Entry, EntryType, ParsedEntry } from '@/lib/types';
-import { Button } from '@/components/ui/button';
-import { Textarea } from '@/components/ui/textarea';
+import { Entry, EntryType, Job } from '@/lib/types';
 import {
-  Receipt, DollarSign, Clock, MessageSquare, FileText, AlertCircle, StickyNote,
-  Sparkles, ChevronDown, CheckCircle2, Hammer, ChevronRight, Landmark,
+  Receipt, DollarSign, Clock, PhoneCall, MessageSquare, FileText, AlertCircle, StickyNote,
+  CheckCircle2, ChevronRight, Landmark,
   CalendarPlus,
 } from 'lucide-react';
 import { cn } from '@/lib/utils';
-
-const EXAMPLES = [
-  'Bought 12L paint from Resene for Smith job $186',
-  'Worked 6 hours prep on Johnson exterior',
-  'New enquiry from Sarah in Wanaka for interior repaint, maybe $4k',
-  'Sent quote to Mike for $8,500',
-  'Power bill due Friday $240',
-];
-
-type Mode = 'nl' | 'form';
+import { localTodayISO } from '@/lib/format-date';
 
 const QUICK_TYPES: { type: EntryType; label: string; icon: React.ElementType; color: string }[] = [
   { type: 'expense',  label: 'Expense',  icon: Receipt,       color: 'text-red-500' },
   { type: 'income',   label: 'Income',   icon: DollarSign,    color: 'text-green-500' },
   { type: 'hours',    label: 'Hours',    icon: Clock,         color: 'text-blue-500' },
-  { type: 'enquiry',  label: 'Enquiry',  icon: MessageSquare, color: 'text-violet-500' },
+  { type: 'enquiry',  label: 'Lead',     icon: PhoneCall,     color: 'text-violet-500' },
   { type: 'quote',    label: 'Quote',    icon: FileText,      color: 'text-amber-500' },
   { type: 'bill',     label: 'Bill',     icon: AlertCircle,   color: 'text-orange-500' },
   { type: 'note',     label: 'Note',     icon: StickyNote,    color: 'text-slate-500' },
@@ -57,7 +46,7 @@ const DEEP_LINK_TYPES: ReadonlySet<EntryType> = new Set([
 ]);
 
 export default function EntryPage() {
-  const { addEntry, addJob, businessId } = useStore();
+  const { addEntries, addJob, logContact, businessId } = useStore();
   const searchParams = useSearchParams();
 
   // Honour `?type=expense|income|hours` deep-link from the Home screen's
@@ -72,7 +61,9 @@ export default function EntryPage() {
 
   const [showForm, setShowForm] = useState<boolean>(deepLinkType != null);
   const [formType, setFormType] = useState<EntryType>(deepLinkType ?? 'expense');
-  const [saved, setSaved] = useState(false);
+  const [savedMessage, setSavedMessage] = useState('');
+  const [moreTypes, setMoreTypes] = useState(false);
+  const pendingSave = useRef<{ fingerprint: string; rows: Entry[] } | null>(null);
 
   async function handleFormSave(data: Omit<Entry, 'id' | 'businessId' | 'createdAt'>) {
     const nowIso = new Date().toISOString();
@@ -102,23 +93,55 @@ export default function EntryPage() {
       enquiryJobId = lead?.id;
     }
 
-    const entry: Entry = {
-      // UUID, not Date.now() — a multi-activity hours split saves several
-      // entries in the same millisecond, and timestamp ids collide.
-      id: `ent_${crypto.randomUUID()}`,
-      businessId: businessId ?? '',
-      createdAt: nowIso,
-      ...data,
-      jobId: data.jobId ?? enquiryJobId,
-    };
-    addEntry(entry);
-    showSaved();
+    await handleManySave([{ ...data, jobId: data.jobId ?? enquiryJobId }]);
+  }
+
+  async function handleManySave(drafts: Omit<Entry, 'id' | 'businessId' | 'createdAt'>[]) {
+    const fingerprint = JSON.stringify(drafts);
+    if (pendingSave.current?.fingerprint !== fingerprint) {
+      pendingSave.current = { fingerprint, rows: drafts.map((draft) => ({
+        ...draft, id: crypto.randomUUID(), businessId: businessId ?? '', createdAt: new Date().toISOString(),
+      })) };
+    }
+    if (!await addEntries(pendingSave.current.rows)) {
+      throw new Error('Could not confirm the save. Your entry is still here — please retry.');
+    }
+    pendingSave.current = null;
+    showSaved('Saved');
     setShowForm(false);
   }
 
-  function showSaved() {
-    setSaved(true);
-    setTimeout(() => setSaved(false), 2500);
+  async function handleLeadSave(
+    data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>,
+    context?: LeadSaveContext,
+  ) {
+    const nowIso = new Date().toISOString();
+    const lead = await addJob({
+      id: crypto.randomUUID(),
+      businessId: businessId ?? '',
+      createdAt: nowIso,
+      updatedAt: nowIso,
+      ...data,
+    });
+    if (!lead) return;
+
+    // The first inbound conversation belongs in the same contact timeline
+    // as every later call/text/email. It is distinct from lead source:
+    // someone can find Brad through Google, then phone him.
+    logContact({
+      jobId: lead.id,
+      direction: 'in',
+      channel: context?.contactChannel ?? 'phone',
+      contactedAt: nowIso,
+      note: 'Initial lead enquiry',
+    });
+    showSaved('Lead saved');
+    setShowForm(false);
+  }
+
+  function showSaved(message: string) {
+    setSavedMessage(message);
+    setTimeout(() => setSavedMessage(''), 2500);
   }
 
   function openFormType(type: EntryType) {
@@ -129,17 +152,17 @@ export default function EntryPage() {
   return (
     <div className="flex flex-col min-h-full">
       <PageHeader
-        title="Entry"
+        title="Log"
         subtitle={new Date().toLocaleDateString('en-NZ', { weekday: 'long', day: 'numeric', month: 'long' })}
       />
 
       <div className="px-4 md:px-6 space-y-4 pb-6">
 
         {/* Saved confirmation */}
-        {saved && (
+        {savedMessage && (
           <div className="flex items-center gap-2 px-4 py-3 rounded-xl bg-green-50 border border-green-200 text-green-700 text-sm font-medium">
             <CheckCircle2 size={16} />
-            Entry saved
+            {savedMessage}
           </div>
         )}
 
@@ -151,18 +174,19 @@ export default function EntryPage() {
           <div className="space-y-3">
             <p className="text-sm text-muted-foreground">What do you want to log?</p>
             <div className="grid grid-cols-2 gap-2.5 sm:grid-cols-4">
-              {QUICK_TYPES.map(({ type, label, icon: Icon, color }) => (
+              {(moreTypes ? QUICK_TYPES : [QUICK_TYPES[2], QUICK_TYPES[0], QUICK_TYPES[6]]).map(({ type, label, icon: Icon, color }) => (
                 <button
                   key={type}
                   onClick={() => openFormType(type)}
                   className="flex flex-col items-center justify-center gap-2 p-4 rounded-2xl bg-card border border-border hover:border-primary/40 hover:bg-accent transition-colors min-h-[88px] active:scale-95"
                 >
                   <Icon size={22} className={color} strokeWidth={1.8} />
-                  <span className="text-sm font-medium text-foreground">{label}</span>
+                  <span className="text-sm font-medium text-foreground">{type === 'expense' ? 'Bought something' : label}</span>
                 </button>
               ))}
             </div>
 
+            <button type="button" className="min-h-11 w-full text-sm font-medium text-muted-foreground" onClick={() => setMoreTypes((open) => !open)}>{moreTypes ? 'Fewer options' : 'More: income, lead, quote or bill'}</button>
             {/* Site visit tile — separate row because it's structurally
                 different from the other tiles (it creates a schedule
                 item, not an entry). The deep-link uses a query param so
@@ -187,10 +211,35 @@ export default function EntryPage() {
         )}
 
         {/* Entry form */}
-        {showForm && (
+        {showForm && formType === 'enquiry' && (
+          <div className="bg-card border border-border rounded-2xl p-4">
+            <div className="mb-4">
+              <h2 className="font-heading text-lg font-semibold text-foreground">New lead</h2>
+              <p className="text-xs text-muted-foreground mt-0.5">
+                Capture the basics now. You can add the detail later.
+              </p>
+            </div>
+            <JobForm
+              variant="lead"
+              defaultContactChannel="phone"
+              defaultValues={{
+                status: 'lead',
+                leadDate: localTodayISO(),
+              }}
+              onSave={handleLeadSave}
+              onCancel={() => setShowForm(false)}
+            />
+          </div>
+        )}
+
+        {showForm && formType === 'hours' && <div className="rounded-2xl border border-border bg-card p-4"><QuickHoursForm onSaveMany={handleManySave} onCancel={() => setShowForm(false)} /></div>}
+
+        {showForm && formType !== 'enquiry' && formType !== 'hours' && (
           <div className="bg-card border border-border rounded-2xl p-4">
             <EntryForm
               defaultType={formType}
+              lockType
+              onSaveMany={handleManySave}
               onSave={handleFormSave}
               onCancel={() => setShowForm(false)}
             />
@@ -200,14 +249,14 @@ export default function EntryPage() {
         {/* Bank reconcile — drop a CSV anywhere on this card to import.
             Same flow as the dedicated /reconcile page but inline so Brad
             doesn't have to navigate away from Entry to clear the queue. */}
-        <BankReconcileSection />
+        {!showForm && <BankReconcileSection />}
 
         {/* Supplier bill PDF upload — text-extract + LLM parse, lands as
             a draft on Home for confirmation. See components/entry/bill-pdf-upload. */}
-        <BillPdfUploadCard />
+        {!showForm && <BillPdfUploadCard />}
 
         {/* Recent entries */}
-        <RecentEntries />
+        {!showForm && <RecentEntries />}
       </div>
     </div>
   );

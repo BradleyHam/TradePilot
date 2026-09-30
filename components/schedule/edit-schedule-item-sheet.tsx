@@ -187,18 +187,36 @@ export function EditScheduleItemSheet({ open, onOpenChange, target, jobs }: Prop
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
         side="bottom"
-        className="h-[90vh] overflow-y-auto rounded-t-2xl px-4 pb-10"
+        showCloseButton={false}
+        className="h-[90dvh] max-h-[90dvh] overflow-y-auto rounded-t-2xl p-0 gap-0"
       >
-        <SheetHeader className="pb-4">
+        {/* The close action deliberately lives outside the scrolling form.
+            On a long booking edit the old header could scroll completely
+            off-screen, making this feel like a screen the user was trapped in. */}
+        <SheetHeader className="sticky top-0 z-20 shrink-0 border-b border-border bg-popover px-4 py-3 pr-24 shadow-sm">
           <SheetTitle>Edit schedule</SheetTitle>
+          <p className="text-xs text-muted-foreground">
+            Change the booking, then save — or close without changing it.
+          </p>
+          <Button
+            type="button"
+            variant="outline"
+            className="fixed right-4 top-[max(0.75rem,env(safe-area-inset-top))] z-[60] h-10 bg-popover px-3 shadow-sm"
+            onClick={() => onOpenChange(false)}
+          >
+            <X size={16} className="mr-1.5" />
+            Close
+          </Button>
         </SheetHeader>
-        {target && (
-          <EditForm
-            target={target}
-            jobs={jobs}
-            onClose={() => onOpenChange(false)}
-          />
-        )}
+        <div className="px-4 pb-[max(1.5rem,env(safe-area-inset-bottom))]">
+          {target && (
+            <EditForm
+              target={target}
+              jobs={jobs}
+              onClose={() => onOpenChange(false)}
+            />
+          )}
+        </div>
       </SheetContent>
     </Sheet>
   );
@@ -818,7 +836,8 @@ function EditForm({
       <div className="flex flex-col gap-2 pt-2">
         <div className="flex gap-2">
           <Button variant="outline" className="flex-1 h-11" onClick={onClose}>
-            Cancel
+            <X size={16} className="mr-1.5" />
+            Close without saving
           </Button>
           <Button
             className="flex-1 h-11 bg-primary"

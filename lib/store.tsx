@@ -9,7 +9,9 @@ import {
   jobToRow, entryToRow, scheduleItemToRow, invoiceToRow, bankTransactionToRow,
   materialToRow, quoteToRow, quoteAttachmentToRow,
   rowToPaintStock, paintStockToRow,
-  rowToBusinessMember, rowToShiftPhoto, rowToShiftReport, rowToJobVariation, rowToClientJobLink, rowToJobContact,
+  rowToBusinessMember, rowToCrewPerson, crewPersonToRow,
+  rowToJobProgressSnapshot, rowToJobProgressPerson,
+  rowToShiftPhoto, rowToShiftReport, rowToJobVariation, rowToClientJobLink, rowToJobContact,
   rowToPayRun, payRunToRow,
   rowToJobAssignment, rowToScheduleAssignment,
 } from './supabase/mappers';
@@ -18,12 +20,25 @@ import type {
   JobImport, QuoteAttachment, QuoteAttachmentKind,
   JobStatus, QuoteTemplate, JobMarketing,
   PaintStockItem,
-  BusinessMember, MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, JobVariation, ClientJobLink, PayRun,
+  BusinessMember, CrewPerson, JobProgressSnapshot, JobProgressPerson,
+  MemberRole, ShiftPhoto, ShiftReport, ShiftReportStatus, JobVariation, ClientJobLink, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from './types';
 import { deriveWorkType } from './types';
+import { persistEntryBatch } from './entry-batch';
+import { localTodayISO } from './format-date';
 import { compressImage } from './image-compress';
+
+export interface MyHoursInput {
+  id?: string;
+  jobId?: string;
+  hours: number;
+  activity?: ActivityType;
+  note?: string;
+  entryDate?: string;
+}
+
 
 /**
  * Supabase's `PostgrestError` doesn't enumerate its fields (Chrome devtools
@@ -119,6 +134,12 @@ interface StoreState {
    * the Settings → Team page.
    */
   teamMembers: BusinessMember[];
+  /** Saved people used for planning only. They have no login or payroll relationship. */
+  crewPeople: CrewPerson[];
+  /** Append-only job progress history. Owner-only management figures. */
+  jobProgressSnapshots: JobProgressSnapshot[];
+  /** Named crew assumptions attached to the progress snapshots above. */
+  jobProgressPeople: JobProgressPerson[];
   /**
    * Wage payments to employees (fortnightly pay runs for Suzie). Rows
    * exist only for PAID periods — pending periods are computed on the
@@ -181,9 +202,12 @@ interface StoreState {
     /** Explicit completion date (overrides job.endDate / latest-hours / today). */
     explicitCompletionDate?: string,
   ) => Promise<{ completed: number; deleted: number }>;
-  addEntry: (entry: Entry) => void;
+  addEntry: (entry: Entry) => Promise<boolean>;
+  addEntries: (entries: Entry[]) => Promise<boolean>;
+  saveHoursEstimate: (id: string, estimate: Job['hoursEstimate']) => Promise<boolean>;
   updateEntry: (id: string, updates: Partial<Entry>) => void;
   deleteEntry: (id: string) => void;
+  clearJobDayHours: (jobId: string, date: string, ids: string[]) => Promise<boolean>;
   /**
    * Retire an unbilled-labour accrual: mark these hours entries as
    * invoiced by the worker, optionally linking the bill that covered
@@ -201,18 +225,32 @@ interface StoreState {
    * hours→in-progress auto-advance + schedule auto-complete. Owners can
    * use it too (defaults workerKind to 'owner').
    */
-  logMyHours: (input: {
-    /**
-     * Omit for off-site work (admin / website / marketing / training):
-     * those hours belong to no job, matching the app's overhead
-     * convention. RLS permits a null job_id for hours (migration 038).
-     */
-    jobId?: string;
-    hours: number;
-    activity?: ActivityType;
+  logMyHours: (input: MyHoursInput) => Promise<boolean>;
+  logMyHoursBatch: (inputs: MyHoursInput[]) => Promise<boolean>;
+  /** Add a reusable no-login person for planning. Never creates payroll or access. */
+  addCrewPerson: (input: {
+    displayName: string;
+    workerKind: CrewPerson['workerKind'];
+  }) => Promise<CrewPerson | null>;
+  /**
+   * Append one dated work-progress estimate. The DB calculates actual hours
+   * and job value atomically; this does not touch entries/invoices/tax.
+   */
+  recordJobProgress: (input: {
+    jobId: string;
+    asOfDate: string;
+    state: JobProgressSnapshot['state'];
+    people: Array<{
+      businessMemberId?: string;
+      crewPersonId?: string;
+      personName: string;
+      workerKind: JobProgressPerson['workerKind'];
+      remainingHours: number;
+      inputDays?: number;
+      hoursPerDay?: number;
+    }>;
     note?: string;
-    entryDate?: string;
-  }) => void;
+  }) => Promise<JobProgressSnapshot | null>;
   /**
    * Job-level assignments (who's on which job). Owner sees all rows;
    * employee RLS restricts to their own. Empty pre-migration-035.
@@ -412,6 +450,8 @@ interface StoreState {
    * patch its recorded figures. Optimistic + rollback.
    */
   updatePayRun: (id: string, patch: Partial<Pick<PayRun, 'eiFiled' | 'payePaid' | 'paye' | 'net' | 'notes'>>) => void;
+  /** Correct the pay day on both the payroll record and its linked wages expense. */
+  correctPayRunPaidDate: (id: string, paidDate: string) => Promise<{ ok: boolean; error?: string }>;
 
   /**
    * Flip a draft bill (isDraft=true) into a real, counted bill. Optional
@@ -694,6 +734,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   // of having the ref.)
   const jobsRef = useRef(jobs);
   const entriesRef = useRef(entries);
+  const insertIdsRef = useRef(new Map<string, string>());
+  const lastEntryError = useRef<string | null>(null);
+  const lastEstimateError = useRef<string | null>(null);
   const scheduleItemsRef = useRef(scheduleItems);
   /* eslint-disable react-hooks/refs */
   jobsRef.current = jobs;
@@ -720,6 +763,9 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
   const [clientJobLinks, setClientJobLinks] = useState<ClientJobLink[]>([]);
   const [jobContacts, setJobContacts] = useState<JobContact[]>([]);
   const [teamMembers, setTeamMembers] = useState<BusinessMember[]>([]);
+  const [crewPeople, setCrewPeople] = useState<CrewPerson[]>([]);
+  const [jobProgressSnapshots, setJobProgressSnapshots] = useState<JobProgressSnapshot[]>([]);
+  const [jobProgressPeople, setJobProgressPeople] = useState<JobProgressPerson[]>([]);
   const [jobAssignments, setJobAssignments] = useState<JobAssignment[]>([]);
   const [scheduleAssignments, setScheduleAssignments] = useState<ScheduleAssignment[]>([]);
   // Refs so the assign mutators can diff against current state without
@@ -766,7 +812,8 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         setMaterials([]); setQuotes([]); setSettings([]); setInvoices([]);
         setBankTransactions([]); setJobImports([]); setQuoteAttachments([]);
         setPaintStock([]); setShiftPhotos([]); setShiftReports([]); setJobVariations([]);
-        setClientJobLinks([]); setJobContacts([]);
+        setClientJobLinks([]); setJobContacts([]); setTeamMembers([]);
+        setCrewPeople([]); setJobProgressSnapshots([]); setJobProgressPeople([]);
         setLoading(false);
         return;
       }
@@ -823,7 +870,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       // the missing money columns (they map to undefined). Owners read the
       // full base table as before.
       const jobsSource = resolvedRole === 'employee' ? 'jobs_public' : 'jobs';
-      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, jv, cjl, tm, pr, ja, sa, jc] = await Promise.all([
+      const [j, e, s, m, q, st, inv, bnk, ji, qa, ps, sp, sr, jv, cjl, tm, cp, jps, jpp, pr, ja, sa, jc] = await Promise.all([
         supabase.from(jobsSource).select('*').eq('business_id', bizId).order('created_at', { ascending: false }),
         supabase.from('entries').select('*').eq('business_id', bizId).order('entry_date', { ascending: false }),
         supabase.from('schedule_items').select('*').eq('business_id', bizId).order('date', { ascending: true }),
@@ -865,6 +912,16 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         // Team members — owner reads all rows (RLS); employees only their
         // own. Drives payroll flags + Settings → Team.
         supabase.from('business_members').select('*').eq('business_id', bizId)
+          .order('created_at', { ascending: true }),
+        // Planning-only people + progress are owner-only management data.
+        // Keep them out of the tableErrors banner so a not-yet-applied 053
+        // migration cannot blank or alarm the rest of this working app.
+        supabase.from('crew_people').select('*').eq('business_id', bizId)
+          .is('archived_at', null).order('display_name', { ascending: true }),
+        supabase.from('job_progress_snapshots').select('*').eq('business_id', bizId)
+          .order('as_of_date', { ascending: false })
+          .order('created_at', { ascending: false }),
+        supabase.from('job_progress_people').select('*').eq('business_id', bizId)
           .order('created_at', { ascending: true }),
         // Pay runs — owner-only (RLS); employees degrade to empty, as does
         // the whole app if migration 032 hasn't been applied yet.
@@ -937,6 +994,12 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       if (cjl.error) console.warn('[store] job_client_links load failed (migration 052 applied?):', cjl.error.message);
       setClientJobLinks((cjl.data ?? []).map(rowToClientJobLink));
       setTeamMembers((tm.data ?? []).map(rowToBusinessMember));
+      if (cp.error) console.warn('[store] crew_people load failed (migration 053 applied?):', cp.error.message);
+      setCrewPeople((cp.data ?? []).map(rowToCrewPerson));
+      if (jps.error) console.warn('[store] job_progress_snapshots load failed (migration 053 applied?):', jps.error.message);
+      setJobProgressSnapshots((jps.data ?? []).map(rowToJobProgressSnapshot));
+      if (jpp.error) console.warn('[store] job_progress_people load failed (migration 053 applied?):', jpp.error.message);
+      setJobProgressPeople((jpp.data ?? []).map(rowToJobProgressPerson));
       if (pr.error) console.warn('[store] pay_runs load failed (migration 032 applied?):', pr.error.message);
       setPayRuns((pr.data ?? []).map(rowToPayRun));
       if (ja.error) console.warn('[store] job_assignments load failed (migration 035 applied?):', ja.error.message);
@@ -1465,71 +1528,18 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     if (!entry.jobId || !entry.entryDate) return;
     if (!entry.hours || entry.hours <= 0) return;
 
-    // Use functional setState so we ALWAYS see the freshest scheduleItems —
-    // scheduleItemsRef can lag by one render in some HMR edge cases, but
-    // the setter callback's `prev` argument is guaranteed current. We do
-    // the match-and-flip inside the setter so it's atomic. The matched
-    // id is captured in a closure so the supabase update fires once for
-    // the correct row.
-    let matchedId: string | undefined;
-    let diag: { totalJobBookings: number; sameJob: number; sameJobSameDate: number; sameJobSameDateUncompleted: number } | null = null;
-    setScheduleItems((prev) => {
-      // Diagnostic counters so a no-match case tells us WHY it didn't
-      // match (no rows for this job? rows exist but on different dates?
-      // matching date but already completed?). Cheap to compute, only
-      // logged when there's no match.
-      diag = {
-        totalJobBookings: prev.filter((s) => s.type === 'job_booking').length,
-        sameJob: prev.filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId).length,
-        sameJobSameDate: prev.filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId && s.date === entry.entryDate).length,
-        sameJobSameDateUncompleted: prev.filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId && s.date === entry.entryDate && !s.completed).length,
-      };
-      const match = prev.find(
-        (s) => s.type === 'job_booking'
-          && s.jobId === entry.jobId
-          && s.date === entry.entryDate
-          && !s.completed,
-      );
-      if (!match) return prev;
-      matchedId = match.id;
-      return prev.map((s) => (s.id === match.id ? { ...s, completed: true } : s));
-    });
-
-    if (!matchedId) {
-      // Verbose log only when an hours entry IS tagged to a job — those
-      // are the cases where we expected to match but didn't. Helps
-      // diagnose date format mismatches, jobId drift, etc.
-      // eslint-disable-next-line no-console
-      console.log('[store] auto-complete skipped — no matching schedule_item', {
-        entry: { jobId: entry.jobId, entryDate: entry.entryDate, hours: entry.hours },
-        scheduleItemCounts: diag,
-        // Show 3 sample rows for this job so we can eyeball the actual
-        // stored dates if there's a format mismatch.
-        sampleSameJobRows: scheduleItemsRef.current
-          .filter((s) => s.type === 'job_booking' && s.jobId === entry.jobId)
-          .slice(0, 3)
-          .map((s) => ({ id: s.id, date: s.date, completed: s.completed, skipReasonKind: s.skipReasonKind })),
-      });
-      return;
-    }
-
-    // Visible in devtools so we can confirm the auto-complete fired.
-    // eslint-disable-next-line no-console
-    console.log('[store] auto-completed schedule_item for hours entry', {
-      scheduleItemId: matchedId,
-      jobId: entry.jobId,
-      date: entry.entryDate,
-    });
-
+    const match = scheduleItemsRef.current.find((item) => item.type === 'job_booking'
+      && item.jobId === entry.jobId && item.date === entry.entryDate && !item.completed && !item.skipReasonKind);
+    if (!match) return;
+    setScheduleItems((prev) => prev.map((item) => item.id === match.id ? { ...item, completed: true } : item));
     (async () => {
-      const { error: updErr } = await supabase
-        .from('schedule_items')
-        .update({ completed: true })
-        .eq('id', matchedId!);
-      if (updErr) {
-        console.warn('[store] auto-complete schedule_item failed (non-fatal):', {
-          message: updErr.message, code: updErr.code, scheduleItemId: matchedId,
-        });
+      try {
+        const { data, error: updateError } = await supabase.from('schedule_items')
+          .update({ completed: true }).eq('id', match.id).select('id').single();
+        if (updateError || !data) throw new Error(updateError?.message ?? 'Booking update was not confirmed.');
+      } catch {
+        setScheduleItems((prev) => prev.map((item) => item.id === match.id ? { ...item, completed: false } : item));
+        setError('Hours saved, but the scheduled day could not be marked done. Review it in Schedule.');
       }
     })();
   }
@@ -1567,37 +1577,58 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     updateJob(job.id, { status: 'in-progress' });
   }
 
-  const addEntry = useCallback((entry: Entry) => {
-    if (!businessId) {
-      console.warn('[store] addEntry called with no businessId; ignoring');
-      return;
+  // One statement saves a whole split shift; no partially saved activities.
+  // Callers retain these UUIDs when retrying an uncertain response.
+  const addEntries = useCallback(async (batch: Entry[]): Promise<boolean> => {
+    if (!businessId || !batch.length) {
+      lastEntryError.current = 'No business loaded. Your entry has not been saved.';
+      setError(lastEntryError.current);
+      return false;
     }
-    setEntries((prev) => [entry, ...prev]);
-    const tempId = entry.id;
-
-    // Fire auto-complete optimistically — the user logs hours, the
-    // matching day's "Overdue" clears immediately without waiting for
-    // the supabase round-trip. The schedule_items mutation rides along
-    // separately and is fire-and-forget.
-    maybeCompleteJobBookingForEntry(entry);
-    // Logging hours starts the job — bump status to in-progress if it's
-    // still sitting in a pre-start state. Forward-only; see helper.
-    maybeAdvanceJobToInProgress(entry);
-
-    (async () => {
-      const row = entryToRow({ ...entry, businessId });
-      const { data, error: insertErr } = await supabase
-        .from('entries').insert(row).select('*').single();
-      if (insertErr || !data) {
-        console.error('[store] addEntry failed:', insertErr);
-        setError(insertErr?.message ?? 'Failed to save entry');
-        setEntries((prev) => prev.filter((e) => e.id !== tempId));
-        return;
+    const ids = new Set(batch.map((entry) => entry.id));
+    setEntries((prev) => [...batch, ...prev.filter((entry) => !ids.has(entry.id))]);
+    try {
+      const persisted = await persistEntryBatch(batch, businessId, insertIdsRef.current,
+        (rows) => supabase.from('entries').upsert(rows, { onConflict: 'id' }).select('*'));
+      const savedIds = new Set(persisted.map((entry) => entry.id));
+      setEntries((prev) => [...persisted, ...prev.filter((entry) => !ids.has(entry.id) && !savedIds.has(entry.id))]);
+      const oldError = lastEntryError.current;
+      if (oldError) setError((current) => current === oldError ? null : current);
+      lastEntryError.current = null;
+      // Never complete a booking or start a job for a failed hours insert.
+      for (const entry of role === 'owner' ? persisted : []) {
+        maybeCompleteJobBookingForEntry(entry);
+        maybeAdvanceJobToInProgress(entry);
       }
-      const persisted = rowToEntry(data);
-      setEntries((prev) => prev.map((e) => (e.id === tempId ? persisted : e)));
-    })();
-  }, [businessId]);
+      return true;
+    } catch (err) {
+      lastEntryError.current = describeError(err) || 'Could not save the entry. Please retry.';
+      setError(lastEntryError.current);
+      setEntries((prev) => prev.filter((entry) => !ids.has(entry.id)));
+      return false;
+    }
+  }, [businessId, role]);
+
+  const addEntry = useCallback((entry: Entry) => addEntries([entry]), [addEntries]);
+
+  const saveHoursEstimate = useCallback(async (id: string, estimate: Job['hoursEstimate']) => {
+    const original = jobsRef.current.find((job) => job.id === id)?.hoursEstimate;
+    setJobs((prev) => prev.map((job) => job.id === id ? { ...job, hoursEstimate: estimate } : job));
+    try {
+      const { data, error: saveError } = await supabase.from('jobs')
+        .update(jobToRow({ hoursEstimate: estimate })).eq('id', id).select('id').single();
+      if (saveError || !data) throw new Error(saveError?.message ?? 'Estimate was not saved.');
+      const oldError = lastEstimateError.current;
+      if (oldError) setError((current) => current === oldError ? null : current);
+      lastEstimateError.current = null;
+      return true;
+    } catch (err) {
+      lastEstimateError.current = describeError(err);
+      setError(lastEstimateError.current);
+      setJobs((prev) => prev.map((job) => job.id === id ? { ...job, hoursEstimate: original } : job));
+      return false;
+    }
+  }, []);
 
   const updateEntry = useCallback((id: string, updates: Partial<Entry>) => {
     let prevEntry: Entry | undefined;
@@ -2859,6 +2890,33 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     return { ok: true };
   }, []);
 
+  // Delete only the reviewed hours, in one database statement. New rows
+  // arriving after confirmation was opened are deliberately left alone.
+  const clearJobDayHours = useCallback(async (jobId: string, date: string, ids: string[]) => {
+    if (!businessId || role !== 'owner' || !ids.length) return false;
+    const selected = new Set(ids);
+    const removed = entries.filter((e) => selected.has(e.id)
+      && e.businessId === businessId && e.type === 'hours'
+      && e.jobId === jobId && e.entryDate === date);
+    if (removed.length !== selected.size) {
+      setError('These hours have changed. Reopen Clear hours and check them again.');
+      return false;
+    }
+    setEntries((prev) => prev.filter((e) => !selected.has(e.id)));
+    try {
+      const { error: deleteError } = await supabase.from('entries').delete()
+        .eq('business_id', businessId).eq('type', 'hours')
+        .eq('job_id', jobId).eq('entry_date', date).in('id', [...selected]);
+      if (deleteError) throw deleteError;
+      return true;
+    } catch (error) {
+      console.error('[store] clearJobDayHours failed:', error);
+      setError(describeError(error));
+      setEntries((prev) => [...prev, ...removed.filter((e) => !prev.some((p) => p.id === e.id))]);
+      return false;
+    }
+  }, [businessId, role, entries]);
+
   const deleteEntry = useCallback((id: string) => {
     let prevEntry: Entry | undefined;
     setEntries((prev) => {
@@ -2894,39 +2952,205 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
-  const logMyHours = useCallback((input: {
-    jobId?: string;
-    hours: number;
-    activity?: ActivityType;
-    note?: string;
-    entryDate?: string;
-  }) => {
+  const addCrewPerson = useCallback(async (input: {
+    displayName: string;
+    workerKind: CrewPerson['workerKind'];
+  }): Promise<CrewPerson | null> => {
     if (!businessId) {
-      console.warn('[store] logMyHours called with no businessId; ignoring');
-      return;
+      setError('Could not add that person because no business is loaded.');
+      return null;
     }
-    const todayIso = new Date().toISOString().slice(0, 10);
-    // Attribute to the signed-in user. For an employee this uid is what the
-    // RLS insert policy checks; for the owner it's harmless extra provenance.
-    const uid = membership?.userId;
-    const entry: Entry = {
+    const displayName = input.displayName.trim().replace(/\s+/g, ' ');
+    if (!displayName) {
+      setError('Enter their name first.');
+      return null;
+    }
+    const existing = crewPeople.find(
+      (person) => !person.archivedAt && person.displayName.toLocaleLowerCase() === displayName.toLocaleLowerCase(),
+    );
+    if (existing) return existing;
+
+    const nowIso = new Date().toISOString();
+    const temporary: CrewPerson = {
       id: crypto.randomUUID(),
       businessId,
-      jobId: input.jobId,
-      type: 'hours',
-      hours: input.hours,
-      activity: input.activity,
-      // description is NOT NULL in the DB — fall back to the activity or a
-      // generic label so an empty note never violates the constraint.
-      description: (input.note?.trim()) || (input.activity ? `${input.activity} work` : 'Hours'),
-      entryDate: input.entryDate || todayIso,
-      gstApplies: false,
-      workerKind: membership?.workerKind ?? 'owner',
-      loggedByUserId: uid,
-      createdAt: new Date().toISOString(),
+      displayName,
+      workerKind: input.workerKind,
+      createdAt: nowIso,
+      updatedAt: nowIso,
     };
-    addEntry(entry);
-  }, [businessId, membership, addEntry]);
+    setCrewPeople((people) => [...people, temporary].sort((a, b) => a.displayName.localeCompare(b.displayName)));
+
+    const { data, error: insertError } = await supabase
+      .from('crew_people')
+      .insert(crewPersonToRow(temporary))
+      .select('*')
+      .single();
+    if (insertError || !data) {
+      console.error('[store] addCrewPerson failed:', describeError(insertError));
+      setCrewPeople((people) => people.filter((person) => person.id !== temporary.id));
+      setError(insertError?.message ?? 'Could not save that person.');
+      return null;
+    }
+    const persisted = rowToCrewPerson(data);
+    setCrewPeople((people) => people
+      .map((person) => person.id === temporary.id ? persisted : person)
+      .sort((a, b) => a.displayName.localeCompare(b.displayName)));
+    return persisted;
+  }, [businessId, crewPeople]);
+
+  const recordJobProgress = useCallback(async (input: {
+    jobId: string;
+    asOfDate: string;
+    state: JobProgressSnapshot['state'];
+    people: Array<{
+      businessMemberId?: string;
+      crewPersonId?: string;
+      personName: string;
+      workerKind: JobProgressPerson['workerKind'];
+      remainingHours: number;
+      inputDays?: number;
+      hoursPerDay?: number;
+    }>;
+    note?: string;
+  }): Promise<JobProgressSnapshot | null> => {
+    if (!businessId) {
+      setError('Could not save progress because no business is loaded.');
+      return null;
+    }
+    const job = jobs.find((candidate) => candidate.id === input.jobId);
+    if (!job) {
+      setError('Could not find that job.');
+      return null;
+    }
+
+    const relevantHours = entries.filter((entry) =>
+      entry.jobId === input.jobId
+      && entry.type === 'hours'
+      && !entry.isDraft
+      && entry.entryDate <= input.asOfDate,
+    );
+    const directHours = relevantHours.reduce((sum, entry) => sum + (entry.hours ?? 0), 0);
+    const legacyHelperHours = relevantHours.reduce((sum, entry) => sum + (entry.helperHours ?? 0), 0);
+    const actualPersonHours = Math.round((directHours + legacyHelperHours) * 100) / 100;
+    const remainingPersonHours = input.state === 'complete'
+      ? 0
+      : Math.round(input.people.reduce((sum, person) => sum + Math.max(0, person.remainingHours), 0) * 100) / 100;
+    if (input.state === 'forecast' && remainingPersonHours <= 0) {
+      setError('Choose who is returning and add some work left.');
+      return null;
+    }
+
+    const value = job.invoiceAmount && job.invoiceAmount > 0
+      ? { amount: job.invoiceAmount, source: 'invoice' as const }
+      : job.quoteAmount && job.quoteAmount > 0
+        ? { amount: job.quoteAmount, source: 'quote' as const }
+        : job.estimatedValue && job.estimatedValue > 0
+          ? { amount: job.estimatedValue, source: 'estimate' as const }
+          : { amount: 0, source: 'none' as const };
+    const forecastPersonHours = input.state === 'complete'
+      ? actualPersonHours
+      : actualPersonHours + remainingPersonHours;
+    const progressFraction = input.state === 'complete'
+      ? 1
+      : forecastPersonHours > 0 ? Math.min(1, actualPersonHours / forecastPersonHours) : 0;
+    const nowIso = new Date().toISOString();
+    const temporaryId = crypto.randomUUID();
+    const temporary: JobProgressSnapshot = {
+      id: temporaryId,
+      businessId,
+      jobId: input.jobId,
+      asOfDate: input.asOfDate,
+      state: input.state,
+      actualPersonHours,
+      legacyHelperHours,
+      remainingPersonHours,
+      forecastPersonHours,
+      jobValueExGst: value.amount,
+      valueSource: value.source,
+      progressFraction,
+      earnedToDateExGst: Math.round(value.amount * progressFraction * 100) / 100,
+      note: input.note?.trim() || undefined,
+      recordedBy: membership?.userId,
+      createdAt: nowIso,
+    };
+    const temporaryPeople: JobProgressPerson[] = input.state === 'complete' ? [] : input.people.map((person) => ({
+      id: crypto.randomUUID(),
+      businessId,
+      snapshotId: temporaryId,
+      businessMemberId: person.businessMemberId,
+      crewPersonId: person.crewPersonId,
+      personName: person.personName.trim(),
+      workerKind: person.workerKind,
+      remainingHours: person.remainingHours,
+      inputDays: person.inputDays,
+      hoursPerDay: person.hoursPerDay,
+      createdAt: nowIso,
+    }));
+
+    setJobProgressSnapshots((snapshots) => [temporary, ...snapshots]);
+    setJobProgressPeople((people) => [...people, ...temporaryPeople]);
+
+    const rpcPeople = input.state === 'complete' ? [] : input.people.map((person) => ({
+      business_member_id: person.businessMemberId ?? null,
+      crew_person_id: person.crewPersonId ?? null,
+      person_name: person.personName.trim(),
+      worker_kind: person.workerKind,
+      remaining_hours: person.remainingHours,
+      input_days: person.inputDays ?? null,
+      hours_per_day: person.hoursPerDay ?? null,
+    }));
+    const { data, error: progressError } = await supabase.rpc('record_job_progress', {
+      p_job_id: input.jobId,
+      p_as_of_date: input.asOfDate,
+      p_state: input.state,
+      p_people: rpcPeople,
+      p_note: input.note?.trim() || null,
+    });
+    if (progressError || !data) {
+      console.error('[store] recordJobProgress failed:', describeError(progressError));
+      setJobProgressSnapshots((snapshots) => snapshots.filter((snapshot) => snapshot.id !== temporaryId));
+      setJobProgressPeople((people) => people.filter((person) => person.snapshotId !== temporaryId));
+      setError(progressError?.message ?? 'Could not save job progress.');
+      return null;
+    }
+
+    const payload = data as {
+      snapshot?: Record<string, unknown>;
+      people?: Array<Record<string, unknown>>;
+    };
+    if (!payload.snapshot) {
+      setJobProgressSnapshots((snapshots) => snapshots.filter((snapshot) => snapshot.id !== temporaryId));
+      setJobProgressPeople((people) => people.filter((person) => person.snapshotId !== temporaryId));
+      setError('Progress saved, but the response could not be read. Refresh to see it.');
+      return null;
+    }
+    const persisted = rowToJobProgressSnapshot(payload.snapshot);
+    const persistedPeople = (payload.people ?? []).map(rowToJobProgressPerson);
+    setJobProgressSnapshots((snapshots) => snapshots.map((snapshot) =>
+      snapshot.id === temporaryId ? persisted : snapshot));
+    setJobProgressPeople((people) => [
+      ...people.filter((person) => person.snapshotId !== temporaryId),
+      ...persistedPeople,
+    ]);
+    return persisted;
+  }, [businessId, entries, jobs, membership?.userId]);
+
+  const logMyHoursBatch = useCallback((inputs: MyHoursInput[]) => {
+    if (!businessId || !membership?.userId) {
+      setError('Your account is still loading. Your hours have not been saved.');
+      return Promise.resolve(false);
+    }
+    return addEntries(inputs.map((input) => ({
+      id: input.id ?? crypto.randomUUID(), businessId, jobId: input.jobId,
+      type: 'hours', hours: input.hours, activity: input.activity,
+      description: input.note?.trim() || (input.activity ? `${input.activity} work` : 'Hours'),
+      entryDate: input.entryDate || localTodayISO(), gstApplies: false,
+      workerKind: membership.workerKind ?? 'owner', loggedByUserId: membership.userId,
+      createdAt: new Date().toISOString(),
+    })));
+  }, [businessId, membership, addEntries]);
+  const logMyHours = useCallback((input: MyHoursInput) => logMyHoursBatch([input]), [logMyHoursBatch]);
 
   /**
    * Upload one or more shift photos against a job + date. Compresses each
@@ -3855,6 +4079,42 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
     })();
   }, []);
 
+  const correctPayRunPaidDate = useCallback(async (id: string, paidDate: string): Promise<{ ok: boolean; error?: string }> => {
+    const run = payRuns.find((p) => p.id === id);
+    const expense = entries.find((e) => e.id === run?.expenseEntryId);
+    if (!run || !expense || !run.paidDate || !/^\d{4}-\d{2}-\d{2}$/.test(paidDate)) {
+      return { ok: false, error: 'Could not find the pay record and its linked wages expense.' };
+    }
+    if (paidDate === run.paidDate) return { ok: true };
+    const oldDate = run.paidDate;
+    setPayRuns((prev) => prev.map((p) => p.id === id ? { ...p, paidDate } : p));
+    setEntries((prev) => prev.map((e) => e.id === expense.id ? { ...e, entryDate: paidDate } : e));
+    const restoreLocal = () => {
+      setPayRuns((prev) => prev.map((p) => p.id === id ? { ...p, paidDate: oldDate } : p));
+      setEntries((prev) => prev.map((e) => e.id === expense.id ? { ...e, entryDate: oldDate } : e));
+    };
+
+    try {
+      const { data: expenseRows, error: expenseError } = await supabase.from('entries')
+        .update({ entry_date: paidDate }).eq('id', expense.id).eq('business_id', run.businessId).select('id');
+      if (expenseError || !expenseRows?.length) throw new Error(expenseError ? describeError(expenseError) : 'Wages expense was not updated.');
+      const { data: runRows, error: runError } = await supabase.from('pay_runs')
+        .update({ paid_date: paidDate }).eq('id', id).eq('business_id', run.businessId).select('id');
+      if (runError || !runRows?.length) throw new Error(runError ? describeError(runError) : 'Pay record was not updated.');
+      return { ok: true };
+    } catch (err) {
+      const { data: restored, error: restoreError } = await supabase.from('entries')
+        .update({ entry_date: oldDate }).eq('id', expense.id).eq('business_id', run.businessId).select('id');
+      const rollbackFailed = !!restoreError || !restored?.length;
+      restoreLocal();
+      const message = rollbackFailed
+        ? 'The date correction was not confirmed and the wages expense could not be restored. Check both records before continuing.'
+        : `Payment date was not changed: ${describeError(err)}`;
+      setError(message);
+      return { ok: false, error: message };
+    }
+  }, [entries, payRuns]);
+
   const importBankTransactions = useCallback(async (
     rows: Omit<BankTransaction, 'id' | 'businessId' | 'importedAt'>[],
   ): Promise<{ inserted: number; skipped: number }> => {
@@ -4354,9 +4614,11 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
       value={{
         jobs, entries, scheduleItems, materials, paintStock, quotes, settings, invoices, bankTransactions,
         jobImports, quoteAttachments,
-        businessId, role, membership, teamMembers, payRuns, loading, error,
+        businessId, role, membership, teamMembers, crewPeople,
+        jobProgressSnapshots, jobProgressPeople, payRuns, loading, error,
         addJob, updateJob, deleteJob, reconcileJobSchedule,
-        addEntry, updateEntry, deleteEntry, markLabourBilled, logMyHours,
+        addEntry, addEntries, saveHoursEstimate, updateEntry, deleteEntry, clearJobDayHours, markLabourBilled, logMyHours, logMyHoursBatch,
+        addCrewPerson, recordJobProgress,
         shiftPhotos, uploadShiftPhotos, updateShiftPhoto, deleteShiftPhoto, setJobCoverPhoto,
         shiftReports, saveShiftReport,
         jobVariations, addJobVariation,
@@ -4365,7 +4627,7 @@ export function StoreProvider({ children }: { children: React.ReactNode }) {
         jobAssignments, scheduleAssignments, setJobAssignees, setBookingAssignees,
         addScheduleItem, updateScheduleItem, deleteScheduleItem,
         addInvoice, updateInvoice, markInvoicePaid, unmarkInvoicePaid, voidInvoice,
-        addPayRun, updatePayRun,
+        addPayRun, updatePayRun, correctPayRunPaidDate,
         confirmBillDraft, confirmBillDraftWithMaterials, confirmBillDraftAsSplit, reallocateBill,
         addMaterials, addMaterialFromOverhead,
         addPaintStock, updatePaintStock, deletePaintStock,

@@ -57,6 +57,12 @@ export interface IcsEvent {
    * a duplicate. Falls back to a random uuid.
    */
   uid?: string;
+  /**
+   * Calendar revision. Reusing a UID with a higher sequence tells Apple and
+   * other calendar apps that a changed date/time replaces the old event.
+   * Defaults to the current Unix second so every later download is newer.
+   */
+  sequence?: number;
 }
 
 /**
@@ -90,6 +96,7 @@ export function buildIcs(event: IcsEvent): string {
   // starts. Some calendar apps use DTSTAMP for "did this event change since
   // last import?" logic, so it's important this updates on every download.
   const now = new Date();
+  const sequence = Math.max(0, Math.floor(event.sequence ?? now.getTime() / 1000));
 
   const lines: string[] = [
     'BEGIN:VCALENDAR',
@@ -106,6 +113,8 @@ export function buildIcs(event: IcsEvent): string {
     'BEGIN:VEVENT',
     `UID:${escapeText(uid)}`,
     `DTSTAMP:${formatUtcStamp(now)}`,
+    `LAST-MODIFIED:${formatUtcStamp(now)}`,
+    `SEQUENCE:${sequence}`,
     `DTSTART:${formatLocalStamp(event.start)}`,
     `DTEND:${formatLocalStamp(end)}`,
     `SUMMARY:${escapeText(event.title)}`,

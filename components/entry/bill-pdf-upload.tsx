@@ -33,7 +33,7 @@ import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
 import { parseBillFile, uploadBillDocument } from '@/lib/parse-bill-file';
 import { findMatchingBillIndex } from '@/lib/bill-dedupe';
-import { rankJobs } from '@/lib/job-match';
+import { safeAutoJobMatch } from '@/lib/job-match';
 import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import type { Entry, ParsedBill } from '@/lib/types';
 import { Upload, FileText } from 'lucide-react';
@@ -121,14 +121,10 @@ export function BillPdfUploadCard() {
       setMessage('Note: file couldn\'t be attached — bill drafted anyway. You can re-attach later.');
     }
 
-    // ── Job-guess via rankJobs ────────────────────────────────────────
+    // ── Job-guess from a distinctive PO/address ──────────────────────
     let guessedJobId: string | undefined;
     if (parsed.jobHint) {
-      const ranked = rankJobs(jobs, parsed.jobHint);
-      const top = ranked[0];
-      if (top && top.tier === 'active-match' && top.score >= JOB_MATCH_MIN_SCORE) {
-        guessedJobId = top.job.id;
-      }
+      guessedJobId = safeAutoJobMatch(jobs, parsed.jobHint, JOB_MATCH_MIN_SCORE)?.id;
     }
 
     // ── Create the draft entry ────────────────────────────────────────

@@ -42,7 +42,7 @@ import {
   SelectTrigger,
   SelectValue,
 } from '@/components/ui/select';
-import { Trash2, CheckCircle2, Plus } from 'lucide-react';
+import { Trash2, CheckCircle2, Plus, CalendarDays } from 'lucide-react';
 import { cn } from '@/lib/utils';
 
 // ── Duration chip presets ────────────────────────────────────────────────
@@ -108,9 +108,11 @@ interface Props {
    *  EditScheduleItemSheet pattern). */
   item: ScheduleItem | null;
   jobs: Job[];
+  /** Downloads the revised calendar event after date/time/details change. */
+  onCalendarRefresh?: (item: ScheduleItem) => void;
 }
 
-export function EditSiteVisitSheet({ open, onOpenChange, item, jobs }: Props) {
+export function EditSiteVisitSheet({ open, onOpenChange, item, jobs, onCalendarRefresh }: Props) {
   return (
     <Sheet open={open} onOpenChange={onOpenChange}>
       <SheetContent
@@ -124,6 +126,7 @@ export function EditSiteVisitSheet({ open, onOpenChange, item, jobs }: Props) {
           <EditForm
             item={item}
             jobs={jobs}
+            onCalendarRefresh={onCalendarRefresh}
             onClose={() => onOpenChange(false)}
           />
         )}
@@ -135,10 +138,12 @@ export function EditSiteVisitSheet({ open, onOpenChange, item, jobs }: Props) {
 function EditForm({
   item,
   jobs,
+  onCalendarRefresh,
   onClose,
 }: {
   item: ScheduleItem;
   jobs: Job[];
+  onCalendarRefresh?: (item: ScheduleItem) => void;
   onClose: () => void;
 }) {
   const { updateScheduleItem, deleteScheduleItem } = useStore();
@@ -199,21 +204,49 @@ function EditForm({
 
   const valid = !!title.trim() && !!date;
 
+  const cleaned = {
+    title: title.trim(),
+    date,
+    startTime: startTime || undefined,
+    endTime: endTime || undefined,
+    jobId: jobId || undefined,
+    location: location.trim() || undefined,
+    clientName: clientName.trim() || undefined,
+    clientEmail: clientEmail.trim() || undefined,
+    clientPhone: clientPhone.trim() || undefined,
+    notes: notes.trim() || undefined,
+  };
+
+  // Anything carried into the native calendar needs a fresh .ics revision.
+  // Mark-as-done alone does not: there is no useful future reminder to add.
+  const calendarDetailsChanged =
+    cleaned.title !== item.title
+    || cleaned.date !== item.date
+    || cleaned.startTime !== item.startTime
+    || cleaned.endTime !== item.endTime
+    || cleaned.jobId !== item.jobId
+    || cleaned.location !== item.location
+    || cleaned.clientName !== item.clientName
+    || cleaned.clientPhone !== item.clientPhone
+    || cleaned.notes !== item.notes;
+  const refreshCalendar = calendarDetailsChanged && !completed;
+
   function handleSave() {
     if (!valid) return;
-    updateScheduleItem(item.id, {
-      title: title.trim(),
-      date,
-      startTime: startTime || undefined,
-      endTime: endTime || undefined,
-      jobId: jobId || undefined,
-      location: location.trim() || undefined,
-      clientName: clientName.trim() || undefined,
-      clientEmail: clientEmail.trim() || undefined,
-      clientPhone: clientPhone.trim() || undefined,
-      notes: notes || undefined,
+    const nextItem: ScheduleItem = {
+      ...item,
+      ...cleaned,
       completed,
+      // A caller with calendar support downloads immediately. Otherwise the
+      // schedule card honestly falls back to "Add to calendar".
+      icsDownloaded: refreshCalendar ? !!onCalendarRefresh : item.icsDownloaded,
+    };
+    updateScheduleItem(item.id, {
+      ...cleaned,
+      completed,
+      icsDownloaded: nextItem.icsDownloaded,
     });
+    if (refreshCalendar) onCalendarRefresh?.(nextItem);
     onClose();
   }
 
@@ -372,6 +405,16 @@ function EditForm({
         />
       </FormField>
 
+      {refreshCalendar && (
+        <div className="flex items-start gap-2.5 rounded-xl border border-blue-200 bg-blue-50 px-3 py-3 text-xs text-blue-800">
+          <CalendarDays size={16} className="mt-0.5 shrink-0" strokeWidth={2} />
+          <p>
+            Saving downloads the updated calendar event. Open it once to refresh
+            the visit and its night-before and 1-hour reminders.
+          </p>
+        </div>
+      )}
+
       <button
         type="button"
         onClick={() => setCompleted((c) => !c)}
@@ -400,7 +443,7 @@ function EditForm({
             disabled={!valid}
             onClick={handleSave}
           >
-            Save
+            {refreshCalendar ? 'Save + update calendar' : 'Save'}
           </Button>
         </div>
         <Button

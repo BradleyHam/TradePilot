@@ -39,12 +39,17 @@ import { OutcomeSheet, OutcomeKind } from './outcome-sheet';
 import { MarkAsQuotedSheet } from './mark-as-quoted-sheet';
 import { DeclineJobSheet } from './decline-job-sheet';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
+import { EditSiteVisitSheet } from '@/components/schedule/edit-site-visit-sheet';
 import { PrepWithAISheet } from './prep-with-ai-sheet';
 import { CompletionDateSheet } from './completion-date-sheet';
 import { InvoiceReviewSheet } from './invoice-review-sheet';
 import { CostEnginePreview } from './cost-engine-preview';
 import { invoiceCountsAsIssued } from '@/lib/invoice-lifecycle';
 import { PhotoLightbox, PhotoThumb, isImageName, type LightboxImage } from './photo-lightbox';
+import { WorkProgressCard } from './work-progress-card';
+import { JobHoursCard } from './job-hours-card';
+import { WorkLeftSheet } from './work-left-sheet';
+import { downloadSiteVisitCalendar } from '@/lib/site-visit-calendar';
 
 interface JobDetailSheetProps {
   job: Job | null;
@@ -79,6 +84,15 @@ const DEPOSIT_NOT_YET_LABELS: Record<DepositNotYetReason, string> = {
 function localTodayISO(): string {
   const d = new Date();
   return `${d.getFullYear()}-${String(d.getMonth() + 1).padStart(2, '0')}-${String(d.getDate()).padStart(2, '0')}`;
+}
+
+/** Compact phone-friendly clock time: "09:30" -> "9:30 am". */
+function formatClockTime(time: string): string {
+  const [hourText, minuteText] = time.split(':');
+  const hour = Number(hourText);
+  if (!Number.isFinite(hour) || minuteText == null) return time;
+  const displayHour = hour % 12 || 12;
+  return `${displayHour}:${minuteText} ${hour >= 12 ? 'pm' : 'am'}`;
 }
 
 // Human-readable labels for the outcome reasons stored on a job. Keep these
@@ -125,8 +139,8 @@ function hasWrapUpData(job: Job): boolean {
 export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const {
     jobs, entries, invoices, scheduleItems, materials, quotes, quoteAttachments,
-    businessId, updateJob, reconcileJobSchedule, deleteJob, addEntry,
-    settings, teamMembers, membership,
+    businessId, updateJob, reconcileJobSchedule, deleteJob, addEntry, recordJobProgress, saveHoursEstimate,
+    settings, teamMembers, membership, jobProgressSnapshots, jobProgressPeople,
   } = useStore();
   const [reconciling, setReconciling] = useState(false);
   const [showInvoice, setShowInvoice] = useState(false);
@@ -163,11 +177,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   const [prepWithAIOpen, setPrepWithAIOpen] = useState(false);
   // Book-a-site-visit sheet, opened from the lead-stage action strip.
   const [bookVisitOpen, setBookVisitOpen] = useState(false);
+  // Existing visit editor. Keeping this separate from BookVisitSheet means
+  // tapping a booked visit updates that row instead of creating a duplicate.
+  const [editingVisitId, setEditingVisitId] = useState<string | null>(null);
   // "Turn it down" — the reason sheet. Opens either as part of declining
   // (status flip already applied) or to edit the reason on a job that's
   // already declined; `declineEditing` tells the sheet which copy to show.
   const [declineOpen, setDeclineOpen] = useState(false);
   const [declineEditing, setDeclineEditing] = useState(false);
+  const [workLeftOpen, setWorkLeftOpen] = useState(false);
   // Inline rename of the job title in the header. Self-contained editor;
   // reset whenever the sheet switches to a different job so a half-finished
   // rename on job A doesn't carry over to job B. Done during render (React's
@@ -192,6 +210,25 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
   // (e.g. status changes). Look up the live version from the store so the
   // controlled Select and the rest of this view stay in sync.
   const liveJob = jobs.find((j) => j.id === job.id) ?? job;
+
+  // The soonest upcoming site visit is the source of truth for the lead CTA.
+  // A visit booked while this sheet is open lands in the store optimistically,
+  // so the button flips to the confirmed date/time immediately after Save.
+  const upcomingSiteVisits = scheduleItems
+    .filter((item) => (
+      item.jobId === liveJob.id
+      && item.type === 'quote_visit'
+      && !item.completed
+      && !item.skipReasonKind
+      && item.date >= localTodayISO()
+    ))
+    .sort((a, b) => (
+      `${a.date}T${a.startTime ?? '23:59'}`.localeCompare(`${b.date}T${b.startTime ?? '23:59'}`)
+    ));
+  const nextSiteVisit = upcomingSiteVisits[0];
+  const editingVisit = editingVisitId
+    ? scheduleItems.find((item) => item.id === editingVisitId) ?? null
+    : null;
 
   const jobEntries = entries
     // Drafts (unconfirmed parsed bills, may have a fuzzy-matched jobId
@@ -343,6 +380,16 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
     // Persist the finish date on the job, then reconcile the schedule using
     // that explicit date as the source of truth.
     updateJob(liveJob.id, { endDate: completionDate });
+    // Freeze 100% work completion on the date it actually happened. This is
+    // an earned-management snapshot only; invoices, cash and tax stay apart.
+    recordJobProgress({
+      jobId: liveJob.id,
+      asOfDate: completionDate,
+      state: 'complete',
+      people: [],
+    }).catch((err) => {
+      console.error('[job-detail-sheet] progress completion save failed:', err);
+    });
     reconcileJobSchedule(liveJob.id, false, completionDate).catch((err) => {
       console.error('[job-detail-sheet] reconcile after completion-date save failed:', err);
     });
@@ -486,6 +533,8 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
             onSave={(patch) => updateJob(liveJob.id, patch)}
           />
 
+          <JobHoursCard key={liveJob.id} job={liveJob} entries={entries} snapshots={jobProgressSnapshots} onEditWorkLeft={() => setWorkLeftOpen(true)} onSave={(estimate) => saveHoursEstimate(liveJob.id, estimate)} />
+
           {/* Job type — tag the kind of work so the Leads insights (win-rate
               by type, etc.) read true. One tap, sets immediately. Kept here
               near the job's identity so it's the same place Brad fixes the
@@ -568,19 +617,50 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               {/* Book site visit — the natural first step for a fresh lead.
                   Primary when no visit's been done yet (no wrap-up data),
                   otherwise it steps back to let 'Prep quote with AI' lead. */}
-              <button
-                type="button"
-                onClick={() => setBookVisitOpen(true)}
-                className={cn(
-                  'w-full inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl text-sm font-semibold transition-colors',
-                  hasWrapUpData(liveJob)
-                    ? 'border border-border bg-background text-foreground hover:bg-accent'
-                    : 'bg-primary text-primary-foreground hover:bg-primary/90',
-                )}
-              >
-                <CalendarPlus size={15} strokeWidth={2} />
-                Book site visit
-              </button>
+              {nextSiteVisit ? (
+                <button
+                  type="button"
+                  onClick={() => setEditingVisitId(nextSiteVisit.id)}
+                  className="w-full min-h-[60px] rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5 text-left transition-colors hover:bg-emerald-100"
+                  aria-label="View or change booked site visit"
+                >
+                  <span className="flex items-center gap-3">
+                    <span className="flex h-9 w-9 shrink-0 items-center justify-center rounded-full bg-emerald-100 text-emerald-700">
+                      <CalendarDays size={17} strokeWidth={2} />
+                    </span>
+                    <span className="min-w-0 flex-1">
+                      <span className="block text-sm font-semibold text-emerald-950">
+                        Site visit booked
+                      </span>
+                      <span className="block text-xs text-emerald-800 mt-0.5">
+                        {formatEntryDate(nextSiteVisit.date)}
+                        {nextSiteVisit.startTime ? ` · ${formatClockTime(nextSiteVisit.startTime)}` : ''}
+                        {nextSiteVisit.endTime ? `–${formatClockTime(nextSiteVisit.endTime)}` : ''}
+                        {upcomingSiteVisits.length > 1
+                          ? ` · ${upcomingSiteVisits.length - 1} more booked`
+                          : ''}
+                      </span>
+                    </span>
+                    <span className="shrink-0 text-xs font-semibold text-emerald-800">
+                      Change
+                    </span>
+                  </span>
+                </button>
+              ) : (
+                <button
+                  type="button"
+                  onClick={() => setBookVisitOpen(true)}
+                  className={cn(
+                    'w-full inline-flex items-center justify-center gap-2 min-h-[44px] rounded-xl text-sm font-semibold transition-colors',
+                    hasWrapUpData(liveJob)
+                      ? 'border border-border bg-background text-foreground hover:bg-accent'
+                      : 'bg-primary text-primary-foreground hover:bg-primary/90',
+                  )}
+                >
+                  <CalendarPlus size={15} strokeWidth={2} />
+                  Book site visit
+                </button>
+              )}
               <div className="flex flex-col sm:flex-row gap-2">
                 {hasWrapUpData(liveJob) && (
                   <button
@@ -969,13 +1049,15 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                   incomeSubvalue = undefined;
                 }
 
-                const profitLabel = isFullyPaid
+                const profitLabel = expectedIncome <= 0
                   ? 'Profit'
-                  : isFinalised
-                    ? 'Profit (when paid)'
-                    : totalIncome > 0
-                      ? 'Profit'
-                      : 'Expected profit';
+                  : isFullyPaid
+                    ? 'Profit'
+                    : isFinalised
+                      ? 'Profit (when paid)'
+                      : totalIncome > 0
+                        ? 'Profit'
+                        : 'Expected profit';
 
                 // The rate tile is the OWNER's rate now — profit ÷ his own
                 // hours. Revenue ÷ everyone's hours was nobody's number.
@@ -1031,11 +1113,13 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
                     <StatCard
                       label={profitLabel}
                       value={
-                        expectedIncome > 0 || totalExpenses > 0
+                        expectedIncome > 0
                           ? `$${expectedProfit.toLocaleString('en-NZ')}`
-                          : '—'
+                          : 'Not priced'
                       }
-                      valueClass={expectedProfit >= 0 ? 'text-green-600' : 'text-red-500'}
+                      valueClass={expectedIncome <= 0
+                        ? undefined
+                        : expectedProfit >= 0 ? 'text-green-600' : 'text-red-500'}
                     />
                     <StatCard
                       label="Hours"
@@ -1053,6 +1137,18 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
               })()}
             </div>
           </div>
+
+          {(liveJob.status === 'in-progress'
+            || jobProgressSnapshots.some((snapshot) => snapshot.jobId === liveJob.id)) && (
+            <WorkProgressCard
+              job={liveJob}
+              entries={entries}
+              snapshots={jobProgressSnapshots}
+              people={jobProgressPeople}
+              asOfDate={localTodayISO()}
+              onEdit={() => setWorkLeftOpen(true)}
+            />
+          )}
 
           {/* Visualisations — only render the ones that have data */}
           {(ownerRate != null || stats.totalExpenses > 0 || stats.totalHours > 0) && (
@@ -1355,6 +1451,12 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         onCancel={() => setAskCompletionDate(false)}
       />
 
+      <WorkLeftSheet
+        jobId={liveJob.id}
+        open={workLeftOpen}
+        onClose={() => setWorkLeftOpen(false)}
+      />
+
       {/* Mark-as-quoted — flips the lead's status to 'quoted' after
           capturing total + date sent + follow-up date. The AI flow
           can pre-fill `initialTotal` with Claude's suggested total
@@ -1412,6 +1514,14 @@ export function JobDetailSheet({ job, open, onClose }: JobDetailSheetProps) {
         open={bookVisitOpen}
         onSaved={() => setBookVisitOpen(false)}
         onCancel={() => setBookVisitOpen(false)}
+      />
+
+      <EditSiteVisitSheet
+        open={editingVisit !== null}
+        onOpenChange={(isOpen) => { if (!isOpen) setEditingVisitId(null); }}
+        item={editingVisit}
+        jobs={jobs}
+        onCalendarRefresh={(updatedItem) => downloadSiteVisitCalendar(updatedItem, jobs)}
       />
 
       {/* Accepted → "invoice them now?" prompt. Yes opens the review + send

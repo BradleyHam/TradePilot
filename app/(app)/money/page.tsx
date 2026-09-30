@@ -9,40 +9,60 @@ import { ExpenseChart } from '@/components/money/expense-chart';
 import { TransactionList } from '@/components/money/transaction-list';
 import { TaxExposureCard } from '@/components/money/tax-exposure-card';
 import { TaxPaidCard } from '@/components/money/tax-paid-card';
+import { JobMoneySummary } from '@/components/money/job-money-summary';
+import { JobMoneyDetailSheet } from '@/components/money/job-money-detail-sheet';
+import { MonthlyBreakdown } from '@/components/money/monthly-breakdown';
+import { WorkLeftSheet } from '@/components/jobs/work-left-sheet';
+import { JobPicker } from '@/components/shared/job-picker';
 import {
   TimeframeSelector,
   type Timeframe, type TimeframeKind,
   smartDefault, frameFor,
 } from '@/components/money/timeframe-selector';
 import {
-  earnedIncomeInWindow, cashIncomeExGstInWindow, earnedIncomeByMonth,
+  cashIncomeExGstInWindow,
   expensesInWindow, incurredExpenseBreakdown, incurredExpensesInWindow,
 } from '@/lib/income-allocator';
+import {
+  earnedDeltaInWindow,
+  earnedIncomeByMonthFromProgress,
+  earnedIncomeInWindowFromProgress,
+  earnedToDateAt,
+} from '@/lib/job-progress';
 import { unbilledLabourInWindow } from '@/lib/labour-accrual';
-import { MonthlyData, CategoryData } from '@/lib/types';
+import { entryExGst, isPayrollHours } from '@/lib/job-stats';
+import { payrollConfig } from '@/lib/payroll';
+import type { MonthlyData, CategoryData, Entry, Material } from '@/lib/types';
 import { cn } from '@/lib/utils';
 import {
   TrendingDown, AlertCircle, FileText,
-  Briefcase, ChevronDown,
+  Briefcase, ChevronDown, X,
 } from 'lucide-react';
-import { format, parseISO, addMonths, startOfMonth, endOfMonth, differenceInCalendarMonths } from 'date-fns';
+import { format, parseISO, addMonths, startOfMonth, endOfMonth, } from 'date-fns';
 import { invoiceIsOutstanding } from '@/lib/invoice-lifecycle';
+import { localTodayISO } from '@/lib/format-date';
 
 export default function MoneyPage() {
-  const { entries, jobs, invoices } = useStore();
+  const {
+    entries, jobs, invoices, materials, settings, teamMembers, loading,
+    jobProgressSnapshots,
+  } = useStore();
   const now = useMemo(() => new Date(), []);
 
   // Default selection: this month if data exists, else last month.
-  const [kind, setKind] = useState<TimeframeKind>(() =>
-    smartDefault(entries.map((e) => e.entryDate), now),
-  );
+  const [chosenKind, setKind] = useState<TimeframeKind | null>(null);
+  const kind = chosenKind ?? smartDefault(entries.map((e) => e.entryDate), now);
   const [customFrame, setCustomFrame] = useState<Timeframe | null>(null);
   const frame = frameFor(kind, customFrame, now);
 
-  // Cash vs Earned basis — defaults to Earned because that answers "did I
+  // Cash vs Work done — defaults to Work done because that answers "did I
   // actually have a good month" rather than "what hit the bank account".
   const [basis, setBasis] = useState<'cash' | 'earned'>('earned');
   const [detailsOpen, setDetailsOpen] = useState(false);
+  const [selectedJobId, setSelectedJobId] = useState('');
+  const [detailJobId, setDetailJobId] = useState<string | null>(null);
+  const [progressJobId, setProgressJobId] = useState<string | null>(null);
+  const selectedJob = selectedJobId ? jobs.find((job) => job.id === selectedJobId) : undefined;
 
   // Revenue vs Expenses chart range — independent of the main timeframe
   // filter so the chart can show a wider trend window (12M default)
@@ -52,24 +72,50 @@ export default function MoneyPage() {
   type ChartRange = '3M' | '6M' | '12M' | 'all';
   const [chartRange, setChartRange] = useState<ChartRange>('12M');
 
-  // Entries that fall inside the selected window.
+  // The job filter scopes every period-bound number below. Whole-business
+  // obligations (tax, unpaid invoices and pipeline) stay explicitly global.
+  const scopedEntries = useMemo(
+    () => selectedJobId ? entries.filter((entry) => entry.jobId === selectedJobId) : entries,
+    [entries, selectedJobId],
+  );
+  const scopedJobs = useMemo(
+    () => selectedJob ? [selectedJob] : jobs,
+    [jobs, selectedJob],
+  );
+
+  // Entries that fall inside the selected window and job scope.
   const windowEntries = useMemo(
-    () => entries.filter((e) => e.entryDate >= frame.start && e.entryDate <= frame.end),
-    [entries, frame.start, frame.end],
+    () => scopedEntries.filter((e) => e.entryDate >= frame.start && e.entryDate <= frame.end),
+    [scopedEntries, frame.start, frame.end],
   );
 
   // ── KPIs (timeframe-bound) ─────────────────────────────────────────────────
   // Cash income — money that actually landed in the window, EX-GST (the
   // GST slice is the IRD's, not revenue — golden rule: all math ex-GST).
   const cashRevenue = useMemo(
-    () => cashIncomeExGstInWindow(entries, frame.start, frame.end),
-    [entries, frame.start, frame.end],
+    () => cashIncomeExGstInWindow(scopedEntries, frame.start, frame.end),
+    [scopedEntries, frame.start, frame.end],
   );
-  // Earned income — for each completed/invoiced/paid job, allocate its quote
-  // amount across months by hours-share, then sum the months in the window.
+  // Work-done income — dated snapshots recognise the completed share of active
+  // jobs without letting a later reforecast rewrite an earlier month. Legacy
+  // terminal jobs retain their established hours-share allocation.
   const earnedRevenue = useMemo(
-    () => earnedIncomeInWindow(jobs, entries, frame.start, frame.end),
-    [jobs, entries, frame.start, frame.end],
+    () => selectedJob
+      ? earnedDeltaInWindow({
+          job: selectedJob,
+          entries,
+          snapshots: jobProgressSnapshots,
+          startISO: frame.start,
+          endISO: frame.end,
+        })
+      : earnedIncomeInWindowFromProgress({
+          jobs: scopedJobs,
+          entries,
+          snapshots: jobProgressSnapshots,
+          startISO: frame.start,
+          endISO: frame.end,
+        }),
+    [selectedJob, scopedJobs, entries, jobProgressSnapshots, frame.start, frame.end],
   );
   const revenue = basis === 'earned' ? earnedRevenue : cashRevenue;
 
@@ -80,17 +126,27 @@ export default function MoneyPage() {
   // Cash: expense entries by date + PAID bills by paidDate. Payments
   // basis, same as the GST return and the tax estimate.
   const cashExpenses = useMemo(
-    () => expensesInWindow(entries, frame.start, frame.end),
-    [entries, frame.start, frame.end],
+    () => expensesInWindow(scopedEntries, frame.start, frame.end),
+    [scopedEntries, frame.start, frame.end],
   );
   // Earned: costs when INCURRED — bills from their bill date paid or not,
   // plus sub/helper hours nobody has invoiced yet. Management figure; it
   // never reaches GST or income tax.
   const incurred = useMemo(
-    () => incurredExpenseBreakdown(entries, frame.start, frame.end),
-    [entries, frame.start, frame.end],
+    () => incurredExpenseBreakdown(scopedEntries, frame.start, frame.end),
+    [scopedEntries, frame.start, frame.end],
   );
-  const expenses = basis === 'earned' ? incurred.total : cashExpenses;
+  // In a single-job earned view, allocate employee wages to the days they
+  // worked and include stock already owned but consumed on that job. These
+  // are job-management costs only; the business view continues to count the
+  // actual pay run/purchase once, so nothing is double-counted for tax.
+  const wageRate = payrollConfig(settings).wageRate;
+  const ownerUserId = teamMembers.find((member) => member.role === 'owner')?.userId;
+  const attributedJobCosts = selectedJobId
+    ? payrollLabourInWindow(entries, selectedJobId, frame.start, frame.end, wageRate, ownerUserId)
+      + overheadMaterialsInWindow(materials, selectedJobId, frame.start, frame.end)
+    : 0;
+  const expenses = basis === 'earned' ? incurred.total + attributedJobCosts : cashExpenses;
   // What part of the earned-basis number hasn't left the bank yet — the
   // line that explains an Expenses card bigger than the Cash view.
   const notYetPaid = incurred.billedUnpaid + incurred.unbilledLabour;
@@ -109,8 +165,8 @@ export default function MoneyPage() {
   const upcomingBills = entries
     // Exclude drafts: they're shown separately on Home as "Bills to confirm"
     // and don't represent real upcoming obligations until Brad confirms.
-    .filter((e) => e.type === 'bill' && !e.isDraft && e.dueDate && new Date(e.dueDate) >= now)
-    .reduce((s, e) => s + (e.amount ?? 0), 0);
+    .filter((e) => e.type === 'bill' && !e.isDraft && !e.paid && e.dueDate && e.dueDate >= localTodayISO(now))
+    .reduce((s, e) => s + entryExGst(e), 0);
   const pipelineValue = jobs
     .filter((j) => !['paid', 'lost', 'declined'].includes(j.status))
     .reduce((s, j) => s + (j.quoteAmount ?? j.estimatedValue ?? 0), 0);
@@ -129,10 +185,10 @@ export default function MoneyPage() {
     const endMonth = startOfMonth(now);
     // For 'all', walk back to the earliest entry but never past the cap.
     let firstMonth = startOfMonth(addMonths(endMonth, -(monthsBack - 1)));
-    if (chartRange === 'all' && entries.length > 0) {
-      const earliestEntry = entries
+    if (chartRange === 'all' && scopedEntries.length > 0) {
+      const earliestEntry = scopedEntries
         .map((e) => parseISO(e.entryDate))
-        .reduce((min, d) => (d < min ? d : min), parseISO(entries[0].entryDate));
+        .reduce((min, d) => (d < min ? d : min), parseISO(scopedEntries[0].entryDate));
       const earliestMonth = startOfMonth(earliestEntry);
       // Pick the later of the two so we don't go beyond the cap.
       if (earliestMonth > firstMonth) firstMonth = earliestMonth;
@@ -151,7 +207,8 @@ export default function MoneyPage() {
     // For earned basis we need the YYYY-MM keys to ask the allocator.
     const monthKeys = months.map((m) => format(m, 'yyyy-MM'));
     const earnedByMonth = basis === 'earned'
-      ? earnedIncomeByMonth(jobs, entries, monthKeys)
+      && !selectedJob
+      ? earnedIncomeByMonthFromProgress(scopedJobs, entries, jobProgressSnapshots, monthKeys)
       : null;
 
     return months.map((m, i) => {
@@ -159,18 +216,33 @@ export default function MoneyPage() {
       // and the cards must never tell two different profit stories.
       const mStart = format(m, 'yyyy-MM-dd');
       const mEnd = format(endOfMonth(m), 'yyyy-MM-dd');
-      const cashRev = cashIncomeExGstInWindow(entries, mStart, mEnd);
-      const earnedRev = earnedByMonth?.get(monthKeys[i]) ?? 0;
+      const cashRev = cashIncomeExGstInWindow(scopedEntries, mStart, mEnd);
+      const earnedRev = selectedJob
+        ? earnedDeltaInWindow({
+            job: selectedJob,
+            entries,
+            snapshots: jobProgressSnapshots,
+            startISO: mStart,
+            endISO: mEnd,
+          })
+        : earnedByMonth?.get(monthKeys[i]) ?? 0;
+      const jobCosts = selectedJobId
+        ? payrollLabourInWindow(entries, selectedJobId, mStart, mEnd, wageRate, ownerUserId)
+          + overheadMaterialsInWindow(materials, selectedJobId, mStart, mEnd)
+        : 0;
       return {
         month: format(m, 'MMM'),
         revenue: basis === 'earned' ? earnedRev : cashRev,
         // Costs follow the same basis as the bars they sit against.
         expenses: basis === 'earned'
-          ? incurredExpensesInWindow(entries, mStart, mEnd)
-          : expensesInWindow(entries, mStart, mEnd),
+          ? incurredExpensesInWindow(scopedEntries, mStart, mEnd) + jobCosts
+          : expensesInWindow(scopedEntries, mStart, mEnd),
       };
     });
-  }, [entries, jobs, chartRange, basis, now]);
+  }, [
+    entries, scopedEntries, scopedJobs, selectedJob, chartRange, basis, now,
+    selectedJobId, wageRate, ownerUserId, materials, jobProgressSnapshots,
+  ]);
 
   // Expense breakdown for the selected window — same population as the
   // Expenses KPI (ex-GST; expense entries by entryDate + PAID bills by
@@ -183,7 +255,7 @@ export default function MoneyPage() {
       return e.gstApplies ? e.amount / 1.15 : e.amount;
     };
     const map: Record<string, number> = {};
-    for (const e of entries) {
+    for (const e of scopedEntries) {
       if (e.isDraft) continue;
       let inWindow = false;
       if (e.type === 'expense') {
@@ -203,19 +275,56 @@ export default function MoneyPage() {
     // Sub / helper hours nobody has invoiced yet are a labour cost — on the
     // earned basis they belong in the breakdown like any other.
     if (basis === 'earned') {
-      const labour = unbilledLabourInWindow(entries, frame.start, frame.end);
+      const labour = unbilledLabourInWindow(scopedEntries, frame.start, frame.end);
       if (labour > 0) map.labour = (map.labour ?? 0) + labour;
+      if (selectedJobId) {
+        const payrollLabour = payrollLabourInWindow(
+          entries, selectedJobId, frame.start, frame.end, wageRate, ownerUserId,
+        );
+        const stockUsed = overheadMaterialsInWindow(materials, selectedJobId, frame.start, frame.end);
+        if (payrollLabour > 0) map.labour = (map.labour ?? 0) + payrollLabour;
+        if (stockUsed > 0) map.materials = (map.materials ?? 0) + stockUsed;
+      }
     }
     return Object.entries(map)
       .map(([category, amount]) => ({ category, amount }))
       .sort((a, b) => b.amount - a.amount);
-  }, [entries, frame.start, frame.end, basis]);
+  }, [
+    entries, scopedEntries, frame.start, frame.end, basis,
+    selectedJobId, wageRate, ownerUserId, materials,
+  ]);
 
-  const fmt = (n: number) => `$${n.toLocaleString('en-NZ')}`;
+  const fmt = (n: number) => {
+    const absolute = Math.abs(n);
+    return `${n < 0 ? '-' : ''}$${absolute.toLocaleString('en-NZ')}`;
+  };
 
   // Headings adapt to the selected window so labels never lie.
-  const isMultiMonth = differenceInCalendarMonths(parseISO(frame.end), parseISO(frame.start)) >= 1;
-  const periodLabel = isMultiMonth ? 'in period' : 'this month';
+  const periodLabel = frame.label;
+  const todayIso = localTodayISO(now);
+  const progressAsOfDate = frame.end < todayIso ? frame.end : todayIso;
+  const missingProgressJobs = basis === 'earned'
+    ? scopedJobs.filter((job) => {
+        if (job.status !== 'in-progress') return false;
+        const workedInWindow = entries.some((entry) =>
+          entry.jobId === job.id
+          && entry.type === 'hours'
+          && ((entry.hours ?? 0) > 0 || (entry.helperHours ?? 0) > 0)
+          && entry.entryDate >= frame.start
+          && entry.entryDate <= frame.end,
+        );
+        if (!workedInWindow) return false;
+        const position = earnedToDateAt({
+          job,
+          entries,
+          snapshots: jobProgressSnapshots,
+          asOfDate: progressAsOfDate,
+        });
+        return position.missingForecast && position.jobValueExGst > 0;
+      })
+    : [];
+
+  if (loading) return <p role="status" className="px-4 py-6 text-sm text-muted-foreground">Loading your money…</p>;
 
   return (
     <div className="flex flex-col min-h-full">
@@ -231,8 +340,51 @@ export default function MoneyPage() {
           onChange={(k, c) => { setKind(k); setCustomFrame(c); }}
         />
 
+        <section className="overflow-visible rounded-2xl border border-border bg-card shadow-sm">
+          <div className="p-3.5">
+            <div className="mb-1.5 flex min-h-6 items-center justify-between gap-3">
+              <label className="text-[11px] font-semibold uppercase tracking-wide text-muted-foreground">
+                Filter by job
+              </label>
+              {selectedJob && (
+                <button
+                  type="button"
+                  onClick={() => setSelectedJobId('')}
+                  className="-my-2 inline-flex min-h-11 items-center gap-1.5 rounded-full border border-primary/20 bg-primary/5 px-3 text-[13px] font-semibold text-primary hover:bg-primary/10 active:bg-primary/15"
+                >
+                  <X size={14} />
+                  Show all jobs
+                </button>
+              )}
+            </div>
+            <JobPicker
+              jobs={jobs}
+              entries={entries}
+              value={selectedJobId}
+              onChange={setSelectedJobId}
+              placeholder="All jobs"
+              noJobLabel="All jobs"
+            />
+          </div>
+
+          <div className="flex items-center justify-between gap-3 border-t border-border px-3.5 py-3">
+            <div className="min-w-0">
+              <p className="text-sm font-semibold text-foreground">How to count it</p>
+              <p className="mt-0.5 text-[11px] leading-relaxed text-muted-foreground">
+                {basis === 'earned'
+                  ? selectedJob
+                    ? 'Job value and costs where the work happened'
+                    : 'Work and costs in the month they happened'
+                  : 'Only money that moved through the bank'}
+              </p>
+            </div>
+            <BasisToggle value={basis} onChange={setBasis} />
+          </div>
+        </section>
+
         <MoneySnapshot
           periodLabel={periodLabel}
+          missingJobs={missingProgressJobs.length}
           basis={basis}
           revenue={revenue}
           expenses={expenses}
@@ -242,7 +394,29 @@ export default function MoneyPage() {
           notYetPaid={notYetPaid}
           totalHours={totalHoursInWindow}
           avgHourlyReturn={avgHourlyReturn}
+          jobView={!!selectedJob}
           fmt={fmt}
+        />
+
+        {missingProgressJobs.length > 0 && (
+          <MissingProgressCard
+            jobs={missingProgressJobs}
+            asOfDate={progressAsOfDate}
+            onAdd={(jobId) => setProgressJobId(jobId)}
+          />
+        )}
+
+        <JobMoneySummary
+          jobs={jobs}
+          entries={entries}
+          materials={materials}
+          settings={settings}
+          teamMembers={teamMembers}
+          start={frame.start}
+          end={frame.end}
+          periodLabel={frame.label}
+          selectedJobId={selectedJobId}
+          onOpenJob={setDetailJobId}
         />
 
         {/* Annual tax sits beside the period snapshot, but keeps its own
@@ -254,13 +428,13 @@ export default function MoneyPage() {
           aria-expanded={detailsOpen}
           aria-controls="money-detail"
           onClick={() => setDetailsOpen((open) => !open)}
-          className="w-full min-h-12 rounded-2xl border border-border/70 bg-card px-4 py-3 text-left shadow-sm transition-colors hover:bg-muted/30 active:bg-muted/50"
+          className="w-full min-h-12 scroll-mb-28 rounded-2xl border border-border/70 bg-card px-4 py-3 text-left shadow-sm transition-colors hover:bg-muted/30 active:bg-muted/50"
         >
           <span className="flex items-center justify-between gap-3">
             <span>
               <span className="block text-sm font-semibold text-foreground">More money detail</span>
               <span className="block text-xs text-muted-foreground mt-0.5">
-                {basis === 'earned' ? 'Earned view' : 'Cash view'} · charts, bills and transactions
+                Exact monthly totals, charts and transactions
               </span>
             </span>
             <ChevronDown
@@ -272,45 +446,6 @@ export default function MoneyPage() {
 
         {detailsOpen && (
           <div id="money-detail" className="space-y-3 animate-in fade-in-0 slide-in-from-top-1 duration-200">
-            <section className="rounded-2xl bg-muted/45 p-3.5">
-              <div className="flex items-center justify-between gap-3">
-                <div>
-                  <p className="text-sm font-semibold text-foreground">How to view the month</p>
-                  <p className="mt-0.5 text-xs leading-relaxed text-muted-foreground">
-                    {basis === 'earned'
-                      ? 'Work is counted when it was earned, including costs not paid yet.'
-                      : 'Only money that actually moved in or out is counted.'}
-                  </p>
-                </div>
-                <div className="inline-flex shrink-0 rounded-xl bg-background p-1 ring-1 ring-border/70">
-                  <button
-                    type="button"
-                    onClick={() => setBasis('earned')}
-                    className={cn(
-                      'min-h-11 rounded-lg px-3 text-xs font-semibold transition-colors',
-                      basis === 'earned'
-                        ? 'bg-foreground text-background shadow-sm'
-                        : 'text-muted-foreground hover:text-foreground',
-                    )}
-                  >
-                    Earned
-                  </button>
-                  <button
-                    type="button"
-                    onClick={() => setBasis('cash')}
-                    className={cn(
-                      'min-h-11 rounded-lg px-3 text-xs font-semibold transition-colors',
-                      basis === 'cash'
-                        ? 'bg-foreground text-background shadow-sm'
-                        : 'text-muted-foreground hover:text-foreground',
-                    )}
-                  >
-                    Cash
-                  </button>
-                </div>
-              </div>
-            </section>
-
             {/* State of the business — useful, but not part of the selected
                 month's made / spent / left story. */}
             <div className="grid grid-cols-2 gap-2.5">
@@ -348,22 +483,159 @@ export default function MoneyPage() {
 
             <RevenueChart
               data={monthlyData}
+              title={selectedJob ? `${selectedJob.name} over time` : 'Revenue vs Expenses'}
               rangeControl={
                 <ChartRangeToggle value={chartRange} onChange={setChartRange} />
               }
             />
+            <MonthlyBreakdown
+              data={monthlyData}
+              basis={basis}
+              scopeLabel={selectedJob?.name}
+            />
             {expenseByCategory.length > 0 && <ExpenseChart data={expenseByCategory} />}
-            {jobs.length > 0 && <PipelineBreakdown jobs={jobs} />}
-            <TransactionList />
+            {!selectedJob && jobs.length > 0 && <PipelineBreakdown jobs={jobs} />}
+            <TransactionList
+              start={frame.start}
+              end={frame.end}
+              periodLabel={frame.label}
+              jobId={selectedJobId || undefined}
+              basis={basis}
+            />
           </div>
         )}
       </div>
+
+      <JobMoneyDetailSheet
+        jobId={detailJobId}
+        open={!!detailJobId}
+        asOfDate={progressAsOfDate}
+        onEditProgress={(jobId) => {
+          setDetailJobId(null);
+          setProgressJobId(jobId);
+        }}
+        onClose={() => setDetailJobId(null)}
+      />
+      <WorkLeftSheet
+        jobId={progressJobId}
+        open={!!progressJobId}
+        defaultAsOfDate={progressAsOfDate}
+        onClose={() => setProgressJobId(null)}
+      />
     </div>
   );
 }
 
+function MissingProgressCard({
+  jobs,
+  asOfDate,
+  onAdd,
+}: {
+  jobs: ReturnType<typeof useStore>['jobs'];
+  asOfDate: string;
+  onAdd: (jobId: string) => void;
+}) {
+  const today = localTodayISO();
+  return (
+    <section className="overflow-hidden rounded-2xl border border-amber-300 bg-amber-50 shadow-sm">
+      <div className="flex gap-3 px-4 pb-3 pt-4">
+        <span className="flex size-9 shrink-0 items-center justify-center rounded-full bg-amber-100 text-amber-700">
+          <AlertCircle size={18} />
+        </span>
+        <div className="min-w-0 flex-1">
+          <p className="text-sm font-bold text-amber-950">
+            {jobs.length === 1
+              ? `${jobs[0].name} isn’t included yet`
+              : `${jobs.length} worked jobs aren’t included yet`}
+          </p>
+          <p className="mt-0.5 text-xs leading-relaxed text-amber-800">
+            {asOfDate < today
+              ? `Add how much work was left at ${format(parseISO(asOfDate), 'd MMM')} so Work done can include its finished share.`
+              : 'Add how much work is left so Work done can include the finished share of each job.'}
+          </p>
+        </div>
+      </div>
+      <div className="divide-y divide-amber-200 border-t border-amber-200">
+        {jobs.map((job) => (
+          <button
+            key={job.id}
+            type="button"
+            onClick={() => onAdd(job.id)}
+            className="flex min-h-12 w-full items-center justify-between gap-3 px-4 py-3 text-left text-sm font-semibold text-amber-950 transition-colors hover:bg-amber-100/70 active:bg-amber-100"
+          >
+            <span className="truncate">{job.name}</span>
+            <span className="shrink-0 text-xs text-amber-800">Add work left</span>
+          </button>
+        ))}
+      </div>
+    </section>
+  );
+}
+
+function BasisToggle({
+  value,
+  onChange,
+}: {
+  value: 'cash' | 'earned';
+  onChange: (value: 'cash' | 'earned') => void;
+}) {
+  return (
+    <div className="inline-flex shrink-0 rounded-xl bg-muted p-1 ring-1 ring-border/70">
+      {(['earned', 'cash'] as const).map((option) => (
+        <button
+          key={option}
+          type="button"
+          onClick={() => onChange(option)}
+          className={cn(
+            'min-h-11 rounded-lg px-3 text-xs font-semibold capitalize transition-colors',
+            value === option
+              ? 'bg-foreground text-background shadow-sm'
+              : 'text-muted-foreground hover:text-foreground',
+          )}
+        >
+          {option === 'earned' ? 'Work done' : 'Cash'}
+        </button>
+      ))}
+    </div>
+  );
+}
+
+function payrollLabourInWindow(
+  entries: Entry[],
+  jobId: string,
+  start: string,
+  end: string,
+  wageRate: number,
+  ownerUserId?: string,
+): number {
+  return entries
+    .filter((entry) =>
+      entry.jobId === jobId
+      && entry.entryDate >= start
+      && entry.entryDate <= end
+      && isPayrollHours(entry, ownerUserId),
+    )
+    .reduce((sum, entry) => sum + (entry.hours ?? 0) * wageRate, 0);
+}
+
+function overheadMaterialsInWindow(
+  materials: Material[],
+  jobId: string,
+  start: string,
+  end: string,
+): number {
+  return materials
+    .filter((material) => {
+      if (material.jobId !== jobId || material.source !== 'overhead') return false;
+      const usedOn = material.usedOn ?? material.createdAt.slice(0, 10);
+      return usedOn >= start && usedOn <= end;
+    })
+    .reduce((sum, material) => sum + (material.cost ?? 0), 0);
+}
+
 function MoneySnapshot({
   periodLabel,
+  missingJobs,
   basis,
   revenue,
   expenses,
@@ -373,9 +645,11 @@ function MoneySnapshot({
   notYetPaid,
   totalHours,
   avgHourlyReturn,
+  jobView,
   fmt,
 }: {
   periodLabel: string;
+  missingJobs: number;
   basis: 'cash' | 'earned';
   revenue: number;
   expenses: number;
@@ -385,17 +659,19 @@ function MoneySnapshot({
   notYetPaid: number;
   totalHours: number;
   avgHourlyReturn: number;
+  jobView: boolean;
   fmt: (value: number) => string;
 }) {
   return (
     <section className="overflow-hidden rounded-[1.5rem] bg-slate-950 text-white shadow-sm">
       <div className="p-5 pb-4">
+        {missingJobs > 0 && <p role="status" className="mb-3 rounded-lg bg-amber-300/15 px-3 py-2 text-sm font-semibold text-amber-200">Incomplete · {missingJobs} worked job{missingJobs === 1 ? '' : 's'} still need progress. This is not the full period result.</p>}
         <div className="flex items-center justify-between gap-3">
           <p className="text-xs font-semibold uppercase tracking-[0.14em] text-white/55">
-            Left after costs
+            {missingJobs > 0 ? 'Recorded so far, after costs' : 'Left after costs'}
           </p>
           <span className="rounded-full bg-white/10 px-2.5 py-1 text-[11px] font-medium text-white/75">
-            {basis === 'earned' ? 'Earned view' : 'Cash view'}
+            {basis === 'earned' ? (jobView ? 'Job progress' : 'Work done') : 'Cash view'}
           </span>
         </div>
         <p className={cn(
@@ -406,9 +682,10 @@ function MoneySnapshot({
         </p>
         <p className="mt-2 text-sm text-white/60">
           {totalHours > 0
-            ? `${totalHours.toLocaleString('en-NZ')}h logged · ${avgHourlyReturn > 0 ? `$${avgHourlyReturn.toFixed(0)}/h average return` : 'no hourly return yet'}`
+            ? `${totalHours.toLocaleString('en-NZ')}h logged · ${avgHourlyReturn > 0 ? `$${avgHourlyReturn.toFixed(0)}/h sales per crew-hour` : 'no hourly return yet'}`
             : `For ${periodLabel}`}
         </p>
+        <p className="mt-1 text-xs text-white/60">Ex GST · before your income tax. Sales per crew-hour is before costs.</p>
       </div>
 
       <div className="grid grid-cols-2 border-t border-white/10 bg-white/[0.04]">

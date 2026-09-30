@@ -1,5 +1,8 @@
 'use client';
 
+import { HoursEstimateFields } from './hours-estimate-fields';
+import { hoursEstimateDraft, parseHoursEstimate } from '@/lib/job-hours-estimate';
+
 // Site Visit Wrap-Up — the "I just walked the property, capture
 // everything while it's fresh" sheet.
 //
@@ -253,6 +256,7 @@ export function SiteVisitWrapUpSheet({
   const [stainProduct, setStainProduct] = useState('');
   const [windowDoorCount, setWindowDoorCount] = useState('');
   const [daysEstimate, setDaysEstimate] = useState('');
+  const [hoursDraft, setHoursDraft] = useState(() => hoursEstimateDraft());
   // Who's on the tools for that estimate. "3 days" solo and "3 days
   // with Suzie" are the same daysEstimate but double the labour —
   // crew × days = person-days is what actually prices the job.
@@ -356,6 +360,7 @@ export function SiteVisitWrapUpSheet({
       setStainProduct(j.stainProduct ?? '');
       setWindowDoorCount(j.windowDoorCount != null ? String(j.windowDoorCount) : '');
       setDaysEstimate(j.daysEstimate != null ? String(j.daysEstimate) : '');
+      setHoursDraft(hoursEstimateDraft(j.hoursEstimate));
       setCrewSize(
         j.crewSize === 1 || j.crewSize === 2 || j.crewSize === 3
           ? (String(j.crewSize) as '1' | '2' | '3')
@@ -377,6 +382,7 @@ export function SiteVisitWrapUpSheet({
       setStainProduct('');
       setWindowDoorCount('');
       setDaysEstimate('');
+      setHoursDraft(hoursEstimateDraft());
       setCrewSize('');
       setClientNameInput('');
       setAddonChips(new Set());
@@ -525,6 +531,8 @@ export function SiteVisitWrapUpSheet({
 
   async function handleSave() {
     if (!target) return;
+    const hours = parseHoursEstimate(hoursDraft);
+    if (hours.error) return;
     setSaving(true);
     try {
       // Shared payload of structured fields. Both branches below (patch
@@ -549,6 +557,7 @@ export function SiteVisitWrapUpSheet({
           ? Math.min(Math.abs(parseInt(windowDoorCount, 10)), 200)
           : undefined,
         daysEstimate: daysEstimate ? Math.abs(parseFloat(daysEstimate)) : undefined,
+        hoursEstimate: hours.value ?? (target.mode === 'existing-job' && target.job.hoursEstimate ? null : undefined),
         crewSize: crewSize ? parseInt(crewSize, 10) : undefined,
         addonItems: Array.from(addonChips),
         siteLogistics: Array.from(siteLogisticsChips),
@@ -1217,6 +1226,8 @@ export function SiteVisitWrapUpSheet({
             </p>
           </div>
 
+          <HoursEstimateFields value={hoursDraft} onChange={setHoursDraft} />
+
           {/* Commercial signals — multi-select chips. These move the
               quote price ±15% without changing the cost. A referred
               quality-focused customer doesn't get the same number as
@@ -1316,7 +1327,7 @@ export function SiteVisitWrapUpSheet({
               // Every field here is optional by design — except the
               // catch-up visit date, which the parent needs to write the
               // backfilled schedule_item.
-              disabled={saving || (askVisitDate && !visitDate)}
+              disabled={saving || (askVisitDate && !visitDate) || !!parseHoursEstimate(hoursDraft).error}
             >
               {saving
                 ? uploadProgress

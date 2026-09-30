@@ -1,7 +1,7 @@
 'use client';
 
 import { useState } from 'react';
-import { Job, JobStatus, WorkType, PrepLevel, LeadSource } from '@/lib/types';
+import { Job, JobStatus, WorkType, PrepLevel, LeadSource, ContactChannel } from '@/lib/types';
 import { SELECTABLE_WORK_TYPES, WORK_TYPE_LABELS, jobWorkTypes } from '@/lib/types';
 import { JOB_STATUSES } from '@/lib/mock-data';
 import { Button } from '@/components/ui/button';
@@ -10,6 +10,8 @@ import {
   Select, SelectContent, SelectItem, SelectTrigger, SelectValue,
 } from '@/components/ui/select';
 import { cn } from '@/lib/utils';
+import { HoursEstimateFields } from './hours-estimate-fields';
+import { hoursEstimateDraft, parseHoursEstimate } from '@/lib/job-hours-estimate';
 
 // 'mixed' is absent by design — it's derived from picking more than one
 // (see deriveWorkType in lib/types.ts), not something a user selects.
@@ -33,6 +35,18 @@ const SOURCES: { value: LeadSource; label: string }[] = [
   { value: 'manual',   label: 'Other'        },
 ];
 
+const LEAD_CONTACT_METHODS: { value: ContactChannel; label: string }[] = [
+  { value: 'phone', label: 'Phone call' },
+  { value: 'text', label: 'Text' },
+  { value: 'email', label: 'Email' },
+  { value: 'visit', label: 'In person' },
+  { value: 'other', label: 'Other' },
+];
+
+export interface LeadSaveContext {
+  contactChannel?: ContactChannel;
+}
+
 const NZ_GST_RATE = 0.15;
 
 /**
@@ -52,7 +66,10 @@ function sanitizeAmount(raw: string): string {
 
 interface JobFormProps {
   defaultValues?: Partial<Job>;
-  onSave: (data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) => void;
+  onSave: (
+    data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>,
+    context?: LeadSaveContext,
+  ) => void;
   onCancel: () => void;
   /**
    * 'lead' trims the form to what's relevant when an enquiry first comes in —
@@ -60,6 +77,8 @@ interface JobFormProps {
    * (you haven't quoted or scheduled yet). 'job' (default) shows everything.
    */
   variant?: 'job' | 'lead';
+  /** How a manually-added lead first got in touch. Phone is the common case. */
+  defaultContactChannel?: ContactChannel;
 }
 
 // Defined at module scope — NOT inside JobForm. If these were redeclared on
@@ -85,7 +104,13 @@ function Input(props: React.InputHTMLAttributes<HTMLInputElement>) {
   );
 }
 
-export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: JobFormProps) {
+export function JobForm({
+  defaultValues,
+  onSave,
+  onCancel,
+  variant = 'job',
+  defaultContactChannel = 'phone',
+}: JobFormProps) {
   const isLead = variant === 'lead';
   const [name, setName] = useState(defaultValues?.name ?? '');
   const [clientName, setClientName] = useState(defaultValues?.clientName ?? '');
@@ -108,6 +133,7 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
   // missing estimate can be fixed without re-running the wrap-up.
   const [daysEstimate, setDaysEstimate] = useState(defaultValues?.daysEstimate?.toString() ?? '');
   const [crewSize, setCrewSize] = useState(defaultValues?.crewSize?.toString() ?? '');
+  const [hoursDraft, setHoursDraft] = useState(() => hoursEstimateDraft(defaultValues?.hoursEstimate));
   const [notes, setNotes] = useState(defaultValues?.notes ?? '');
   // Optional scope fields. Power the "estimating coach" data layer — the
   // values feed downstream insights ($/m² benchmarks, win-rate by work type).
@@ -126,9 +152,12 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
   // trend) and where from (the source pill + by-source insights).
   const [leadDate, setLeadDate] = useState(defaultValues?.leadDate ?? '');
   const [source, setSource] = useState<LeadSource | ''>(defaultValues?.source ?? '');
+  const [contactChannel, setContactChannel] = useState<ContactChannel>(defaultContactChannel);
 
   function handleSave() {
     if (!name.trim() || !clientName.trim()) return;
+    const hours = parseHoursEstimate(hoursDraft);
+    if (hours.error) return;
     onSave({
       name: name.trim(),
       clientName: clientName.trim(),
@@ -144,6 +173,7 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
             : parseFloat(quoteAmount))
         : undefined,
       daysEstimate: daysEstimate ? Math.abs(parseFloat(daysEstimate)) : undefined,
+      hoursEstimate: hours.value ?? (defaultValues?.hoursEstimate ? null : undefined),
       crewSize: crewSize
         ? Math.min(Math.max(Math.abs(parseInt(crewSize, 10)) || 1, 1), 6)
         : undefined,
@@ -155,37 +185,69 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
       workTypes: Array.from(workTypes),
       surfaceAreaM2: surfaceAreaM2 ? parseFloat(surfaceAreaM2) : undefined,
       prepLevel: prepLevel || undefined,
-    });
+    }, isLead ? { contactChannel } : undefined);
   }
 
   return (
     <div className="space-y-3">
-      <Field label="Job name *">
-        <Input placeholder="e.g. Smith Exterior Repaint" value={name} onChange={(e) => setName(e.target.value)} />
-      </Field>
-
       {isLead ? (
-        <Field label="Client name *">
-          <Input placeholder="Full name" value={clientName} onChange={(e) => setClientName(e.target.value)} />
-        </Field>
-      ) : (
-        <div className="grid grid-cols-2 gap-3">
+        <>
           <Field label="Client name *">
-            <Input placeholder="Full name" value={clientName} onChange={(e) => setClientName(e.target.value)} />
+            <Input placeholder="Who is calling?" value={clientName} onChange={(e) => setClientName(e.target.value)} />
           </Field>
-          <Field label="Status">
-            <Select value={status} onValueChange={(v) => setStatus(v as JobStatus)}>
-              <SelectTrigger className="h-9 text-sm">
-                <SelectValue />
-              </SelectTrigger>
-              <SelectContent>
-                {JOB_STATUSES.map((s) => (
-                  <SelectItem key={s} value={s} className="capitalize">{s.replace('-', ' ')}</SelectItem>
-                ))}
-              </SelectContent>
-            </Select>
+          <Field label="What do they need? *">
+            <Input placeholder="e.g. Interior repaint in Albert Town" value={name} onChange={(e) => setName(e.target.value)} />
           </Field>
-        </div>
+        </>
+      ) : (
+        <>
+          <Field label="Job name *">
+            <Input placeholder="e.g. Smith Exterior Repaint" value={name} onChange={(e) => setName(e.target.value)} />
+          </Field>
+          <div className="grid grid-cols-2 gap-3">
+            <Field label="Client name *">
+              <Input placeholder="Full name" value={clientName} onChange={(e) => setClientName(e.target.value)} />
+            </Field>
+            <Field label="Status">
+              <Select value={status} onValueChange={(v) => setStatus(v as JobStatus)}>
+                <SelectTrigger className="h-9 text-sm">
+                  <SelectValue />
+                </SelectTrigger>
+                <SelectContent>
+                  {JOB_STATUSES.map((s) => (
+                    <SelectItem key={s} value={s} className="capitalize">{s.replace('-', ' ')}</SelectItem>
+                  ))}
+                </SelectContent>
+              </Select>
+            </Field>
+          </div>
+        </>
+      )}
+
+      {isLead && (
+        <Field label="How did they get in touch?">
+          <div className="flex flex-wrap gap-2">
+            {LEAD_CONTACT_METHODS.map((method) => (
+              <button
+                key={method.value}
+                type="button"
+                aria-pressed={contactChannel === method.value}
+                onClick={() => setContactChannel(method.value)}
+                className={cn(
+                  'min-h-[44px] rounded-full border px-3 text-sm font-medium transition-colors',
+                  contactChannel === method.value
+                    ? 'border-primary bg-primary text-primary-foreground'
+                    : 'border-border bg-background text-muted-foreground hover:border-primary/40 hover:text-foreground',
+                )}
+              >
+                {method.label}
+              </button>
+            ))}
+          </div>
+          <p className="mt-1.5 text-[11px] leading-snug text-muted-foreground">
+            This is saved in the lead&apos;s contact history. Phone call is selected by default.
+          </p>
+        </Field>
       )}
 
       <div className="grid grid-cols-[minmax(0,1fr)_minmax(0,1fr)] gap-3">
@@ -208,7 +270,7 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
         <Field label="Lead came in">
           <Input type="date" value={leadDate} onChange={(e) => setLeadDate(e.target.value)} />
         </Field>
-        <Field label="Source">
+        <Field label="How they found you">
           <Select value={source || null} onValueChange={(v) => setSource((v ?? '') as LeadSource | '')}>
             <SelectTrigger className="min-w-0 w-full h-9 text-sm">
               <SelectValue placeholder="Pick one">
@@ -380,6 +442,8 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
         </>
       )}
 
+      {!isLead && <HoursEstimateFields value={hoursDraft} onChange={setHoursDraft} />}
+
       {/* Gut time estimate — working days on the tools + who's on it.
           days × crew = person-days, which is what the quote AI prices
           labour from. Normally captured at the site-visit wrap-up;
@@ -439,7 +503,7 @@ export function JobForm({ defaultValues, onSave, onCancel, variant = 'job' }: Jo
         <Button
           className="flex-1 bg-primary"
           onClick={handleSave}
-          disabled={!name.trim() || !clientName.trim()}
+          disabled={!name.trim() || !clientName.trim() || !!parseHoursEstimate(hoursDraft).error}
         >
           {isLead ? 'Save lead' : 'Save Job'}
         </Button>

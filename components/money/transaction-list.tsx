@@ -42,6 +42,20 @@ const FILTERS: { value: Filter; label: string }[] = [
 
 const DAY_WINDOW = 30;
 
+interface TransactionListProps {
+  start?: string;
+  end?: string;
+  periodLabel?: string;
+  jobId?: string;
+  basis?: 'cash' | 'earned';
+}
+
+function transactionDate(entry: Entry, basis: 'cash' | 'earned'): string {
+  return basis === 'cash' && entry.type === 'bill' && entry.paidDate
+    ? entry.paidDate
+    : entry.entryDate;
+}
+
 /**
  * Flag pairs of entries that look like duplicates: same job, same type, same
  * amount (or hours), within 7 days of each other. Best-effort heuristic — the
@@ -88,7 +102,13 @@ function dateLabel(iso: string): string {
   return format(d, 'EEE d MMM');
 }
 
-export function TransactionList() {
+export function TransactionList({
+  start,
+  end,
+  periodLabel,
+  jobId,
+  basis = 'earned',
+}: TransactionListProps) {
   const { entries, jobs } = useStore();
   const [filter, setFilter] = useState<Filter>('all');
 
@@ -98,12 +118,21 @@ export function TransactionList() {
     return d.toISOString().slice(0, 10);
   }, []);
 
-  // Last 30 days, newest first
+  const windowStart = start ?? cutoff;
+  const windowEnd = end ?? '9999-12-31';
+
+  // Selected page period (or the legacy last-30-days fallback), newest first.
   const recent = useMemo(
     () => entries
-      .filter((e) => e.entryDate >= cutoff)
-      .sort((a, b) => b.entryDate.localeCompare(a.entryDate)),
-    [entries, cutoff],
+      .filter((e) => {
+        const date = transactionDate(e, basis);
+        return date >= windowStart
+          && date <= windowEnd
+          && (!jobId || e.jobId === jobId);
+      },
+      )
+      .sort((a, b) => transactionDate(b, basis).localeCompare(transactionDate(a, basis))),
+    [entries, windowStart, windowEnd, jobId, basis],
   );
 
   const duplicateIds = useMemo(() => findDuplicateIds(recent), [recent]);
@@ -117,12 +146,13 @@ export function TransactionList() {
   const groups = useMemo(() => {
     const out: { date: string; entries: Entry[] }[] = [];
     for (const e of filtered) {
+      const date = transactionDate(e, basis);
       const last = out[out.length - 1];
-      if (last && last.date === e.entryDate) last.entries.push(e);
-      else out.push({ date: e.entryDate, entries: [e] });
+      if (last && last.date === date) last.entries.push(e);
+      else out.push({ date, entries: [e] });
     }
     return out;
-  }, [filtered]);
+  }, [filtered, basis]);
 
   const jobNameById = useMemo(() => {
     const map = new Map<string, string>();
@@ -136,7 +166,9 @@ export function TransactionList() {
     <div className="bg-card border border-border rounded-2xl overflow-hidden">
       <div className="px-4 pt-4 pb-3 flex items-center justify-between gap-2">
         <p className="text-sm font-semibold text-foreground">Recent transactions</p>
-        <p className="text-xs text-muted-foreground">Last {DAY_WINDOW} days · {recent.length} entries</p>
+        <p className="text-xs text-muted-foreground">
+          {periodLabel ?? `Last ${DAY_WINDOW} days`} · {recent.length} entries
+        </p>
       </div>
 
       {/* Filter chips */}
@@ -171,7 +203,7 @@ export function TransactionList() {
       {/* Empty state */}
       {filtered.length === 0 && (
         <div className="px-4 pb-6 text-center text-sm text-muted-foreground">
-          No {filter === 'all' ? 'transactions' : filter} in the last {DAY_WINDOW} days.
+          No {filter === 'all' ? 'transactions' : filter} in {periodLabel ?? `the last ${DAY_WINDOW} days`}.
         </div>
       )}
 

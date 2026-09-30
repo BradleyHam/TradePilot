@@ -38,7 +38,7 @@ import { LeadInsights } from '@/components/leads/lead-insights';
 import { PageHeader } from '@/components/shared/page-header';
 import { EmptyState } from '@/components/shared/empty-state';
 import { JobDetailSheet } from '@/components/jobs/job-detail-sheet';
-import { JobForm } from '@/components/jobs/job-form';
+import { JobForm, type LeadSaveContext } from '@/components/jobs/job-form';
 import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { BookVisitSheet } from '@/components/schedule/book-visit-sheet';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
@@ -335,15 +335,27 @@ export default function LeadsPage() {
     logContact({ jobId, direction: 'in', channel: 'other' });
   }
 
-  function handleAddLead(data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>) {
-    addJob({
+  async function handleAddLead(
+    data: Omit<Job, 'id' | 'businessId' | 'createdAt' | 'updatedAt'>,
+    context?: LeadSaveContext,
+  ) {
+    const nowIso = new Date().toISOString();
+    const lead = await addJob({
       // Real UUID — jobs.id is a uuid column, so a "job_123" temp id fails
       // the insert with "invalid input syntax for type uuid".
       id: crypto.randomUUID(),
       businessId: businessId ?? '',
-      createdAt: new Date().toISOString(),
-      updatedAt: new Date().toISOString(),
+      createdAt: nowIso,
+      updatedAt: nowIso,
       ...data,
+    });
+    if (!lead) return;
+    logContact({
+      jobId: lead.id,
+      direction: 'in',
+      channel: context?.contactChannel ?? 'phone',
+      contactedAt: nowIso,
+      note: 'Initial lead enquiry',
     });
     setShowAddLead(false);
   }

@@ -64,6 +64,12 @@ export interface PeriodHours {
   total: number;
 }
 
+export interface KnownPayDeductions {
+  paye: number;
+  net: number;
+  paidDate: string;
+}
+
 // ── Date helpers (string-safe, local-midnight — matches lib/format-date) ───
 
 function parseISO(iso: string): Date {
@@ -189,6 +195,39 @@ export function employeeHoursInPeriod(
     }
   }
   return { own, legacyHelper, total: own + legacyHelper };
+}
+
+/**
+ * Reuse a previously filed deduction only when it is a genuinely like-for-like
+ * pay: same employee, same gross, and the stored PAYE + net reconciles back to
+ * gross. This is deliberately narrower than pretending TradePilot is a full
+ * payroll engine. Tax code, KiwiSaver, student loan and other deductions can
+ * all change the answer; an exact filed precedent is safe and immediately
+ * useful for Suzie's usual fortnight.
+ */
+export function latestKnownDeductions(
+  payRuns: PayRun[],
+  memberId: string | undefined,
+  gross: number,
+): KnownPayDeductions | null {
+  if (!Number.isFinite(gross) || gross <= 0) return null;
+
+  const matches = payRuns
+    .filter((run) => {
+      if (!run.paid || !run.eiFiled || !run.paidDate) return false;
+      if (run.paye == null || run.net == null) return false;
+      if (memberId != null && run.memberId !== memberId) return false;
+      if (Math.abs(run.gross - gross) > 0.02) return false;
+      return Math.abs(run.gross - run.paye - run.net) <= 0.02;
+    })
+    .sort((a, b) => {
+      const byPaidDate = (b.paidDate ?? '').localeCompare(a.paidDate ?? '');
+      return byPaidDate || b.createdAt.localeCompare(a.createdAt);
+    });
+
+  const match = matches[0];
+  if (!match || match.paye == null || match.net == null || !match.paidDate) return null;
+  return { paye: match.paye, net: match.net, paidDate: match.paidDate };
 }
 
 // ── IRD deadlines ──────────────────────────────────────────────────────────

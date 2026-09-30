@@ -157,10 +157,13 @@ export function MoneySplitBar({ stats }: MoneySplitBarProps) {
   const { expectedIncome, materialsCost, contractorLabourCost, payrollLabourCost, expectedProfit } = stats;
   if (expectedIncome <= 0 && stats.totalExpenses <= 0) return null;
 
-  const overrun = expectedProfit < 0;
+  const hasIncomeBasis = expectedIncome > 0;
+  const overrun = hasIncomeBasis && expectedProfit < 0;
   // When the job lost money there's no owner slice to draw — scale the
   // costs to themselves and say by how much they overshot.
-  const denominator = overrun ? stats.totalExpenses : Math.max(expectedIncome, 1);
+  const denominator = !hasIncomeBasis || overrun
+    ? Math.max(stats.totalExpenses, 1)
+    : expectedIncome;
 
   const segments = [
     { key: 'materials'   as const, label: 'Materials',  value: materialsCost },
@@ -178,7 +181,7 @@ export function MoneySplitBar({ stats }: MoneySplitBarProps) {
           {/* Naming the figure makes the bar self-explanatory — but only
               when there IS one. A job with costs and no price yet gets the
               generic title rather than "Where the $0 went". */}
-          {expectedIncome > 0 ? <>Where the {money(expectedIncome)} went</> : 'Where the money went'}
+          {hasIncomeBasis ? <>Where the {money(expectedIncome)} went</> : 'Costs logged'}
         </p>
         {overrun && (
           <p className="text-xs font-medium text-red-500">Over by {money(-expectedProfit)}</p>

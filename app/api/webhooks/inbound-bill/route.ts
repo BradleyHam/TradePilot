@@ -47,7 +47,7 @@ import { inferDueDate, type DueDateSource } from '@/lib/bill-due-date';
 import { followBillDownloadLink, type LinkFollowResult } from '@/lib/bill-link-follower';
 import { parseDuluxSecureLinkEmail } from '@/lib/dulux-email-parser';
 import { extractDuluxShortLink, fetchDuluxSecurePdf } from '@/lib/dulux-secure-fetch';
-import { rankJobs } from '@/lib/job-match';
+import { safeAutoJobMatch } from '@/lib/job-match';
 import { rowToJob, entryToRow } from '@/lib/supabase/mappers';
 import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
 import type { Entry, Job, ParsedBill } from '@/lib/types';
@@ -498,8 +498,7 @@ async function createOrMergeBill(
   // Job-guess from the parser's hint (PO / address).
   let guessedJobId: string | undefined;
   if (parsed.jobHint && jobs.length > 0) {
-    const top = rankJobs(jobs, parsed.jobHint)[0];
-    if (top && top.tier === 'active-match' && top.score >= JOB_MATCH_MIN_SCORE) guessedJobId = top.job.id;
+    guessedJobId = safeAutoJobMatch(jobs, parsed.jobHint, JOB_MATCH_MIN_SCORE)?.id;
   }
 
   // Per-invoice source id: several invoices from one email must not collide

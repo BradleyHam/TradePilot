@@ -10,10 +10,10 @@ interface JobCardProps {
   totalHours?: number;
   totalExpenses?: number;
   totalIncome?: number;
+  /** Full expected job income from invoice, quote or estimate. */
+  expectedIncome?: number;
   /** Pre-computed by the parent via lib/job-stats.ts. Falls back to invoiced/quoted/estimated when actual income is zero. */
   expectedProfit?: number;
-  /** True when expected profit is based on a real quote/invoice rather than an estimate. */
-  expectedIsConfident?: boolean;
   /**
    * Signed URL for the job's main image, resolved by the parent (which
    * batch-signs the whole list in one call — see lib/job-cover.ts).
@@ -25,7 +25,7 @@ interface JobCardProps {
 
 export function JobCard({
   job, totalHours, totalExpenses, totalIncome,
-  expectedProfit, expectedIsConfident, coverUrl, onClick,
+  expectedIncome, expectedProfit, coverUrl, onClick,
 }: JobCardProps) {
   const value = job.quoteAmount ?? job.estimatedValue;
   // Prefer the parent-provided expected profit; fall back to the simple
@@ -35,6 +35,8 @@ export function JobCard({
       ? totalIncome - totalExpenses
       : undefined
   );
+  const hasIncomeBasis = expectedIncome !== undefined && expectedIncome > 0;
+  const showCostsOnly = !hasIncomeBasis && totalExpenses !== undefined && totalExpenses > 0;
   const profitLabel = totalIncome && totalIncome > 0 ? 'Profit' : 'Est. profit';
 
   return (
@@ -78,11 +80,18 @@ export function JobCard({
         {totalHours !== undefined && totalHours > 0 && (
           <Stat label="Hours" value={`${totalHours}h`} />
         )}
-        {profit !== undefined && (
+        {hasIncomeBasis && profit !== undefined && (
           <Stat
             label={profitLabel}
             value={`$${profit.toLocaleString('en-NZ')}`}
             valueClass={profit >= 0 ? 'text-green-600' : 'text-red-500'}
+          />
+        )}
+        {showCostsOnly && (
+          <Stat
+            label="Costs logged"
+            value={`$${totalExpenses.toLocaleString('en-NZ')}`}
+            valueClass="text-amber-600"
           />
         )}
       </div>

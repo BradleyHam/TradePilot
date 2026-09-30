@@ -37,6 +37,25 @@ function tokenise(s: string | undefined | null): string[] {
     .filter((t) => t.length >= 3);
 }
 
+// Useful for ordering a picker, but not strong enough to silently allocate a
+// bill. Supplier references often contain only a town or a generic trade word
+// (for example "WANAKA"). Those words can appear on several active jobs and
+// previously caused the newest one to be selected by accident.
+const GENERIC_AUTO_MATCH_TOKENS = new Set([
+  'wanaka', 'queenstown', 'cromwell', 'arrowtown', 'otago', 'zealand',
+  'road', 'street', 'avenue', 'drive', 'lane', 'place',
+  'invoice', 'account', 'order', 'purchase', 'limited', 'company',
+  'painting', 'painter', 'interior', 'exterior', 'maintenance', 'project',
+]);
+
+function exactMatchTokens(job: Job, context: string): string[] {
+  const contextTokens = new Set(tokenise(context));
+  const jobTokens = new Set(tokenise([
+    job.name, job.clientName, job.location, job.legacyId,
+  ].filter(Boolean).join(' ')));
+  return [...contextTokens].filter((token) => jobTokens.has(token));
+}
+
 /** Score how well a job's identifying text matches the context tokens. */
 function fuzzyScore(job: Job, ctxTokens: Set<string>): number {
   if (ctxTokens.size === 0) return 0;
@@ -108,4 +127,27 @@ export function rankJobs(
   });
 
   return ranked;
+}
+
+/**
+ * Return a job only when a bill hint is distinctive enough to auto-allocate.
+ * Ambiguous/tied matches and matches made solely from generic place or trade
+ * words deliberately return undefined so Brad confirms the job himself.
+ */
+export function safeAutoJobMatch(
+  jobs: Job[],
+  context: string,
+  minScore = 10,
+  now: Date = new Date(),
+): Job | undefined {
+  const ranked = rankJobs(jobs, context, now);
+  const top = ranked[0];
+  if (!top || top.tier !== 'active-match' || top.score < minScore) return undefined;
+
+  const runnerUp = ranked.find((candidate) => candidate.tier === 'active-match' && candidate.job.id !== top.job.id);
+  if (runnerUp && runnerUp.score === top.score) return undefined;
+
+  const exactTokens = exactMatchTokens(top.job, context);
+  const hasDistinctiveToken = exactTokens.some((token) => !GENERIC_AUTO_MATCH_TOKENS.has(token));
+  return hasDistinctiveToken ? top.job : undefined;
 }

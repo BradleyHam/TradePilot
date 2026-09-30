@@ -30,6 +30,11 @@
 
 const NZ = 'en-NZ';
 
+/** Local calendar date as YYYY-MM-DD. Avoids UTC shifting NZ back a day. */
+export function localTodayISO(date = new Date()): string {
+  return `${date.getFullYear()}-${String(date.getMonth() + 1).padStart(2, '0')}-${String(date.getDate()).padStart(2, '0')}`;
+}
+
 /** Parse an ISO YYYY-MM-DD string into a Date at local midnight. */
 function parse(iso: string): Date | null {
   if (!iso) return null;

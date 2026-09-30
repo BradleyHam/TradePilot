@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation';
 import { StoreProvider } from '@/lib/store';
 import { BottomNav } from '@/components/nav/bottom-nav';
 import { DesktopSidebar } from '@/components/nav/desktop-sidebar';
+import { StoreSaveNotice } from '@/components/shared/store-save-notice';
 import { RoleGuard } from '@/components/nav/role-guard';
 import { supabase } from '@/lib/supabase/client';
 
@@ -55,6 +56,7 @@ export default function AppLayout({ children }: { children: React.ReactNode }) {
             sat beneath the clock and the Home settings gear was
             unreachable. Zero effect in desktop browsers. */}
         <main className="flex-1 flex flex-col min-h-screen overflow-y-auto overflow-x-hidden pt-safe pb-20 md:pb-0">
+          <StoreSaveNotice />
           {children}
         </main>
       </div>

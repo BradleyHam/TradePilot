@@ -11,11 +11,13 @@ import type {
   PaintStockItem, PaintStockKind, PaintStockLocation,
   BankTransactionStatus, LeadSource, WorkType, PrepLevel, LostReason, WonReason,
   ScheduleSkipReasonKind,
-  BusinessMember, MemberRole, WorkerKind, ShiftPhoto, ShiftReport, JobVariation, ClientJobLink, PayRun,
+  BusinessMember, CrewPerson, JobProgressSnapshot, JobProgressPerson,
+  MemberRole, WorkerKind, ShiftPhoto, ShiftReport, JobVariation, ClientJobLink, PayRun,
   JobAssignment, ScheduleAssignment,
   JobContact, ContactDirection, ContactChannel,
 } from '../types';
 import { deriveWorkType } from '../types';
+import { readHoursEstimate } from '../job-hours-estimate';
 
 type Row = Record<string, unknown>;
 
@@ -74,6 +76,7 @@ export function rowToJob(r: Row): Job {
     siteLogistics: Array.isArray(r.site_logistics) ? (r.site_logistics as string[]) : undefined,
     daysEstimate: asNumber(r.days_estimate),
     crewSize: asNumber(r.crew_size),
+    hoursEstimate: readHoursEstimate(r.hours_estimate),
     commercialSignals: Array.isArray(r.commercial_signals) ? (r.commercial_signals as string[]) : undefined,
     lostReason: (asString(r.lost_reason) as LostReason | undefined),
     wonReason: (asString(r.won_reason) as WonReason | undefined),
@@ -163,6 +166,7 @@ export function jobToRow(j: Partial<Job>): Row {
   }
   if (j.daysEstimate !== undefined) out.days_estimate = j.daysEstimate ?? null;
   if (j.crewSize !== undefined) out.crew_size = j.crewSize ?? null;
+  if (j.hoursEstimate !== undefined) out.hours_estimate = j.hoursEstimate;
   if (j.commercialSignals !== undefined) {
     out.commercial_signals = j.commercialSignals && j.commercialSignals.length > 0 ? j.commercialSignals : null;
   }
@@ -663,6 +667,65 @@ export function rowToBusinessMember(r: Row): BusinessMember {
     role: (r.role as MemberRole) ?? 'employee',
     displayName: asString(r.display_name),
     workerKind: asString(r.worker_kind) as WorkerKind | undefined,
+    createdAt: r.created_at as string,
+  };
+}
+
+export function rowToCrewPerson(r: Row): CrewPerson {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    displayName: r.display_name as string,
+    workerKind: r.worker_kind as CrewPerson['workerKind'],
+    archivedAt: asString(r.archived_at),
+    createdAt: r.created_at as string,
+    updatedAt: r.updated_at as string,
+  };
+}
+
+export function crewPersonToRow(person: Partial<CrewPerson>): Row {
+  const out: Row = {};
+  if (person.id !== undefined) out.id = person.id;
+  if (person.businessId !== undefined) out.business_id = person.businessId;
+  if (person.displayName !== undefined) out.display_name = person.displayName.trim();
+  if (person.workerKind !== undefined) out.worker_kind = person.workerKind;
+  if (person.archivedAt !== undefined) out.archived_at = person.archivedAt || null;
+  return out;
+}
+
+export function rowToJobProgressSnapshot(r: Row): JobProgressSnapshot {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    jobId: r.job_id as string,
+    asOfDate: r.as_of_date as string,
+    state: r.state as JobProgressSnapshot['state'],
+    actualPersonHours: asNumber(r.actual_person_hours) ?? 0,
+    legacyHelperHours: asNumber(r.legacy_helper_hours) ?? 0,
+    remainingPersonHours: asNumber(r.remaining_person_hours) ?? 0,
+    forecastPersonHours: asNumber(r.forecast_person_hours) ?? 0,
+    jobValueExGst: asNumber(r.job_value_ex_gst) ?? 0,
+    valueSource: (asString(r.value_source) as JobProgressSnapshot['valueSource']) ?? 'none',
+    progressFraction: asNumber(r.progress_fraction) ?? 0,
+    earnedToDateExGst: asNumber(r.earned_to_date_ex_gst) ?? 0,
+    note: asString(r.note),
+    recordedBy: asString(r.recorded_by),
+    createdAt: r.created_at as string,
+  };
+}
+
+export function rowToJobProgressPerson(r: Row): JobProgressPerson {
+  return {
+    id: r.id as string,
+    businessId: r.business_id as string,
+    snapshotId: r.snapshot_id as string,
+    businessMemberId: asString(r.business_member_id),
+    crewPersonId: asString(r.crew_person_id),
+    personName: r.person_name as string,
+    workerKind: r.worker_kind as WorkerKind,
+    remainingHours: asNumber(r.remaining_hours) ?? 0,
+    inputDays: asNumber(r.input_days),
+    hoursPerDay: asNumber(r.hours_per_day),
     createdAt: r.created_at as string,
   };
 }

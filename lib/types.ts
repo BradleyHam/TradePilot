@@ -121,6 +121,14 @@ export type WorkerKind =
   | 'helper'
   | 'subcontractor';
 
+/** Planning roles: the owner's time belongs with experienced painters. */
+export type LabourEstimateRole = Exclude<WorkerKind, 'owner'>;
+export interface JobHoursEstimate {
+  /** Total person-hours, independent of days, crew size and work-left forecasts. */
+  total: number;
+  byRole?: Partial<Record<LabourEstimateRole, number>>;
+}
+
 /** Settings keys for the per-tier target hourly rates. Stored as strings
  *  in `settings.value`, parsed at read-time. PD-anchored defaults live
  *  in `lib/worker-rates.ts`. */
@@ -157,6 +165,70 @@ export interface BusinessMember {
   displayName?: string;
   /** Which worker tier this person's logged hours default to (e.g. Suzie = 'helper'). */
   workerKind?: WorkerKind;
+  createdAt: string;
+}
+
+/**
+ * A reusable person in the planning roster who does NOT have a Trade Pilot
+ * login. This is deliberately separate from BusinessMember: adding a painter
+ * here must never create an auth account, payroll period, PAYE reminder, or
+ * grant access to business data.
+ */
+export interface CrewPerson {
+  id: string;
+  businessId: string;
+  displayName: string;
+  /** Existing rate/category vocabulary; the UI calls these Painter, Brush hand, etc. */
+  workerKind: Exclude<WorkerKind, 'owner'>;
+  archivedAt?: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type JobProgressState = 'forecast' | 'complete';
+export type JobProgressValueSource = 'invoice' | 'quote' | 'estimate' | 'none';
+
+/**
+ * An append-only, dated view of how far through a job the work is. The money
+ * is a management estimate only: it never creates income, changes an invoice,
+ * or feeds GST/PAYE/tax calculations.
+ */
+export interface JobProgressSnapshot {
+  id: string;
+  businessId: string;
+  jobId: string;
+  asOfDate: string;
+  state: JobProgressState;
+  actualPersonHours: number;
+  /** Historical helperHours included in actualPersonHours, surfaced for auditability. */
+  legacyHelperHours: number;
+  remainingPersonHours: number;
+  forecastPersonHours: number;
+  jobValueExGst: number;
+  valueSource: JobProgressValueSource;
+  progressFraction: number;
+  earnedToDateExGst: number;
+  note?: string;
+  recordedBy?: string;
+  createdAt: string;
+}
+
+/**
+ * The named people behind one progress forecast. Names and categories are
+ * snapshotted so old reports remain understandable after someone is archived
+ * or loses their login.
+ */
+export interface JobProgressPerson {
+  id: string;
+  businessId: string;
+  snapshotId: string;
+  businessMemberId?: string;
+  crewPersonId?: string;
+  personName: string;
+  workerKind: WorkerKind;
+  remainingHours: number;
+  inputDays?: number;
+  hoursPerDay?: number;
   createdAt: string;
 }
 
@@ -707,6 +779,8 @@ export interface Job {
    * unverified".
    */
   crewSize?: number;
+  /** Original hours budget. Only changed explicitly, never by progress updates. */
+  hoursEstimate?: JobHoursEstimate | null;
   /**
    * Soft commercial factors that move the quote price ±15% without
    * changing the cost basis. Examples: 'referral', 'repeat-customer',

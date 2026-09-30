@@ -15,7 +15,7 @@
 // Every section handles its own empty state — see the golden rule in
 // AGENTS.md: "no empty visualisations" on a fresh week.
 
-import { useCallback, useMemo, useState } from 'react';
+import { useCallback, useMemo, useRef, useState } from 'react';
 import Link from 'next/link';
 import { useStore } from '@/lib/store';
 import { supabase } from '@/lib/supabase/client';
@@ -37,6 +37,8 @@ import { InvoiceAction } from '@/components/jobs/invoice-action';
 import { BookJobDatesSheet } from '@/components/jobs/booked-dates';
 import { LogHoursPrompt, shouldPromptForHours } from '@/components/jobs/log-hours-prompt';
 import { EditScheduleItemSheet, type ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
+import { EditSiteVisitSheet } from '@/components/schedule/edit-site-visit-sheet';
+import { downloadSiteVisitCalendar } from '@/lib/site-visit-calendar';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { Button } from '@/components/ui/button';
 
@@ -246,8 +248,8 @@ const LEADS_TO_CONTACT_MAX_ROWS = 6;
 // ── Page ────────────────────────────────────────────────────────────────────
 export default function HomePage() {
   const {
-    entries, scheduleItems, invoices, jobs, jobImports, quotes, businessId,
-    updateScheduleItem, addScheduleItem, updateEntry, markInvoicePaid, addEntry, deleteEntry, updateJob,
+    entries, scheduleItems, invoices, jobs, jobImports, quotes, businessId, loading,
+    updateScheduleItem, addScheduleItem, updateEntry, markInvoicePaid, addEntries, deleteEntry, updateJob,
     logContact,
     confirmBillDraftWithMaterials, confirmBillDraftAsSplit,
     commitImportAsLink, commitImportAsCreate, commitImportAsSkip,
@@ -303,6 +305,8 @@ export default function HomePage() {
   // Secondary destinations stay reachable without competing for a permanent
   // bottom-nav slot. This is navigation only; it never changes business data.
   const [moreOpen, setMoreOpen] = useState(false);
+  const [followUpsOpen, setFollowUpsOpen] = useState(false);
+  const pendingHours = useRef<{ key: string; rows: Entry[] } | null>(null);
 
   // Reschedule sheet — opened by tapping any Today row. Stores item ids
   // (not the items themselves) so we re-resolve from the live store on
@@ -310,6 +314,13 @@ export default function HomePage() {
   // (dodges the stale-prop trap in AGENTS.md). Holds every id in the
   // tapped item's run so multi-day job bookings reschedule as one block.
   const [reschedulingItemIds, setReschedulingItemIds] = useState<string[] | null>(null);
+  // Site visits use their focused one-day editor. Keeping them out of the
+  // general range editor also lets a changed date/time refresh the phone
+  // calendar reminder immediately.
+  const [editingVisitId, setEditingVisitId] = useState<string | null>(null);
+  const editingVisit = editingVisitId
+    ? scheduleItems.find((item) => item.id === editingVisitId) ?? null
+    : null;
   const reschedulingTarget: ScheduleEditTarget | null = useMemo(() => {
     if (!reschedulingItemIds || reschedulingItemIds.length === 0) return null;
     const items = reschedulingItemIds
@@ -620,170 +631,14 @@ export default function HomePage() {
   });
   const hour = new Date().getHours();
   const greeting = hour < 12 ? 'Good morning' : hour < 17 ? 'Good afternoon' : 'Good evening';
-  const attentionCount = leadsToContact.length
-    + toQuoteJobs.length
-    + jobsWaitingForDates.length
-    + overdueInvoices.length
-    + billsDueSoon.length
-    + billDrafts.length
-    + depositsToSend.length
-    + quoteFollowUps.length
-    + jobImports.length;
+  const attentionCount = leadsToContact.length + jobsWaitingForDates.length
+    + billDrafts.length + depositsToSend.length + quoteFollowUps.length + jobImports.length;
 
-  return (
-    <div className="flex flex-col min-h-full">
-      <PageHeader
-        title={greeting}
-        subtitle={subtitle}
-        action={
-          <button
-            type="button"
-            onClick={() => setMoreOpen(true)}
-            aria-label="More tools"
-            className="md:hidden flex items-center justify-center w-11 h-11 -mr-2 rounded-xl text-muted-foreground hover:bg-muted active:bg-muted transition-colors"
-          >
-            <MoreHorizontal size={22} strokeWidth={1.9} />
-          </button>
-        }
-      />
+  if (loading) return <p role="status" className="px-4 py-6 text-sm text-muted-foreground">Loading today’s work…</p>;
 
-      <div className="px-4 md:px-6 pb-6 space-y-4 w-full max-w-2xl mx-auto">
-        <TodaySection
-          items={todayItems}
-          todayISO={todayISO}
-          onMarkDone={(id) => updateScheduleItem(id, { completed: true })}
-          onReschedule={(item) => {
-            // Tap any day of a run and the whole run comes along — matches
-            // the Schedule tab so rescheduling one overdue day of a 3-day
-            // job doesn't leave the other two days orphaned with a stale
-            // "(Day 2/3)" label.
-            setReschedulingItemIds(findScheduleRun(item, scheduleItems).map((s) => s.id));
-          }}
-          onOpenWrapUp={(item) => {
-            // Ticking a quote_visit opens the wrap-up regardless of
-            // whether it has a linked job — the sheet will create one
-            // on save if needed. We DON'T complete the schedule item
-            // yet — the wrap-up's onSaved callback does that, so a
-            // cancelled wrap-up leaves the row in Today (still owed
-            // a write-up).
-            setWrapUpScheduleItemId(item.id);
-          }}
-          onLogHours={(item, fields) => {
-            // Build hours-type Entries attached to the schedule item's job.
-            // Mirrors the shape used in app/(app)/entry/page.tsx — hours
-            // entries don't have GST (gstApplies=false) and the description
-            // falls back to the schedule item's title so a bare "" doesn't
-            // turn into a useless row in the entries list later.
-            //
-            // One entry PER ACTIVITY (a single activity is one entry) so the
-            // hours-by-activity chart stays truthful when a day was split
-            // between, say, prep and painting.
-            for (const slice of fields.slices) {
-              addEntry({
-                // UUID, not Date.now() — a multi-activity split saves several
-                // entries in the same millisecond, and timestamp ids collide.
-                id: `ent_${crypto.randomUUID()}`,
-                businessId: businessId ?? '',
-                jobId: item.jobId,
-                type: 'hours',
-                hours: slice.hours,
-                activity: slice.activity,
-                // Brad's own login ticking his own row — same 'owner'
-                // default as the full EntryForm. Without this, Home-logged
-                // hours landed with workerKind undefined: a third unlabelled
-                // bucket in every by-worker rollup, and job costing couldn't
-                // rate them. (Suzie's hours come via /my/hours, not here.)
-                workerKind: 'owner',
-                description: fields.description.trim() || item.title,
-                // Ticking an overdue row usually means the work happened on
-                // the day the row was scheduled — put the hours on THAT day
-                // so the hours-by-day allocation is right. Future-dated rows
-                // (ticked early) still log as today: work can't happen on a
-                // date that hasn't arrived. String compare is safe on
-                // YYYY-MM-DD.
-                entryDate: item.date && item.date < todayISO ? item.date : todayISO,
-                gstApplies: false,
-                createdAt: new Date().toISOString(),
-              });
-            }
-          }}
-        />
-
-        {/* Staff close-outs: quiet when all is well, but any "Brad needs to
-            check" report is expanded directly under the summary. */}
-        <TeamUpdatesCard />
-
-        {attentionCount > 0 ? (
-          <section>
-            <div className="mb-2 flex items-center justify-between">
-              <h2 className="text-sm font-semibold text-foreground">Needs attention</h2>
-              <span className="inline-flex min-w-6 h-6 items-center justify-center rounded-full bg-primary/10 px-2 text-xs font-bold text-primary tabular-nums">
-                {attentionCount}
-              </span>
-            </div>
-            <div className="space-y-4">
-              {leadsToContact.length > 0 && (
-                <LeadsToContactSection
-                  items={leadsToContact}
-                  todayISO={todayISO}
-                  scheduledItemByJob={scheduledLeadItemByJob}
-                  compactHeading
-                  onMarkContacted={(jobId) =>
-                    logContact({ jobId, direction: 'out', channel: 'email' })
-                  }
-                  onAlreadyScheduled={(job, item) =>
-                    logContact({
-                      jobId: job.id,
-                      direction: 'out',
-                      channel: 'other',
-                      note: `Existing ${item.type === 'quote_visit' ? 'site visit' : 'schedule booking'} confirmed for ${item.date}.`,
-                    })
-                  }
-                  onAddToSchedule={(job) => setBookVisitJob(job)}
-                  onArrangeVisit={(job) => setVisitPromptJob(job)}
-                  onSentQuote={(job) => setMarkQuotedJobId(job.id)}
-                />
-              )}
-
-              {toQuoteJobs.length > 0 && (
-                <QuotesToPrepSection items={toQuoteJobs} compactHeading />
-              )}
-
-              {jobsWaitingForDates.length > 0 && (
-                <JobsWaitingForDatesFlag
-                  jobs={jobsWaitingForDates}
-                  onBookDates={(job) => setBookingDatesJobId(job.id)}
-                  onDatesNotConfirmed={(job) => {
-                    if (!businessId) return;
-                    // Retire an overdue booking-date reminder before creating
-                    // the fresh one, otherwise the old Today row keeps nagging.
-                    for (const item of scheduleItems) {
-                      if (
-                        item.jobId === job.id
-                        && item.type === 'follow_up'
-                        && item.notes === BOOKING_DATES_FOLLOW_UP_NOTE
-                        && !item.completed
-                      ) {
-                        updateScheduleItem(item.id, { completed: true });
-                      }
-                    }
-                    addScheduleItem({
-                      id: crypto.randomUUID(),
-                      businessId,
-                      jobId: job.id,
-                      type: 'follow_up',
-                      title: `Confirm dates — ${job.name}`,
-                      date: formatISODate(addDays(parseISODate(todayISO), 14)),
-                      notes: BOOKING_DATES_FOLLOW_UP_NOTE,
-                      completed: false,
-                      createdAt: new Date().toISOString(),
-                    });
-                  }}
-                />
-              )}
-
-              {showMoneyFlags && (
-                <MoneyFlagsCard
+  const moneyFlags = (priority: boolean) => (
+    <MoneyFlagsCard
+                  priority={priority}
                   compactHeading
                   overdueInvoices={overdueInvoices}
                   billsDueSoon={billsDueSoon}
@@ -830,8 +685,149 @@ export default function HomePage() {
                   onCommitImportAsCreate={(id) => void commitImportAsCreate(id)}
                   onCommitImportAsSkip={(id) => void commitImportAsSkip(id)}
                 />
+  );
+
+  return (
+    <div className="flex flex-col min-h-full">
+      <PageHeader
+        title={greeting}
+        subtitle={subtitle}
+        action={
+          <button
+            type="button"
+            onClick={() => setMoreOpen(true)}
+            aria-label="More tools"
+            className="md:hidden flex items-center justify-center w-11 h-11 -mr-2 rounded-xl text-muted-foreground hover:bg-muted active:bg-muted transition-colors"
+          >
+            <MoreHorizontal size={22} strokeWidth={1.9} />
+          </button>
+        }
+      />
+
+      <div className="px-4 md:px-6 pb-6 space-y-4 w-full max-w-2xl mx-auto">
+        <TodaySection
+          items={todayItems}
+          todayISO={todayISO}
+          onMarkDone={(id) => updateScheduleItem(id, { completed: true })}
+          onAddToCalendar={(item) => {
+            downloadSiteVisitCalendar(item, jobs);
+            updateScheduleItem(item.id, { icsDownloaded: true });
+          }}
+          onReschedule={(item) => {
+            if (item.type === 'quote_visit') {
+              // Visits need the focused one-day editor because saving a new
+              // date/time must also refresh the native calendar reminder.
+              setEditingVisitId(item.id);
+              return;
+            }
+            // Tap any day of a run and the whole run comes along — matches
+            // the Schedule tab so rescheduling one overdue day of a 3-day
+            // job doesn't leave the other two days orphaned with a stale
+            // "(Day 2/3)" label.
+            setReschedulingItemIds(findScheduleRun(item, scheduleItems).map((s) => s.id));
+          }}
+          onOpenWrapUp={(item) => {
+            // Ticking a quote_visit opens the wrap-up regardless of
+            // whether it has a linked job — the sheet will create one
+            // on save if needed. We DON'T complete the schedule item
+            // yet — the wrap-up's onSaved callback does that, so a
+            // cancelled wrap-up leaves the row in Today (still owed
+            // a write-up).
+            setWrapUpScheduleItemId(item.id);
+          }}
+          onLogHours={async (item, fields) => {
+            const key = JSON.stringify([item.id, fields]);
+            if (pendingHours.current?.key !== key) pendingHours.current = { key, rows: fields.slices.map((slice) => ({
+              id: crypto.randomUUID(), businessId: businessId ?? '', jobId: item.jobId,
+              type: 'hours', hours: slice.hours, activity: slice.activity, workerKind: 'owner',
+              description: fields.description.trim() || item.title,
+              entryDate: item.date && item.date < todayISO ? item.date : todayISO,
+              gstApplies: false, createdAt: new Date().toISOString(),
+            })) };
+            const saved = await addEntries(pendingHours.current.rows);
+            if (!saved) throw new Error('Hours were not confirmed. Your entry is still here — please retry.');
+            pendingHours.current = null;
+          }}
+        />
+
+        {/* Staff close-outs: quiet when all is well, but any "Brad needs to
+            check" report is expanded directly under the summary. */}
+        <TeamUpdatesCard />
+
+        <Link href="/entry?type=hours" className="flex min-h-12 items-center justify-center rounded-xl bg-primary px-4 py-3 text-base font-semibold text-primary-foreground">Log today’s hours</Link>
+        <PayrollFlags />
+        {showMoneyFlags && moneyFlags(true)}
+        {toQuoteJobs.length > 0 && <QuotesToPrepSection items={toQuoteJobs} compactHeading />}
+
+        {attentionCount > 0 ? (
+          <section>
+            <button type="button" aria-expanded={followUpsOpen} aria-controls="home-follow-ups" onClick={() => setFollowUpsOpen((open) => !open)} className="mb-2 flex min-h-12 w-full items-center justify-between rounded-xl border border-border bg-card px-4 text-left">
+              <span className="text-sm font-semibold text-foreground">Follow-ups and admin {followUpsOpen ? '−' : '+'}</span>
+              <span className="inline-flex min-w-6 h-6 items-center justify-center rounded-full bg-primary/10 px-2 text-xs font-bold text-primary tabular-nums">
+                {attentionCount}
+              </span>
+            </button>
+            {followUpsOpen && <div id="home-follow-ups" className="space-y-4">
+              {leadsToContact.length > 0 && (
+                <LeadsToContactSection
+                  items={leadsToContact}
+                  todayISO={todayISO}
+                  scheduledItemByJob={scheduledLeadItemByJob}
+                  compactHeading
+                  onMarkContacted={(jobId) =>
+                    logContact({ jobId, direction: 'out', channel: 'email' })
+                  }
+                  onAlreadyScheduled={(job, item) =>
+                    logContact({
+                      jobId: job.id,
+                      direction: 'out',
+                      channel: 'other',
+                      note: `Existing ${item.type === 'quote_visit' ? 'site visit' : 'schedule booking'} confirmed for ${item.date}.`,
+                    })
+                  }
+                  onAddToSchedule={(job) => setBookVisitJob(job)}
+                  onArrangeVisit={(job) => setVisitPromptJob(job)}
+                  onSentQuote={(job) => setMarkQuotedJobId(job.id)}
+                />
               )}
-            </div>
+
+
+
+              {jobsWaitingForDates.length > 0 && (
+                <JobsWaitingForDatesFlag
+                  jobs={jobsWaitingForDates}
+                  onBookDates={(job) => setBookingDatesJobId(job.id)}
+                  onDatesNotConfirmed={(job) => {
+                    if (!businessId) return;
+                    // Retire an overdue booking-date reminder before creating
+                    // the fresh one, otherwise the old Today row keeps nagging.
+                    for (const item of scheduleItems) {
+                      if (
+                        item.jobId === job.id
+                        && item.type === 'follow_up'
+                        && item.notes === BOOKING_DATES_FOLLOW_UP_NOTE
+                        && !item.completed
+                      ) {
+                        updateScheduleItem(item.id, { completed: true });
+                      }
+                    }
+                    addScheduleItem({
+                      id: crypto.randomUUID(),
+                      businessId,
+                      jobId: job.id,
+                      type: 'follow_up',
+                      title: `Confirm dates — ${job.name}`,
+                      date: formatISODate(addDays(parseISODate(todayISO), 14)),
+                      notes: BOOKING_DATES_FOLLOW_UP_NOTE,
+                      completed: false,
+                      createdAt: new Date().toISOString(),
+                    });
+                  }}
+                />
+              )}
+
+              {showMoneyFlags && moneyFlags(false)}
+            </div>}
           </section>
         ) : (
           <div className="flex items-center gap-3 rounded-2xl border border-green-200/70 bg-green-50/70 px-4 py-3 text-green-800">
@@ -839,16 +835,11 @@ export default function HomePage() {
               <Check size={17} strokeWidth={2.2} />
             </div>
             <div>
-              <p className="text-sm font-semibold">You&apos;re clear for now</p>
-              <p className="text-xs text-green-700/80">Nothing needs chasing tonight.</p>
+              <p className="text-sm font-semibold">No other follow-ups</p>
+              <p className="text-xs text-green-700/80">Your money and payroll reminders are shown above when due.</p>
             </div>
           </div>
         )}
-
-        {/* Payroll — pay Suzie + the IRD follow-ups. Self-contained:
-            reads the store itself and renders nothing when no employees
-            exist or nothing is due. */}
-        <PayrollFlags />
 
         <WeekStatsSection
           hours={hoursThisWeek}
@@ -1033,16 +1024,22 @@ export default function HomePage() {
         onCancel={() => setBookingDatesJobId(null)}
       />
 
-      {/* Reschedule sheet — opened by tapping any Today row (including
-          overdue ones). Same component the Schedule tab uses, so a
-          multi-day job booking, a quote visit, or a bare reminder all get
-          the right edit UI (date range + working-days pattern where it
-          makes sense, single date otherwise). */}
+      {/* General reschedule sheet for work blocks and reminders. Site visits
+          route to the focused editor below so changed timing also refreshes
+          the phone-calendar event. */}
       <EditScheduleItemSheet
         open={reschedulingTarget !== null}
         onOpenChange={(open) => { if (!open) setReschedulingItemIds(null); }}
         target={reschedulingTarget}
         jobs={jobs}
+      />
+
+      <EditSiteVisitSheet
+        open={editingVisit !== null}
+        onOpenChange={(open) => { if (!open) setEditingVisitId(null); }}
+        item={editingVisit}
+        jobs={jobs}
+        onCalendarRefresh={(updatedItem) => downloadSiteVisitCalendar(updatedItem, jobs)}
       />
 
       {/* "No hours on this job" quick-add — opens right after Mark paid on
@@ -1138,16 +1135,18 @@ export interface LoggedHoursFields {
 }
 
 function TodaySection({
-  items, todayISO, onMarkDone, onLogHours, onOpenWrapUp, onReschedule,
+  items, todayISO, onMarkDone, onLogHours, onOpenWrapUp, onReschedule, onAddToCalendar,
 }: {
   items: ScheduleItem[];
   todayISO: string;
   onMarkDone: (id: string) => void;
-  onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => void;
+  onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => Promise<void>;
   /** Tick handler for quote_visit rows with a linked job — opens the wrap-up. */
   onOpenWrapUp: (item: ScheduleItem) => void;
   /** Tapping the row body — opens the reschedule sheet for the item's run. */
   onReschedule: (item: ScheduleItem) => void;
+  /** Re-download a missing site-visit reminder without leaving Home. */
+  onAddToCalendar: (item: ScheduleItem) => void;
 }) {
   return (
     <section>
@@ -1173,6 +1172,7 @@ function TodaySection({
               onLogHours={onLogHours}
               onOpenWrapUp={onOpenWrapUp}
               onReschedule={onReschedule}
+              onAddToCalendar={onAddToCalendar}
             />
           ))}
         </ul>
@@ -1194,17 +1194,29 @@ const SCHEDULE_TYPE_META: Record<string, { color: string; bg: string; icon: Reac
   reminder:    { color: 'text-slate-600',  bg: 'bg-slate-50',  icon: Bell,        label: 'Reminder' },
 };
 
+function overdueScheduleCopy(type: ScheduleItemType): string {
+  switch (type) {
+    case 'job_booking': return 'Work day needs action';
+    case 'quote_visit': return 'Visit needs wrap-up';
+    case 'follow_up': return 'Follow-up due';
+    case 'bill_due': return 'Bill overdue';
+    case 'invoice_due': return 'Invoice overdue';
+    case 'reminder': return 'Reminder due';
+  }
+}
+
 function TodayRow({
-  item, todayISO, onMarkDone, onLogHours, onOpenWrapUp, onReschedule,
+  item, todayISO, onMarkDone, onLogHours, onOpenWrapUp, onReschedule, onAddToCalendar,
 }: {
   item: ScheduleItem;
   todayISO: string;
   onMarkDone: (id: string) => void;
-  onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => void;
+  onLogHours: (item: ScheduleItem, fields: LoggedHoursFields) => Promise<void>;
   /** Tick handler for quote_visit rows. Falls back to onMarkDone if not provided. */
   onOpenWrapUp?: (item: ScheduleItem) => void;
   /** Tapping the row body — opens the reschedule sheet. */
   onReschedule: (item: ScheduleItem) => void;
+  onAddToCalendar: (item: ScheduleItem) => void;
 }) {
   const meta = SCHEDULE_TYPE_META[item.type] ?? SCHEDULE_TYPE_META.reminder;
   const Icon = meta.icon;
@@ -1254,6 +1266,9 @@ function TodayRow({
   // in place of the bare tick — the tick read as "mark done" and hid the
   // fact that this is where you add the visit details from Home.
   const showWrapUpButton = isWrapUpVisit && visitTimePassed;
+  const needsCalendarReminder = item.type === 'quote_visit'
+    && !item.icsDownloaded
+    && !visitTimePassed;
 
   function handleTickClick() {
     if (isWrapUpVisit) {
@@ -1265,18 +1280,16 @@ function TodayRow({
     }
   }
 
-  function handleFormSave(fields: LoggedHoursFields) {
-    onLogHours(item, fields);
-    onMarkDone(item.id);
+  async function handleFormSave(fields: LoggedHoursFields) {
+    await onLogHours(item, fields);
+    // Saving hours completes the matching booked day in the store.
+    if (item.type !== 'job_booking' || item.date > todayISO) onMarkDone(item.id);
     // No need to flip formOpen — the row is about to unmount as the parent
     // filter excludes completed items.
   }
 
   function handleFormCancel() {
-    // Treat cancel as "yes I'm done, no I'm not logging hours right now".
-    // Schedule item still gets marked complete (the user clicked tick) so
-    // they don't have to tick again later just to clear it from Today.
-    onMarkDone(item.id);
+    setFormOpen(false);
   }
 
   return (
@@ -1297,29 +1310,45 @@ function TodayRow({
           </div>
           <div className="flex-1 min-w-0">
             <p className={cn(
-              'text-sm font-medium text-foreground truncate',
+              'text-sm font-medium text-foreground leading-snug',
               formOpen && 'line-through text-muted-foreground',
             )}>
               {item.title}
             </p>
             <p className="text-xs text-muted-foreground mt-0.5 flex items-center gap-1.5 flex-wrap">
-              {/* Date chip — leads the meta row so "when?" lands first.
-                  Chip colour still encodes the item type (job/quote/etc.)
-                  so the visual grammar from before is preserved. */}
+              {/* Name the thing before showing its date. "Overdue" by itself
+                  made a past work booking look like an overdue job or bill. */}
+              <span className="font-medium text-muted-foreground">{meta.label}</span>
               <span className={cn(
                 'inline-flex items-center px-1.5 py-0.5 rounded text-[10px] font-semibold uppercase tracking-wide',
                 meta.bg, meta.color,
               )}>
                 {chipDateLabel(item.date, todayISO)}
               </span>
-              {overdue && <span className="text-red-600 font-medium">Overdue</span>}
-              {item.startTime && <span className="truncate">{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
+              {overdue && (
+                <span className="text-red-600 font-medium">{overdueScheduleCopy(item.type)}</span>
+              )}
+              {item.startTime && <span className="truncate">{item.startTime.slice(0,5)}{item.endTime ? `–${item.endTime.slice(0,5)}` : ''}</span>}
             </p>
           </div>
           {!formOpen && (
-            <ChevronRight size={16} className="text-muted-foreground shrink-0" strokeWidth={1.8} />
+            <span className="flex items-center gap-1 text-xs font-semibold text-primary shrink-0">
+
+              <ChevronRight size={16} className="text-muted-foreground" strokeWidth={1.8} />
+            </span>
           )}
         </button>
+        {needsCalendarReminder && (
+          <button
+            type="button"
+            onClick={() => onAddToCalendar(item)}
+            aria-label={`Add calendar reminder for "${item.title}"`}
+            className="flex min-w-16 flex-col items-center justify-center gap-0.5 border-l border-border px-2 text-[10px] font-semibold text-blue-700 bg-blue-50 hover:bg-blue-100 active:bg-blue-100 transition-colors"
+          >
+            <CalendarPlus size={15} strokeWidth={2} />
+            Reminder
+          </button>
+        )}
         {showWrapUpButton ? (
           // Site visit whose time has passed → explicit "Wrap up" CTA so
           // adding the details is reachable straight from Home (no need to
@@ -1410,9 +1439,11 @@ function TickedHoursForm({
   itemTitle, onSave, onCancel,
 }: {
   itemTitle: string;
-  onSave: (fields: LoggedHoursFields) => void;
+  onSave: (fields: LoggedHoursFields) => Promise<void>;
   onCancel: () => void;
 }) {
+  const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState('');
   const [hoursStr, setHoursStr] = useState('');
   // Multi-select, in tap order. 'painting' pre-selected so the common
   // "8h painting, done" day is still two taps (hours + Save).
@@ -1458,18 +1489,21 @@ function TickedHoursForm({
   const canSave =
     !Number.isNaN(hoursNum) && hoursNum > 0 && activities.length > 0 && splitBalances;
 
-  function submit() {
-    if (!canSave) return;
+  async function submit() {
+    if (!canSave || saving) return;
+    setSaving(true); setSaveError('');
     const slices = multi
       ? activities
           .map((a) => ({ activity: a, hours: parseFloat(splitHours[a] ?? '') || 0 }))
           .filter((s) => s.hours > 0)
       : [{ activity: activities[0], hours: hoursNum }];
-    onSave({ slices, description });
+    try { await onSave({ slices, description }); }
+    catch (err) { setSaveError(err instanceof Error ? err.message : 'Could not save. Please retry.'); }
+    finally { setSaving(false); }
   }
 
   return (
-    <div className="border-t border-border bg-muted/30 px-4 py-3 space-y-3">
+    <fieldset disabled={saving} className="min-w-0 border-t border-border bg-muted/30 px-4 py-3 space-y-3">
       <div>
         <label className="text-[11px] font-semibold text-muted-foreground uppercase tracking-wide block mb-1">
           Hours
@@ -1576,6 +1610,7 @@ function TickedHoursForm({
         />
       </div>
 
+      {saveError && <p role="alert" className="text-sm text-destructive">{saveError}</p>}
       <div className="flex items-center justify-end gap-2 pt-1">
         <button
           type="button"
@@ -1595,10 +1630,10 @@ function TickedHoursForm({
               : 'bg-muted text-muted-foreground cursor-not-allowed',
           )}
         >
-          Save hours
+          {saving ? 'Saving…' : 'Save hours'}
         </button>
       </div>
-    </div>
+    </fieldset>
   );
 }
 
@@ -1771,8 +1806,9 @@ function MoneyFlagsCard({
   overdueInvoices, billsDueSoon, billDrafts, depositsToSend, quoteFollowUps, jobImports, jobs, todayISO,
   onMarkInvoicePaid, onMarkBillPaid, onConfirmDraft, onConfirmDraftSplit, onDeleteDraft,
   onCommitImportAsLink, onCommitImportAsCreate, onCommitImportAsSkip, onIssueDeposit, onDepositNotYet,
-  onFollowedUp, onMarkLost, onSnoozeFollowUp, compactHeading = false,
+  onFollowedUp, onMarkLost, onSnoozeFollowUp, compactHeading = false, priority = false,
 }: {
+  priority?: boolean;
   overdueInvoices: Invoice[];
   billsDueSoon: Entry[];
   billDrafts: Entry[];
@@ -1796,15 +1832,16 @@ function MoneyFlagsCard({
   onCommitImportAsSkip: (importId: string) => void;
   compactHeading?: boolean;
 }) {
+  if (priority && overdueInvoices.length === 0 && billsDueSoon.length === 0) return null;
   return (
     <section>
       {compactHeading
-        ? <p className="mb-2 text-sm font-semibold text-foreground">Money and admin</p>
+        ? <p className="mb-2 text-sm font-semibold text-foreground">{priority ? 'Money due — review first' : 'Money and admin'}</p>
         : <SectionLabel>Flags</SectionLabel>}
       <div className="bg-card border border-border rounded-2xl divide-y divide-border overflow-hidden">
         {/* Drafts first — the freshest pending action; Brad just uploaded
             a PDF and the next tap should be to confirm it. */}
-        {billDrafts.length > 0 && (
+        {!priority && billDrafts.length > 0 && (
           <BillsToConfirmFlag
             drafts={billDrafts}
             jobs={jobs}
@@ -1816,7 +1853,7 @@ function MoneyFlagsCard({
         {/* Project archive imports — staged by scripts/import-projects.ts.
             Sits below bill drafts because these are historical data being
             backfilled, not "right now" actions. */}
-        {jobImports.length > 0 && (
+        {!priority && jobImports.length > 0 && (
           <ImportsToReviewFlag
             imports={jobImports}
             jobs={jobs}
@@ -1825,14 +1862,14 @@ function MoneyFlagsCard({
             onSkip={onCommitImportAsSkip}
           />
         )}
-        {depositsToSend.length > 0 && (
+        {!priority && depositsToSend.length > 0 && (
           <DepositToSendFlag
             jobs={depositsToSend}
             onIssueDeposit={onIssueDeposit}
             onNotYet={onDepositNotYet}
           />
         )}
-        {quoteFollowUps.length > 0 && (
+        {!priority && quoteFollowUps.length > 0 && (
           <QuoteFollowUpsFlag
             followUps={quoteFollowUps}
             todayISO={todayISO}
@@ -1841,7 +1878,7 @@ function MoneyFlagsCard({
             onSnooze={onSnoozeFollowUp}
           />
         )}
-        {overdueInvoices.length > 0 && (
+        {priority && overdueInvoices.length > 0 && (
           <OverdueInvoicesFlag
             invoices={overdueInvoices}
             jobs={jobs}
@@ -1849,7 +1886,7 @@ function MoneyFlagsCard({
             onMarkPaid={onMarkInvoicePaid}
           />
         )}
-        {billsDueSoon.length > 0 && (
+        {priority && billsDueSoon.length > 0 && (
           <BillsDueFlag
             bills={billsDueSoon}
             jobs={jobs}
@@ -3941,7 +3978,7 @@ function ComingUpRow({ item, todayISO }: { item: ScheduleItem; todayISO: string 
           )}>
             {chipDateLabel(item.date, todayISO)}
           </span>
-          {item.startTime && <span>{item.startTime}{item.endTime ? `–${item.endTime}` : ''}</span>}
+          {item.startTime && <span>{item.startTime.slice(0,5)}{item.endTime ? `–${item.endTime.slice(0,5)}` : ''}</span>}
         </p>
       </div>
     </li>

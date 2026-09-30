@@ -5,12 +5,11 @@
  * IRD gets its two follow-ups. Three flag types, all self-clearing:
  *
  *   1. "Pay {name}"      — a fortnight has ended with no pay run recorded.
- *                          Expands into a mark-paid form. Net-first: Brad
- *                          reads the net off his banking app, the PAYE off
- *                          the IRD calculator, and the gross fills itself
- *                          (gross = net + PAYE). Any two of the three money
- *                          fields derive the third; hours × rate pre-fills
- *                          gross when the employee logged time.
+ *                          Expands into a mark-paid form. Hours × rate
+ *                          pre-fills gross; a matching filed pay pre-fills
+ *                          PAYE and net. If there is no exact precedent,
+ *                          gross stays anchored to hours × rate. Net and
+ *                          PAYE are recorded from the actual pay record.
  *   2. "File payday info" — a pay run is recorded but the myIR employment
  *                          information isn't (due 2 working days after
  *                          pay day). One tap to clear.
@@ -28,9 +27,10 @@ import { useStore } from '@/lib/store';
 import {
   payrollConfig, completedPeriods, periodIsPaid, employeeHoursInPeriod,
   eiFilingDueDate, payeMonthsDue, currentPeriod, scheduledPaydayForPeriod,
+  latestKnownDeductions,
   type PayPeriod,
 } from '@/lib/payroll';
-import type { BusinessMember } from '@/lib/types';
+import type { BusinessMember, PayRun } from '@/lib/types';
 import { formatEntryDate } from '@/lib/format-date';
 import { Button } from '@/components/ui/button';
 import { cn } from '@/lib/utils';
@@ -59,7 +59,7 @@ function fmtPeriod(p: PayPeriod): string {
 const inputCls = 'w-full h-11 px-3 rounded-lg border border-input bg-background text-sm focus:outline-none focus:ring-2 focus:ring-ring';
 
 export function PayrollFlags() {
-  const { teamMembers, payRuns, settings, addPayRun, updatePayRun } = useStore();
+  const { teamMembers, payRuns, settings, addPayRun, updatePayRun, correctPayRunPaidDate } = useStore();
   const todayISO = todayISOLocal();
 
   const employees = useMemo(
@@ -130,6 +130,7 @@ export function PayrollFlags() {
             rate={cfg.wageRate}
             todayISO={todayISO}
             scheduledPayday={scheduledPaydayForPeriod(cfg, period)}
+            previousPayRuns={payRuns}
             onSave={addPayRun}
           />
         ))}
@@ -189,21 +190,69 @@ export function PayrollFlags() {
             </div>
           );
         })}
+        {payRuns.length > 0 && <details className="px-4 py-2">
+          <summary className="flex min-h-11 cursor-pointer items-center text-sm font-semibold">Pay records · correct a date</summary>
+          <div className="space-y-2 pb-2">
+            {[...payRuns].sort((a, b) => (b.paidDate ?? '').localeCompare(a.paidDate ?? '')).slice(0, 6).map((run) => (
+              <PayDateCorrection key={run.id} run={run} todayISO={todayISO} onSave={correctPayRunPaidDate} />
+            ))}
+          </div>
+        </details>}
       </div>
     </section>
   );
 }
 
+function PayDateCorrection({ run, todayISO, onSave }: {
+  run: PayRun;
+  todayISO: string;
+  onSave: (id: string, date: string) => Promise<{ ok: boolean; error?: string }>;
+}) {
+  const [editing, setEditing] = useState(false);
+  const [date, setDate] = useState(run.paidDate ?? '');
+  const [saving, setSaving] = useState(false);
+  const [error, setError] = useState<string>();
+  const validDate = date && date <= todayISO && !Number.isNaN(new Date(`${date}T12:00:00`).getTime());
+
+  async function save() {
+    if (!validDate || saving) return;
+    setSaving(true);
+    setError(undefined);
+    const result = await onSave(run.id, date);
+    setSaving(false);
+    if (result.ok) setEditing(false);
+    else setError(result.error ?? 'Could not save this date.');
+  }
+
+  return <div className="rounded-xl border border-border p-3">
+    <div className="flex items-center justify-between gap-2">
+      <p className="text-sm"><span className="font-medium">{run.employeeName}</span> · {fmtPeriod({ start: run.periodStart, end: run.periodEnd })}<br />
+        <span className="text-muted-foreground">Paid {run.paidDate ? formatEntryDate(run.paidDate) : 'date unknown'} · {fmtMoney(run.gross)} gross</span>
+      </p>
+      <button type="button" className="min-h-11 shrink-0 px-2 text-sm font-semibold text-primary" onClick={() => { setDate(run.paidDate ?? ''); setError(undefined); setEditing((v) => !v); }}>{editing ? 'Cancel' : 'Edit date'}</button>
+    </div>
+    {editing && <div className="mt-3 space-y-2">
+      <label className="block text-sm">Actual payment date
+        <input type="date" value={date} max={todayISO} onChange={(e) => setDate(e.target.value)} className={inputCls} />
+      </label>
+      <p className="text-xs text-muted-foreground">Updates this pay record and its wages expense. Check myIR if payday information was already filed.</p>
+      {error && <p role="alert" className="text-sm text-destructive">{error}</p>}
+      <Button className="min-h-11 w-full" disabled={!validDate || saving || date === run.paidDate} onClick={() => void save()}>{saving ? 'Saving…' : 'Save payment date'}</Button>
+    </div>}
+  </div>;
+}
+
 // ── One "Pay {name}" row with an inline mark-paid form ─────────────────────
 
 function PayEmployeeFlag({
-  member, period, rate, todayISO, scheduledPayday, onSave,
+  member, period, rate, todayISO, scheduledPayday, previousPayRuns, onSave,
 }: {
   member: BusinessMember;
   period: PayPeriod;
   rate: number;
   todayISO: string;
   scheduledPayday: string;
+  previousPayRuns: PayRun[];
   onSave: (input: {
     memberId?: string;
     employeeName: string;
@@ -225,89 +274,85 @@ function PayEmployeeFlag({
     [entries, member.userId, period],
   );
   const suggestedGross = Math.round(hours.total * rate * 100) / 100;
+  const initialDeductions = useMemo(
+    () => latestKnownDeductions(previousPayRuns, member.id, suggestedGross),
+    [previousPayRuns, member.id, suggestedGross],
+  );
   const overdue = todayISO > scheduledPayday;
   const dueToday = todayISO === scheduledPayday;
 
   const [open, setOpen] = useState(false);
   const [paidDate, setPaidDate] = useState(todayISO);
   const [gross, setGross] = useState(String(suggestedGross || ''));
-  const [paye, setPaye] = useState('');
-  const [net, setNet] = useState('');
-  // Which money fields Brad has actually typed in. gross = net + PAYE, so
-  // whenever two values are known the untyped third fills itself — and a
-  // field he typed is never overwritten. The hours × rate gross prefill
-  // counts as NOT typed, so entering net + PAYE replaces the suggestion.
-  // Net comes first in the layout: the net is the number sitting in his
-  // banking app, the PAYE comes off the IRD calculator, and the gross —
-  // the number the books actually need — is derived.
-  const [touched, setTouched] = useState({ gross: false, paye: false, net: false });
+  const [paye, setPaye] = useState(initialDeductions ? String(initialDeductions.paye) : '');
+  const [net, setNet] = useState(initialDeductions ? String(initialDeductions.net) : '');
+  const [deductionSourceDate, setDeductionSourceDate] = useState(initialDeductions?.paidDate);
+  const [paidHours, setPaidHours] = useState(String(hours.total || ''));
+  const [paidRate, setPaidRate] = useState(String(rate));
+  const [touched, setTouched] = useState({ paye: false, net: false });
   const [saving, setSaving] = useState(false);
+  const [saveError, setSaveError] = useState<string>();
 
-  // Forgive "$1,487.50" / "1487.5" / " 1487 " — the tired-painter rule.
   const parseAmount = (s: string): number | undefined => {
-    const n = Number(s.replace(/[$,\s]/g, ''));
-    return Number.isFinite(n) && n > 0 ? n : undefined;
+    const cleaned = s.replace(/[$,\s]/g, '');
+    if (!cleaned) return undefined;
+    const n = Number(cleaned);
+    return Number.isFinite(n) && n >= 0 ? n : undefined;
   };
   const grossNum = parseAmount(gross);
-
-  // Round to cents and render without float noise ("1487.5" not "1487.499…").
+  const hoursNum = parseAmount(paidHours);
+  const rateNum = parseAmount(paidRate);
   const r2 = (n: number): string => String(Math.round(n * 100) / 100);
 
-  // One handler per money field. Each marks its own field typed, then fills
-  // whichever counterpart can be derived — preferring a field with no value
-  // over overwriting a visible (but untyped) one, and never touching a
-  // typed field. All reads use this render's state, which is current: only
-  // the field being edited changes before the derivation runs.
+  // Only an explicit gross edit or hours/rate edit may change gross.
+  // Never feed a derived deduction back into it while someone types net.
+  const onGrossChange = (s: string) => {
+    setGross(s);
+    const g = parseAmount(s);
+    const known = g != null ? latestKnownDeductions(previousPayRuns, member.id, g) : null;
+    if (!touched.paye) setPaye(known ? String(known.paye) : '');
+    if (!touched.net) setNet(known ? String(known.net) : '');
+    setDeductionSourceDate(!touched.paye && !touched.net ? known?.paidDate : undefined);
+  };
+  const onHoursOrRateChange = (field: 'hours' | 'rate', value: string) => {
+    if (field === 'hours') setPaidHours(value);
+    else setPaidRate(value);
+    const h = parseAmount(field === 'hours' ? value : paidHours);
+    const r = parseAmount(field === 'rate' ? value : paidRate);
+    onGrossChange(h != null && r != null ? r2(h * r) : '');
+  };
   const onNetChange = (s: string) => {
     setNet(s);
+    // A copied PAYE amount is no longer confirmed once actual net changes.
+    if (!touched.paye) setPaye('');
+    setDeductionSourceDate(undefined);
     setTouched((t) => ({ ...t, net: true }));
-    const n = parseAmount(s);
-    if (n == null) return;
-    const p = parseAmount(paye);
-    const g = parseAmount(gross);
-    if (p != null && !touched.gross) setGross(r2(n + p));
-    else if (p == null && g != null && g >= n && !touched.paye) setPaye(r2(g - n));
   };
   const onPayeChange = (s: string) => {
     setPaye(s);
+    setDeductionSourceDate(undefined);
     setTouched((t) => ({ ...t, paye: true }));
-    const p = parseAmount(s);
-    if (p == null) return;
-    const n = parseAmount(net);
-    const g = parseAmount(gross);
-    if (n != null && !touched.gross) setGross(r2(n + p));
-    else if (n == null && g != null && g > p && !touched.net) setNet(r2(g - p));
-  };
-  const onGrossChange = (s: string) => {
-    setGross(s);
-    setTouched((t) => ({ ...t, gross: true }));
-    const g = parseAmount(s);
-    if (g == null) return;
-    const p = parseAmount(paye);
-    const n = parseAmount(net);
-    if (p != null && g > p && !touched.net) setNet(r2(g - p));
-    else if (p == null && n != null && g >= n && !touched.paye) setPaye(r2(g - n));
   };
 
-  // All three filled but they don't add up — usually a KiwiSaver or student
-  // loan deduction hiding in the gap, or a typo. Warn, never block: the
-  // typed gross is what saves, and Brad may know something the maths doesn't.
   const payeNum = parseAmount(paye);
   const netNum = parseAmount(net);
-  const mismatch =
-    grossNum != null && payeNum != null && netNum != null
-    && Math.abs(netNum + payeNum - grossNum) > 0.02;
+  const invalidAmount = [gross, net, paye, paidHours, paidRate].some((s) => s.trim() !== '' && parseAmount(s) == null);
+  const exceedsGross = grossNum != null && ((netNum ?? 0) + (payeNum ?? 0) > grossNum + 0.02);
+  const difference = grossNum != null && netNum != null ? Math.round((grossNum - netNum) * 100) / 100 : undefined;
+  const otherDeductions = difference != null && payeNum != null ? Math.round((difference - payeNum) * 100) / 100 : undefined;
+  const canSave = !!grossNum && !invalidAmount && !exceedsGross && !!paidDate && !saving;
 
   const save = async () => {
-    if (!grossNum || saving) return;
+    if (!canSave || !grossNum) return;
+    setSaveError(undefined);
     setSaving(true);
     const res = await onSave({
       memberId: member.id,
       employeeName: name,
       periodStart: period.start,
       periodEnd: period.end,
-      hours: hours.total || undefined,
-      rate,
+      hours: hoursNum,
+      rate: rateNum,
       gross: grossNum,
       paye: parseAmount(paye),
       net: parseAmount(net),
@@ -315,7 +360,7 @@ function PayEmployeeFlag({
     });
     setSaving(false);
     // On success the period drops out of duePeriods and this row unmounts.
-    if (!res.ok) setOpen(true);
+    if (!res.ok) { setOpen(true); setSaveError(res.error ?? 'Pay was not saved. Please retry.'); }
   };
 
   return (
@@ -353,8 +398,17 @@ function PayEmployeeFlag({
         />
       </button>
       {open && (
-        <div className="px-4 pb-4 pt-1 bg-muted/30 space-y-3">
+        <fieldset disabled={saving} className="px-4 pb-4 pt-1 bg-muted/30 space-y-3">
+          <p className="text-xs text-muted-foreground">{hours.total} hours logged for {fmtPeriod(period)}. Enter the hours this payment covers.</p>
           <div className="grid grid-cols-2 gap-3">
+            <label className="block">
+              <span className="text-xs text-muted-foreground">Hours paid</span>
+              <input type="text" inputMode="decimal" value={paidHours} onChange={(e) => onHoursOrRateChange('hours', e.target.value)} className={inputCls} />
+            </label>
+            <label className="block">
+              <span className="text-xs text-muted-foreground">Hourly rate ($)</span>
+              <input type="text" inputMode="decimal" value={paidRate} onChange={(e) => onHoursOrRateChange('rate', e.target.value)} className={inputCls} />
+            </label>
             <label className="block">
               <span className="text-xs text-muted-foreground">Paid on</span>
               <input
@@ -388,7 +442,7 @@ function PayEmployeeFlag({
               />
             </label>
             <label className="block">
-              <span className="text-xs text-muted-foreground">Gross ($) — auto from net + PAYE</span>
+              <span className="text-xs text-muted-foreground">Gross ($) — hours × rate</span>
               <input
                 type="text"
                 inputMode="decimal"
@@ -399,27 +453,41 @@ function PayEmployeeFlag({
               />
             </label>
           </div>
-          {mismatch && (
-            <p className="text-xs text-amber-600 dark:text-amber-500 leading-snug">
-              These don&apos;t add up: {fmtMoney(netNum!)} net + {fmtMoney(payeNum!)} PAYE
-              = {fmtMoney(netNum! + payeNum!)}, but gross says {fmtMoney(grossNum!)}.
-              Fine if KiwiSaver or student loan also came out — otherwise
-              double-check the IRD calculator.
-            </p>
+          {hoursNum != null && Math.abs(hoursNum - hours.total) > 0.01 && (
+            <p className="text-xs text-amber-700">Paying {hoursNum} hours; {hours.total} are logged in this period. Check the period and timesheets.</p>
+          )}
+          {(invalidAmount || exceedsGross) && <p role="alert" className="text-sm text-destructive">{invalidAmount ? 'Enter valid, non-negative amounts.' : 'Net pay plus PAYE is more than gross. Check these amounts before saving.'}</p>}
+          {!exceedsGross && difference != null && payeNum == null && (
+            <p className="text-xs text-muted-foreground">{fmtMoney(difference)} difference between gross and net. Enter PAYE from the pay record; this difference may include other deductions.</p>
+          )}
+          {!exceedsGross && otherDeductions != null && otherDeductions > 0.02 && (
+            <p className="text-xs text-amber-700">{fmtMoney(otherDeductions)} remains after net pay and PAYE. Check any other deductions against the pay record.</p>
+          )}
+          {saveError && <p role="alert" className="text-sm text-destructive">{saveError}</p>}
+          {deductionSourceDate && grossNum != null && payeNum != null && netNum != null && (
+            <div className="rounded-xl border border-emerald-200 bg-emerald-50 px-3 py-2.5 dark:border-emerald-900 dark:bg-emerald-950/30">
+              <p className="text-sm font-medium text-emerald-800 dark:text-emerald-300">
+                Transfer {fmtMoney(netNum)} · PAYE {fmtMoney(payeNum)}
+              </p>
+              <p className="text-xs text-emerald-700/80 dark:text-emerald-400/80">
+                Filled from the latest filed pay with the same {fmtMoney(grossNum)} gross
+                {' '}({formatEntryDate(deductionSourceDate)}). Review before paying.
+              </p>
+            </div>
           )}
           <p className="text-xs text-muted-foreground">
-            Enter any two and the third fills itself (gross = net + PAYE).
-            Saves the gross as a wages expense (no GST) on the pay date, then
-            reminds you to file payday info and pay the PAYE.
+            A matching filed pay fills net and PAYE automatically. Otherwise,
+            enter net pay and PAYE from the pay record. Gross stays based on hours × rate; you can edit it for additional pay.
+            Saves gross wages with no GST, then reminds you to file payday info and pay PAYE.
           </p>
           <Button
             className="w-full min-h-[44px]"
-            disabled={!grossNum || saving}
+            disabled={!canSave}
             onClick={() => void save()}
           >
-            {saving ? 'Saving…' : grossNum ? `Mark paid — ${fmtMoney(grossNum)} gross` : 'Enter net + PAYE (or gross)'}
+            {saving ? 'Saving…' : grossNum ? `Mark paid — ${fmtMoney(grossNum)} gross` : 'Enter hours and rate (or gross)'}
           </Button>
-        </div>
+        </fieldset>
       )}
     </div>
   );

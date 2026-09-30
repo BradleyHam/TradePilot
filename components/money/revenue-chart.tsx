@@ -7,6 +7,7 @@ import { MonthlyData } from '@/lib/types';
 
 interface RevenueChartProps {
   data: MonthlyData[];
+  title?: string;
   /**
    * Optional control slot rendered next to the title (e.g. a range
    * selector). Lets the chart card host its own time-window control
@@ -15,11 +16,11 @@ interface RevenueChartProps {
   rangeControl?: React.ReactNode;
 }
 
-export function RevenueChart({ data, rangeControl }: RevenueChartProps) {
+export function RevenueChart({ data, title = 'Revenue vs Expenses', rangeControl }: RevenueChartProps) {
   return (
     <div className="bg-card border border-border rounded-2xl p-4">
       <div className="flex items-center justify-between mb-4 gap-2">
-        <p className="text-sm font-semibold text-foreground">Revenue vs Expenses</p>
+        <p className="text-sm font-semibold text-foreground">{title}</p>
         {rangeControl}
       </div>
       <ResponsiveContainer width="100%" height={180}>

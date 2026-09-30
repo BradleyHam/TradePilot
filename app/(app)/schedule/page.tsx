@@ -10,12 +10,14 @@ import { EmptyState } from '@/components/shared/empty-state';
 import { Button } from '@/components/ui/button';
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { EntryForm } from '@/components/entry/entry-form';
+import { ClearDayHours } from '@/components/schedule/clear-day-hours';
 import { EditScheduleItemSheet, ScheduleEditTarget } from '@/components/schedule/edit-schedule-item-sheet';
 import { EditSiteVisitSheet } from '@/components/schedule/edit-site-visit-sheet';
 import { SiteVisitWrapUpSheet, type WrapUpTarget } from '@/components/jobs/site-visit-wrap-up-sheet';
 import { MarkAsQuotedSheet } from '@/components/jobs/mark-as-quoted-sheet';
 import { VisitActionChooser } from '@/components/schedule/visit-action-chooser';
 import { downloadIcs } from '@/lib/ics';
+import { downloadSiteVisitCalendar } from '@/lib/site-visit-calendar';
 import { makeUpDate, renumberedTitles } from '@/lib/schedule-blocks';
 import { hoursByWorker, hoursWorkerLabel } from '@/lib/hours-attribution';
 import {
@@ -644,11 +646,13 @@ export default function SchedulePage() {
     return scheduleItems.filter((s) => typeFilter === 'all' ? true : s.type === typeFilter);
   }, [scheduleItems, typeFilter]);
 
+  const todayForList = formatISODate(new Date());
+  const looseRuns = useMemo(() => groupRuns(filteredAll.filter((item) => !item.completed && (item.date < todayForList || item.skipReasonKind))), [filteredAll, todayForList]);
   const upcomingItems = useMemo(() => {
     return [...filteredAll]
-      .filter((s) => !s.completed)
+      .filter((s) => !s.completed && !s.skipReasonKind && s.date >= todayForList)
       .sort((a, b) => a.date.localeCompare(b.date));
-  }, [filteredAll]);
+  }, [filteredAll, todayForList]);
 
   const upcomingRuns = useMemo(() => groupRuns(upcomingItems), [upcomingItems]);
 
@@ -776,32 +780,7 @@ export default function SchedulePage() {
    * know about the .ics shape.
    */
   function handleAddItemToCalendar(item: ScheduleItem) {
-    const [y, m, d] = item.date.split('-').map(Number);
-    const [hh, mm] = (item.startTime ?? '09:00').split(':').map(Number);
-    const start = new Date(y, m - 1, d, hh, mm);
-    let end: Date | undefined;
-    if (item.endTime) {
-      const [eh, em] = item.endTime.split(':').map(Number);
-      end = new Date(y, m - 1, d, eh, em);
-    }
-    // The item's own address wins; fall back to the linked job's location
-    // if the schedule item didn't capture one of its own — same fallback
-    // as the post-save flow.
-    const linkedJob = item.jobId ? jobs.find((j) => j.id === item.jobId) : undefined;
-    const clientName = item.clientName ?? linkedJob?.clientName;
-    const clientPhone = item.clientPhone ?? linkedJob?.clientPhone;
-    downloadIcs({
-      uid: `${item.id}@tradepilot`,
-      title: item.title || 'Site visit',
-      start,
-      end,
-      location: item.location ?? linkedJob?.location,
-      description: [
-        clientName && `Client: ${clientName}`,
-        clientPhone && `Phone: ${clientPhone}`,
-        item.notes,
-      ].filter(Boolean).join('\n') || undefined,
-    });
+    downloadSiteVisitCalendar(item, jobs);
     updateScheduleItem(item.id, { icsDownloaded: true });
   }
 
@@ -931,6 +910,7 @@ export default function SchedulePage() {
             />
           </div>
         ) : view === 'list' ? (
+          <>
           <ListView
             runs={upcomingRuns}
             completedRuns={completedRuns}
@@ -942,6 +922,20 @@ export default function SchedulePage() {
               setWrapUpScheduleItemIds([item.id]);
             }}
           />
+          {looseRuns.length > 0 && <details className="mt-4 rounded-xl border border-border p-3"><summary className="min-h-11 cursor-pointer py-3 text-sm font-semibold">Loose ends · {looseRuns.length} past or skipped bookings</summary>
+          <ListView
+            runs={looseRuns}
+            completedRuns={[]}
+            jobs={jobs}
+            onComplete={handleComplete}
+            onEdit={openEdit}
+            onAddToCalendar={handleAddItemToCalendar}
+            onWrapUp={(item) => {
+              setWrapUpScheduleItemIds([item.id]);
+            }}
+          />
+          </details>}
+          </>
         ) : view === 'week' ? (
           <WeekView
             items={filteredAll}
@@ -1108,6 +1102,7 @@ export default function SchedulePage() {
         onOpenChange={(open) => !open && setEditingVisitId(null)}
         item={editingVisit}
         jobs={jobs}
+        onCalendarRefresh={(updatedItem) => downloadSiteVisitCalendar(updatedItem, jobs)}
       />
 
       {/* "Didn't work" picker — opens from the RunCard pill or the
@@ -2438,6 +2433,7 @@ function MonthView({
                     </div>
                   </div>
                 )}
+                {selectedDay && <ClearDayHours key={selectedDay} date={selectedDay} />}
                 {dayHours.length > 0 && (
                   <div>
                     <h4 className="text-xs font-semibold text-muted-foreground uppercase tracking-wide mb-2 flex items-center gap-1.5">

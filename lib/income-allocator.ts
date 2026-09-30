@@ -20,8 +20,9 @@
  * A job in lead/quoted/accepted/booked/in-progress is unfinished; we don't
  * recognise revenue from it yet, even if deposits have been received.
  *
- * All amounts here are GROSS (what you'd see on Revenue stat cards). For
- * tax-side calcs use lib/tax-estimator.ts which handles ex-GST.
+ * Job quote/invoice/estimate amounts are ex-GST. The legacy earned helpers
+ * below remain for compatibility; Money's Work done view now uses the dated
+ * progress engine in lib/job-progress.ts. Tax still uses lib/tax-estimator.ts.
  */
 
 import type { Job, Entry } from './types';
@@ -103,6 +104,39 @@ export function earnedIncomeInWindow(
     }
   }
   return total;
+}
+
+/**
+ * Management view for one deliberately selected job. Unlike business-wide
+ * earned revenue, this includes an in-progress job: its current agreed /
+ * invoiced value is spread across the months its hours were worked. That
+ * answers "how is this job tracking?" without prematurely recognising the
+ * same revenue in whole-business or tax totals.
+ */
+export function projectedJobIncomeInWindow(
+  job: Job,
+  entries: Entry[],
+  startISO: string,
+  endISO: string,
+): number {
+  const jobEntries = entries.filter((entry) => entry.jobId === job.id);
+  const recordedIncome = jobEntries
+    .filter((entry) => entry.type === 'income')
+    .reduce((sum, entry) => sum + entryExGstLocal(entry), 0);
+  const total = ALLOCATABLE_AMOUNT(job) || recordedIncome;
+  if (total <= 0) return 0;
+
+  const hours = jobEntries.filter((entry) => entry.type === 'hours' && (entry.hours ?? 0) > 0);
+  const totalHours = hours.reduce((sum, entry) => sum + (entry.hours ?? 0), 0);
+  if (totalHours > 0) {
+    const hoursInWindow = hours
+      .filter((entry) => entry.entryDate >= startISO && entry.entryDate <= endISO)
+      .reduce((sum, entry) => sum + (entry.hours ?? 0), 0);
+    return total * (hoursInWindow / totalHours);
+  }
+
+  const fallbackDate = job.endDate ?? job.startDate;
+  return fallbackDate && fallbackDate >= startISO && fallbackDate <= endISO ? total : 0;
 }
 
 /**
