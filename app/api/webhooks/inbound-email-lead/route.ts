@@ -7,7 +7,7 @@
 // email to this route's CloudMailin address and it lands in Jobs → Leads.
 //
 // Transport mirrors /api/webhooks/inbound-tapi-lead exactly (shared-secret
-// auth, admin insert pinned to TRADEPILOT_BUSINESS_ID, content-based dedup).
+// auth, admin insert pinned to TRADEPILOT_BUSINESS_ID, retry dedup).
 // The ONE difference is parsing: a forwarded human email has no fixed format,
 // so we hand it to the LLM (lib/email-lead-parser.ts) rather than string-
 // matching — same approach as the inbound-bill pipeline.
@@ -19,9 +19,8 @@
 //   3. LLM-parse the email into lead fields. If the model is confident it's
 //      NOT a customer enquiry, accept-and-ignore (200 + skipped) so a stray
 //      forward / newsletter doesn't create junk.
-//   4. Dedupe: skip if a matching email lead (same contact email, or same
-//      name+location) was created in the last 7 days — catches retries /
-//      double-forwards while letting a genuine re-enquiry weeks later through.
+//   4. Dedupe recent retries by the original Message-ID. Never suppress a
+//      different enquiry just because the same customer contacted us again.
 //   5. Insert status='lead', source='email' via the admin (service-role)
 //      client (an inbound webhook has no auth.uid()).
 //
@@ -36,9 +35,9 @@ import crypto from 'crypto';
 import {
   parseEmailLead,
   buildEmailLeadFields,
-  normaliseForDedup,
   type EmailLeadFields,
 } from '@/lib/email-lead-parser';
+import { emailLeadJobId, emailLeadMessageMarker, isSameEmailLead } from '@/lib/email-lead-dedup';
 import { quoteToRow, quoteAttachmentToRow } from '@/lib/supabase/mappers';
 import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
 import { sendBusinessNotificationSafe } from '@/lib/push-notify';
@@ -48,8 +47,7 @@ export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
 
 // Long enough to absorb provider retries / accidental re-forwards; short
-// enough that a genuine re-enquiry about the same property weeks later still
-// comes through as a fresh lead.
+// enough to limit the lookup. A different message is never deduped by sender.
 const DEDUP_WINDOW_DAYS = 7;
 
 interface CloudMailinPayload {
@@ -58,6 +56,7 @@ interface CloudMailinPayload {
   plain?: unknown;
   html?: unknown;
   subject?: unknown;
+  gmail_message_id?: unknown;
   attachments?: unknown;
 }
 
@@ -287,6 +286,8 @@ export async function POST(req: Request) {
   const html = asString(body.html);
   const fromHeader =
     asString(headers['from']) ?? asString(headers['From']) ?? asString(body.envelope?.from);
+  const rawGmailId = asString(body.gmail_message_id);
+  const gmailId = rawGmailId && /^[a-z0-9_-]{1,200}$/i.test(rawGmailId) ? rawGmailId : undefined;
 
   if (!plain && !html && !subject) {
     return NextResponse.json(
@@ -299,17 +300,23 @@ export async function POST(req: Request) {
   let lead: EmailLeadFields;
   let confidence: 'high' | 'medium' | 'low' = 'low';
   try {
+    // An attachment-only message cannot be classified from text. Keep it for
+    // review instead of quietly skipping a possible photo-based enquiry.
+    if (gmailId && !plain && !html) throw new Error('Mailbox message has no readable body');
     const parsed = await parseEmailLead({ subject, plain, html, from: fromHeader });
 
     // Confident not-a-lead → accept-and-ignore so a stray forward/newsletter
     // doesn't create junk. A 200 stops CloudMailin retrying.
-    if (!parsed.looksLikeLead) {
+    if (!parsed.looksLikeLead && parsed.confidence === 'high') {
       console.info('[inbound-email-lead] skipped — model judged not a lead', { subject, fromHeader });
       return NextResponse.json({ ok: true, skipped: true, reason: 'not-a-lead' });
     }
 
     confidence = parsed.confidence;
     lead = buildEmailLeadFields(parsed, { fromHeader, subject });
+    if (!parsed.looksLikeLead) {
+      lead.notes += '\n\nPossible enquiry — the automatic check was uncertain. Please review the original email.';
+    }
   } catch (err) {
     // Parser blew up (e.g. Anthropic outage). DO NOT drop the email — insert a
     // minimal lead carrying the raw content so Brad can action it by hand.
@@ -317,11 +324,18 @@ export async function POST(req: Request) {
     lead = buildFallbackLead({ subject, plain, html, fromHeader });
   }
 
-  // ── 5. Dedupe on content within the recent window ───────────────────────
+  // ── 5. Dedupe identical message deliveries within the recent window ────
+  const messageId = asString(headers['message-id']) ?? asString(headers['Message-ID'])
+    ?? asString(headers['message_id']);
+  const marker = emailLeadMessageMarker(gmailId ? `gmail:${gmailId}` : messageId);
+  const stableJobId = emailLeadJobId(businessId, marker);
+  const originalLink = gmailId
+    ? `https://mail.google.com/mail/u/?authuser=info%40lakesidepainting.co.nz#all/${gmailId}`
+    : undefined;
   const windowStart = new Date(Date.now() - DEDUP_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
   const { data: recent, error: dedupErr } = await admin
     .from('jobs')
-    .select('id, name, location, client_email, created_at')
+    .select('id, notes, created_at')
     .eq('business_id', businessId)
     .eq('source', 'email')
     .gte('created_at', windowStart);
@@ -329,14 +343,7 @@ export async function POST(req: Request) {
     // Don't block on a dedupe failure — better to risk a dupe than drop a lead.
     console.error('[inbound-email-lead] dedupe query failed', dedupErr);
   } else if (recent && recent.length > 0) {
-    const incomingEmail = lead.clientEmail?.toLowerCase();
-    const incomingKey = `${normaliseForDedup(lead.location)}|${normaliseForDedup(lead.name)}`;
-    const dup = recent.find((r) => {
-      const rowEmail = (r.client_email as string | null)?.toLowerCase();
-      if (incomingEmail && rowEmail && rowEmail === incomingEmail) return true;
-      const rowKey = `${normaliseForDedup(r.location as string | undefined)}|${normaliseForDedup(r.name as string | undefined)}`;
-      return rowKey === incomingKey;
-    });
+    const dup = recent.find((r) => isSameEmailLead(r.notes, marker));
     if (dup) {
       console.info('[inbound-email-lead] dedup hit', { jobId: dup.id, subject });
       return NextResponse.json({ ok: true, jobId: dup.id as string, dedup: true });
@@ -347,6 +354,7 @@ export async function POST(req: Request) {
   const { data: inserted, error: insertErr } = await admin
     .from('jobs')
     .insert({
+      ...(stableJobId ? { id: stableJobId } : {}),
       business_id: businessId,
       name: lead.name,
       client_name: lead.clientName,
@@ -355,12 +363,17 @@ export async function POST(req: Request) {
       location: lead.location ?? null,
       status: 'lead',
       source: 'email',
-      notes: lead.notes,
+      notes: [lead.notes, originalLink ? `Original email: ${originalLink}` : undefined, marker].filter(Boolean).join('\n\n'),
     })
     .select('id')
     .single();
 
   if (insertErr || !inserted) {
+    if (insertErr?.code === '23505' && stableJobId) {
+      const { data: existing } = await admin.from('jobs').select('id')
+        .eq('business_id', businessId).eq('id', stableJobId).maybeSingle();
+      if (existing) return NextResponse.json({ ok: true, jobId: stableJobId, dedup: true });
+    }
     console.error('[inbound-email-lead] insert failed', insertErr);
     return NextResponse.json(
       { ok: false, error: 'Failed to create lead.', detail: insertErr?.message },

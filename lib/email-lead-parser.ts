@@ -123,7 +123,8 @@ const EMIT_TOOL: Tool = {
           'TRUE if this email could plausibly be a customer wanting a quote ' +
           'or painting work. FALSE only when you are confident it is NOT — ' +
           'e.g. a newsletter, marketing blast, receipt, supplier invoice, ' +
-          'automated system notification, or spam. When genuinely unsure, ' +
+          'unrelated automated notification, or spam. A website contact-form ' +
+          'notification containing a customer work request IS a lead. When genuinely unsure, ' +
           'return TRUE: a missed enquiry is a lost customer, a junk lead is ' +
           'trivial to delete.',
       },
@@ -141,12 +142,11 @@ const EMIT_TOOL: Tool = {
 };
 
 const SYSTEM_PROMPT = [
-  'You read emails that a New Zealand painter (Lakeside Painting) has',
-  'FORWARDED to his job tracker because he thinks they might be a new',
-  'customer enquiry — a "lead". Your job is to extract the prospective',
+  'You read direct or forwarded emails for a New Zealand painter (Lakeside',
+  'Painting). Your job is to identify prospective customer enquiries and extract the',
   "customer's details and call the emit_lead tool.",
   '',
-  'CRITICAL — this is a FORWARDED email. The envelope/From you see is often',
+  'Some emails are forwarded. The envelope/From you see may be',
   "the painter's own inbox, and Gmail prepends a forwarding banner. The REAL",
   "lead's name, email, and phone are inside the message body / quoted",
   'original. Extract the CUSTOMER, never the painter who forwarded it.',
@@ -157,7 +157,11 @@ const SYSTEM_PROMPT = [
   '',
   'Bias the looksLikeLead flag towards TRUE. Only set it FALSE when you are',
   'genuinely confident the email is not a customer enquiry (newsletter,',
-  'marketing, receipt, supplier invoice, automated notification, spam).',
+  'marketing, receipt, supplier invoice, unrelated automated notification, spam).',
+  'A website or platform notification that contains a real customer request',
+  'for painting or related work is a lead, not merely an automated notice.',
+  'A reply discussing existing work without a new work request is not a new',
+  'lead; if it might request additional work, retain it for review.',
 ].join('\n');
 
 /**
@@ -185,7 +189,7 @@ export async function parseEmailLead(input: {
     {
       role: 'user',
       content:
-        'A forwarded email is below. Extract the prospective customer and ' +
+        'An email is below. Extract the prospective customer if present and ' +
         'call emit_lead.\n\n--- BEGIN EMAIL ---\n' +
         text +
         '\n--- END EMAIL ---',

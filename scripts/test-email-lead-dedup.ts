@@ -1,0 +1,20 @@
+import assert from 'node:assert/strict';
+import { emailLeadJobId, emailLeadMessageMarker, isSameEmailLead } from '../lib/email-lead-dedup';
+
+const first = emailLeadMessageMarker('<one@example.com>');
+const second = emailLeadMessageMarker('<two@example.com>');
+assert.ok(first);
+assert.equal(first, emailLeadMessageMarker('  <one@example.com>  '));
+assert.notEqual(first, second);
+assert.equal(isSameEmailLead(`Customer enquiry\n\n${first}`, first), true);
+assert.equal(isSameEmailLead(`Customer enquiry\n\n${first}`, second), false);
+assert.equal(isSameEmailLead('Same customer and address, but a different job', first), false);
+assert.equal(isSameEmailLead('', undefined), false);
+assert.equal(emailLeadMessageMarker(''), undefined);
+const jobId = emailLeadJobId('business-1', first);
+assert.match(jobId!, /^[0-9a-f]{8}-[0-9a-f]{4}-5[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/);
+assert.equal(jobId, emailLeadJobId('business-1', first));
+assert.notEqual(jobId, emailLeadJobId('business-2', first));
+assert.notEqual(jobId, emailLeadJobId('business-1', second));
+assert.equal(emailLeadJobId('business-1'), undefined);
+console.log('Email lead identity checks passed');
