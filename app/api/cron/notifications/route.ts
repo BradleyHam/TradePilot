@@ -26,7 +26,8 @@ import { NextResponse } from 'next/server';
 import { supabaseAdmin } from '@/lib/supabase/admin';
 import { rowToEntry, rowToJob, rowToPayRun, rowToScheduleItem } from '@/lib/supabase/mappers';
 import { evaluateNotificationRules } from '@/lib/notification-rules';
-import { sendBusinessNotification } from '@/lib/push-notify';
+import { sendBusinessNotification, sendBusinessNotificationSafe } from '@/lib/push-notify';
+import { scannerIsStale } from '@/lib/email-lead-routing';
 import { secretMatches } from '@/lib/webhook-auth';
 
 export const runtime = 'nodejs';
@@ -61,6 +62,13 @@ export async function GET(req: Request) {
   }
 
   const todayISO = nzTodayISO();
+  const health = await supabaseAdmin.from('settings').select('value').eq('business_id',businessId).eq('key','email_scanner_health').maybeSingle();
+  if (health.error) return NextResponse.json({ok:false,error:'Scanner health lookup failed.'},{status:500});
+  if (scannerIsStale(health.data?.value)) {
+    await sendBusinessNotificationSafe(supabaseAdmin,businessId,{ruleKey:'email-scanner-stopped',dedupeKey:health.data?.value ?? 'missing',
+      title:'Email enquiry capture needs attention',body:'The mailbox scanner has not checked in for over two hours. New enquiries may be waiting in Gmail.',url:'/leads'});
+  }
+
 
   // ── 2. Anyone listening? ─────────────────────────────────────────────────
   const { count, error: countErr } = await supabaseAdmin

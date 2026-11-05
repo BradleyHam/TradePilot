@@ -1,0 +1,7 @@
+{
+  "timeZone": "Pacific/Auckland",
+  "dependencies": { "enabledAdvancedServices": [{ "userSymbol": "Gmail", "serviceId": "gmail", "version": "v1" }] },
+  "oauthScopes": ["https://www.googleapis.com/auth/gmail.readonly", "https://www.googleapis.com/auth/script.external_request"],
+  "runtimeVersion": "V8",
+  "exceptionLogging": "STACKDRIVER"
+}

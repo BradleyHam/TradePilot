@@ -37,18 +37,15 @@ import {
   buildEmailLeadFields,
   type EmailLeadFields,
 } from '@/lib/email-lead-parser';
-import { emailLeadJobId, emailLeadMessageMarker, isSameEmailLead } from '@/lib/email-lead-dedup';
+import { emailLeadJobId, emailLeadMessageMarker } from '@/lib/email-lead-dedup';
 import { quoteToRow, quoteAttachmentToRow } from '@/lib/supabase/mappers';
 import { webhookRequestAuthenticated } from '@/lib/webhook-auth';
 import { sendBusinessNotificationSafe } from '@/lib/push-notify';
+import { matchEmailJob } from '@/lib/email-lead-routing';
 import type { QuoteAttachmentKind } from '@/lib/types';
 
 export const runtime = 'nodejs';
 export const dynamic = 'force-dynamic';
-
-// Long enough to absorb provider retries / accidental re-forwards; short
-// enough to limit the lookup. A different message is never deduped by sender.
-const DEDUP_WINDOW_DAYS = 7;
 
 interface CloudMailinPayload {
   envelope?: { from?: unknown; to?: unknown };
@@ -57,6 +54,9 @@ interface CloudMailinPayload {
   html?: unknown;
   subject?: unknown;
   gmail_message_id?: unknown;
+  gmail_thread_id?: unknown;
+  received_at?: unknown;
+  scanner_heartbeat?: unknown;
   attachments?: unknown;
 }
 
@@ -277,6 +277,13 @@ export async function POST(req: Request) {
     return NextResponse.json({ ok: false, error: 'Body must be valid JSON.' }, { status: 400 });
   }
 
+  // Successful scans update a content-free heartbeat, even when no mail arrived.
+  if (body.scanner_heartbeat === true) {
+    const { error } = await admin.from('settings').upsert({business_id:businessId,
+      key:'email_scanner_health', value:JSON.stringify({checkedAt:new Date().toISOString()})}, {onConflict:'business_id,key'});
+    return NextResponse.json(error ? {ok:false,error:'Heartbeat could not be saved.'} : {ok:true}, {status:error ? 500 : 200});
+  }
+
   const headers = (body.headers && typeof body.headers === 'object')
     ? (body.headers as Record<string, unknown>)
     : {};
@@ -296,9 +303,27 @@ export async function POST(req: Request) {
     );
   }
 
+  const threadId = asString(body.gmail_thread_id);
+  const threadMarker = threadId && /^[a-z0-9_-]{1,200}$/i.test(threadId) ? emailLeadMessageMarker(`thread:${threadId}`) : undefined;
+  const identity = gmailId ? `gmail:${gmailId}` : asString(headers['Message-ID']) ?? asString(headers['message-id']);
+  const receiptKey = identity ? `email_receipt_${crypto.createHash('sha256').update(identity).digest('hex')}` : undefined;
+  const finish = async (result: Record<string, unknown>) => {
+    if (receiptKey) {
+      const {error} = await admin.from('settings').upsert({business_id:businessId,key:receiptKey,value:JSON.stringify(result)}, {onConflict:'business_id,key'});
+      if (error) return NextResponse.json({ok:false,error:'Receipt could not be saved; retry pending.'},{status:500});
+    }
+    return NextResponse.json(result);
+  };
+  if (receiptKey) {
+    const {data,error} = await admin.from('settings').select('value').eq('business_id',businessId).eq('key',receiptKey).maybeSingle();
+    if (error) return NextResponse.json({ok:false,error:'Receipt lookup failed.'},{status:500});
+    if (data?.value) return NextResponse.json({...JSON.parse(data.value),dedup:true});
+  }
+
   // ── 4. LLM-parse → lead fields (never-drop fallback on failure) ──────────
   let lead: EmailLeadFields;
   let confidence: 'high' | 'medium' | 'low' = 'low';
+  let followUp = false;
   try {
     // An attachment-only message cannot be classified from text. Keep it for
     // review instead of quietly skipping a possible photo-based enquiry.
@@ -307,14 +332,15 @@ export async function POST(req: Request) {
 
     // Confident not-a-lead → accept-and-ignore so a stray forward/newsletter
     // doesn't create junk. A 200 stops CloudMailin retrying.
-    if (!parsed.looksLikeLead && parsed.confidence === 'high') {
-      console.info('[inbound-email-lead] skipped — model judged not a lead', { subject, fromHeader });
-      return NextResponse.json({ ok: true, skipped: true, reason: 'not-a-lead' });
+    if (!parsed.looksLikeLead && parsed.confidence === 'high' && parsed.messageKind !== 'follow-up') {
+      console.info('[inbound-email-lead] skipped — model judged not a lead', {});
+      return finish({ ok: true, skipped: true, reason: 'not-a-lead' });
     }
 
     confidence = parsed.confidence;
+    followUp = parsed.messageKind === 'follow-up';
     lead = buildEmailLeadFields(parsed, { fromHeader, subject });
-    if (!parsed.looksLikeLead) {
+    if (!parsed.looksLikeLead && !followUp) {
       lead.notes += '\n\nPossible enquiry — the automatic check was uncertain. Please review the original email.';
     }
   } catch (err) {
@@ -332,23 +358,30 @@ export async function POST(req: Request) {
   const originalLink = gmailId
     ? `https://mail.google.com/mail/u/?authuser=info%40lakesidepainting.co.nz#all/${gmailId}`
     : undefined;
-  const windowStart = new Date(Date.now() - DEDUP_WINDOW_DAYS * 24 * 60 * 60 * 1000).toISOString();
-  const { data: recent, error: dedupErr } = await admin
-    .from('jobs')
-    .select('id, notes, created_at')
-    .eq('business_id', businessId)
-    .eq('source', 'email')
-    .gte('created_at', windowStart);
-  if (dedupErr) {
-    // Don't block on a dedupe failure — better to risk a dupe than drop a lead.
-    console.error('[inbound-email-lead] dedupe query failed', dedupErr);
-  } else if (recent && recent.length > 0) {
-    const dup = recent.find((r) => isSameEmailLead(r.notes, marker));
-    if (dup) {
-      console.info('[inbound-email-lead] dedup hit', { jobId: dup.id, subject });
-      return NextResponse.json({ ok: true, jobId: dup.id as string, dedup: true });
-    }
+  // Match source identity first, then a known conversation. Ambiguity stays visible.
+  const {data:jobs,error:jobsError} = await admin.from('jobs').select('id,name,client_email,location,status,notes').eq('business_id',businessId);
+  if (jobsError) return NextResponse.json({ok:false,error:'Job lookup failed; retry pending.'},{status:500});
+  let threadJobIds: string[] = [];
+  if (threadMarker) {
+    const {data,error} = await admin.from('job_contacts').select('job_id').eq('business_id',businessId).like('note',`%${threadMarker}%`);
+    if (error) return NextResponse.json({ok:false,error:'Conversation lookup failed.'},{status:500});
+    threadJobIds = [...new Set((data ?? []).map(c => c.job_id as string))];
   }
+  const match = matchEmailJob(jobs ?? [],lead,{followUp,originalLink,threadJobIds});
+  const saveContact = async (jobId:string) => {
+    const contactId = emailLeadJobId(businessId,emailLeadMessageMarker(`contact:${identity ?? crypto.randomUUID()}`));
+    const received = asString(body.received_at);
+    const validDate = received && Number.isFinite(Date.parse(received)) && Date.parse(received) <= Date.now()+60000;
+    const {error} = await admin.from('job_contacts').upsert({id:contactId,business_id:businessId,job_id:jobId,
+      direction:'in',channel:'email',contacted_at:validDate ? received : new Date().toISOString(),
+      note:[lead.notes,originalLink,marker,threadMarker].filter(Boolean).join('\n\n')},{onConflict:'id',ignoreDuplicates:true});
+    return error;
+  };
+  if (match) {
+    if (await saveContact(match)) return NextResponse.json({ok:false,error:'Conversation save failed.'},{status:500});
+    return finish({ok:true,jobId:match,matched:true});
+  }
+  if (followUp) lead.notes += '\n\nFollow-up could not be linked confidently. Review and attach it to the correct job.';
 
   // ── 6. Insert the lead ──────────────────────────────────────────────────
   const { data: inserted, error: insertErr } = await admin
@@ -363,7 +396,7 @@ export async function POST(req: Request) {
       location: lead.location ?? null,
       status: 'lead',
       source: 'email',
-      notes: [lead.notes, originalLink ? `Original email: ${originalLink}` : undefined, marker].filter(Boolean).join('\n\n'),
+      notes: [lead.notes, threadMarker, originalLink ? `Original email: ${originalLink}` : undefined, marker].filter(Boolean).join('\n\n'),
     })
     .select('id')
     .single();
@@ -372,7 +405,10 @@ export async function POST(req: Request) {
     if (insertErr?.code === '23505' && stableJobId) {
       const { data: existing } = await admin.from('jobs').select('id')
         .eq('business_id', businessId).eq('id', stableJobId).maybeSingle();
-      if (existing) return NextResponse.json({ ok: true, jobId: stableJobId, dedup: true });
+      if (existing) {
+        if (await saveContact(stableJobId)) return NextResponse.json({ok:false,error:'Contact retry failed.'},{status:500});
+        return finish({ok:true,jobId:stableJobId,dedup:true});
+      }
     }
     console.error('[inbound-email-lead] insert failed', insertErr);
     return NextResponse.json(
@@ -380,6 +416,8 @@ export async function POST(req: Request) {
       { status: 500 },
     );
   }
+
+  if (await saveContact(inserted.id as string)) return NextResponse.json({ok:false,error:'Contact save failed; retry pending.'},{status:500});
 
   // Instant push — same rationale as the Tapi webhook: forwarded
   // enquiries land silently, and speed-to-lead wins jobs. Fired before
@@ -415,7 +453,7 @@ export async function POST(req: Request) {
     confidence,
     attachments,
   });
-  return NextResponse.json({ ok: true, jobId: inserted.id, name: lead.name, attachments });
+  return finish({ ok: true, jobId: inserted.id, name: lead.name, attachments });
 }
 
 /**
